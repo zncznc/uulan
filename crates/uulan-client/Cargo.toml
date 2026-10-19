@@ -23,6 +23,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uulan-protocol = { workspace = true }
 uulan-media = { path = "../uulan-media" }
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+softbuffer = { version = "0.4", default-features = false }
 
 [dev-dependencies]
 tokio = { workspace = true }

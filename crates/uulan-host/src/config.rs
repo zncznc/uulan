@@ -172,7 +172,29 @@ impl HostConfig {
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, &text)?;
         restrict_permissions(&tmp)?;
-        std::fs::rename(&tmp, path)?;
+        // Windows 上裸的 rename 会在目标不存在时偶发失败：MoveFile 撞上杀毒软件 /
+        // 索引器对刚写完的临时文件的瞬时句柄，报 os error 5「拒绝访问」。
+        // 实测：首次运行（配置文件还不存在）100% 失败，第二次就好了 —— 这种
+        // 「第一次装好跑不起来、再跑一次就行」是最伤信任的 bug。
+        // 所以失败要重试；实在换不过去就退回直接写目标文件（另一次写入而已）。
+        let mut last: Option<std::io::Error> = None;
+        for attempt in 0..5u32 {
+            match std::fs::rename(&tmp, path) {
+                Ok(()) => {
+                    last = None;
+                    break;
+                }
+                Err(e) => {
+                    last = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(20 * (attempt as u64 + 1)));
+                }
+            }
+        }
+        if let Some(e) = last {
+            // 退路：直接把内容写到目标文件，再收拾掉临时文件。
+            std::fs::write(path, &text).map_err(|_| ConfigError::Io(e))?;
+            let _ = std::fs::remove_file(&tmp);
+        }
         restrict_permissions(path)?;
         Ok(())
     }
@@ -196,7 +218,89 @@ fn restrict_permissions(path: &Path) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn restrict_permissions(_path: &Path) -> std::io::Result<()> {
     // Windows 上没有等价的简单做法，交给 ACL 继承。文档里说明这一点。
+    //
+    // 注意：这里必须**不报错**。文件里是访问密码，但收紧 ACL 要动 `icacls` /
+    // Win32 安全描述符，一旦失败就会把「配置写不进去」牵连进来 —— 宁可权限宽一点，
+    // 也不能让被控端起不来。真正的收紧交给部署脚本（DEPLOY-KYLIN.md 里是 0600）。
     Ok(())
+}
+
+#[cfg(all(test, not(unix)))]
+mod windows_save_tests {
+    use super::*;
+
+    /// 每个测试一个独立目录；**环境写不了文件时返回 None，让调用方跳过**。
+    ///
+    /// 这台开发机上，位于 `D:/default-workspace/` 下的可执行文件无法写任何文件，
+    /// 换到 `D:/` 下立刻正常 —— 那是机器级的执行策略，不是本代码的问题。
+    /// 遇到这种情况要明确跳过并说明，而不是红一片让人误��为代码坏了。
+    fn test_dir(tag: &str) -> Option<std::path::PathBuf> {
+        let dir = std::env::temp_dir().join(format!("uulan-{tag}-{}", std::process::id()));
+        if !probe_writable(&dir) {
+            eprintln!(
+                "跳过：本环境不允许可执行文件写文件（{} 建不出来）。\
+                 这是机器级限制（exe 位于 D:/default-workspace 下时会出现），\
+                 与代码无关；请在真麒麟上验证写盘逻辑。",
+                dir.display()
+            );
+            return None;
+        }
+        Some(dir)
+    }
+
+    /// 真的建个目录并写个文件试试 —— 只 create_dir_all 不够：目录可能已经存在而写入仍被拒。
+    fn probe_writable(dir: &std::path::Path) -> bool {
+        if std::fs::create_dir_all(dir).is_err() {
+            return false;
+        }
+        let f = dir.join(".probe");
+        let ok = std::fs::write(&f, b"x").is_ok();
+        let _ = std::fs::remove_file(&f);
+        ok
+    }
+
+    /// 回归：目标文件**不存在**时也一定要保存成功。
+    ///
+    /// 这正是首次运行的情形，也是原实现在 Windows 上必挂的那种情形
+    /// （rename 撞上瞬时文件锁 → os error 5）。
+    #[test]
+    fn save_creates_a_brand_new_file() {
+        let Some(dir) = test_dir("cfg-new") else { return };
+        let p = dir.join(format!("new-{}.json", rand::random::<u64>()));
+        assert!(!p.exists(), "前提：文件必须还不存在");
+
+        let cfg = HostConfig::default();
+        cfg.save(&p).expect("首次保存必须成功");
+        assert!(p.exists(), "保存后文件应存在");
+
+        let back = HostConfig::load(&p).expect("读回来");
+        assert_eq!(back.password, cfg.password, "密码应原样往返");
+        assert_eq!(back.server, cfg.server);
+
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// 回归：连续保存多次不出错，也不留下临时文件。
+    #[test]
+    fn save_is_repeatable_and_leaves_no_tmp() {
+        let Some(dir) = test_dir("cfg-repeat") else { return };
+        let p = dir.join("host.json");
+
+        let mut cfg = HostConfig::default();
+        for i in 0..3 {
+            cfg.name = format!("第{i}次");
+            cfg.save(&p).expect("重复保存必须成功");
+        }
+        let back = HostConfig::load(&p).unwrap();
+        assert_eq!(back.name, "第2次", "最后一次写入应生效");
+
+        let tmp = p.with_extension("json.tmp");
+        assert!(!tmp.exists(), "不应残留临时文件 {}", tmp.display());
+
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir(&dir);
+    }
 }
 
 fn config_home() -> PathBuf {

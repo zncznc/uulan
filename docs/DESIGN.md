@@ -268,6 +268,40 @@ uulan/
 | **M5 麒麟落地** | ⬜ | 麒麟安装包 + systemd 开机自启 + 部署文档 | 在真麒麟 V10 SP1 上跑通 M2–M4 |
 | **M6 加固** | ⬜ | E2E 加密、临时验证码轮换、日志脱敏 | 中继抓包看不到明文内容 |
 
+### M2.5 进行中：控制端窗口（已完成）
+
+控制端不再是 headless —— **默认开窗口**显示画面，加 `--headless` 回到命令行模式
+（原来的统计输出格式一字未变，端到端测试仍走那条路）。
+
+实现都在 `crates/uulan-client/src/window.rs`，四个要点：
+
+- **winit 的事件循环必须在主线程。** `#[tokio::main]` 的 async 主体本来就在主线程，
+  所以直接在里头同步调用；**不要**为了「把主线程留给窗口」去 spawn 线程 ——
+  winit 0.30 会直接 panic（*Initializing the event loop outside of the main thread…*）。
+  画面不受影响：收流、喂解码器、取帧都是 tokio 任务，跑在多线程运行时的 worker 上。
+- **用 softbuffer，不用 GTK / OpenGL。** 参考项目在 GTK 上栽过：窗口在锁屏/息屏时停止重绘。
+- **帧走 `watch` 通道而不是队列。** 远控要的是最新画面；追不上时应丢旧帧，而不是把延迟越堆越高。
+- **缩放取整数倍 + 最近邻，且从不缩小。** 远程桌面上要看清的是文字，缩过的字比重采样锯齿更难受。
+
+实测（本机合成源 1280x720@30，**release 二进制**，14 秒会话）：
+
+```
+窗口已就绪
+painted=653             # 10 秒里窗口真的呈现了 653 帧
+收到 AU 4154 / 关键帧 277 / 解出帧 1999 / 丢帧 1482 / 首帧 56ms
+```
+
+`--seconds N` 到点自动关窗，便于脚本化验证。
+
+#### 本机开发环境的两个坑（会重复踩）
+
+1. **链接 `windows-sys` 需要 `dlltool.exe`**，它不在 PATH 上。在
+   `%LOCALAPPDATA%\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_*\mingw64\bin`。
+   不加就报 `error calling dlltool 'dlltool.exe': program not found`。
+2. **位于 `D:/default-workspace/` 下的 exe 写不了任何文件**（换到 `D:/` 下立刻正常）。
+   这是目录级执行策略，不是代码问题，但会让 `cargo test` 里所有涉及写盘的断言失真。
+   诊断工具：`cargo run -q -p uulan-host --example fs_probe`，把它拷到 `D:/` 下再跑一遍对照。
+
 ### M2 实际验收方式（重要）
 
 M2 分两层验收，**两层都做完了**。

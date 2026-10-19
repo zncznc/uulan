@@ -10,3 +10,4 @@ pub mod watch;
 
 pub use connect::{connect, ClientError, Connected, HostInfo};
 pub use watch::{WatchStats, VideoWatcher};
+pub mod window;

@@ -1,13 +1,13 @@
-//! uulan-client —— 控制端命令行入口。
+//! uulan-client —— 控制端。
 //!
-//! 当前实现的是 headless 模式：连上被控端、握手、收画面并解码，最后打印统计。
-//! 这既是排障工具，也是窗口界面（下一步）的地基 —— 窗口只是把 [`watch`] 推来的
-//! 最新一帧画到屏幕上，并上报键鼠事件。
+//! **默认开窗口**：连上被控端、握手、收画面解码，然后把最新一帧画到窗口里。
+//! 加 `--headless` 回到命令行模式 —— 那是排障与基准用的路径（可在无显示环境跑，
+//! 也是端到端测试用的那条），统计输出的格式和以前完全一致。
 //!
 //! 用法：
 //!   uulan-client --server 10.0.0.1:21116 --device 123456789 --password aB3dE5fG
-//!   uulan-client ... --frames 120      # 解出 120 帧后自动退出（自测/基准用）
-//!   uulan-client ... --json            # 以 JSON 打印统计，便于脚本消费
+//!   uulan-client ... --headless --frames 120   # 命令行模式，解出 120 帧后退出
+//!   uulan-client ... --headless --json         # 以 JSON 打印统计，便于脚本消费
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -29,10 +29,14 @@ struct Args {
     ffmpeg: Option<PathBuf>,
     json: bool,
     save_frame: Option<PathBuf>,
+    /// 不开窗口，走原来的命令行模式。
+    headless: bool,
 }
 
 const HELP: &str = "\
 uulan-client —— uulan 内网远控的控制端
+
+默认打开窗口显示被控端画面；加 --headless 退回命令行模式。
 
   --server <addr>     中继地址（默认 127.0.0.1:21116）
   --device <id>       被控端设备 ID（9 位数字）
@@ -42,7 +46,8 @@ uulan-client —— uulan 内网远控的控制端
   --seconds <S>       跑 S 秒后退出
   --ffmpeg <path>     ffmpeg 可执行文件（默认走 PATH）
   --save-frame <path> 退出时把最后一帧存成 PPM（排查「对面到底画的是什么」用）
-  --json              以 JSON 输出统计
+  --headless          不开窗口，只打印统计（自测 / 无显示环境用）
+  --json              以 JSON 输出统计（仅 --headless 下生效）
   -h, --help          显示本帮助
 
 退出码：0 正常；1 被控端拒绝（密码错/离线）；2 用法错。
@@ -59,6 +64,7 @@ fn parse_args() -> Result<Args> {
         ffmpeg: None,
         json: false,
         save_frame: None,
+        headless: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -76,6 +82,7 @@ fn parse_args() -> Result<Args> {
             "--ffmpeg" => a.ffmpeg = Some(PathBuf::from(it.next().unwrap_or_default())),
             "--save-frame" => a.save_frame = Some(PathBuf::from(it.next().unwrap_or_default())),
             "--json" => a.json = true,
+            "--headless" => a.headless = true,
             "-h" | "--help" => {
                 println!("{HELP}");
                 std::process::exit(0);
@@ -142,6 +149,41 @@ async fn main() -> Result<()> {
         .context("启动视频解码失败")?;
 
     let info = watcher.info().clone();
+
+    // ── 窗口模式 ──────────────────────────────────────────────────────────
+    // winit 的事件循环**必须占住主线程**，而画面接收/解码跑在 tokio 里。
+    // 所以这里把当前这个 async 主函数（它已在 tokio 的多线程运行时上）整体搬到
+    // 后台线程去跑，主线程腾出来给窗口。`rx` 是 watch 通道，天然跨线程。
+    if !args.headless {
+        let rx = watcher.subscribe();
+        let stats = watcher.stats();
+        let overlay = uulan_client::window::Overlay {
+            host_name: format!("{}({})", c.host.name, c.host.os),
+            screen: (c.host.screen.w, c.host.screen.h),
+            ..Default::default()
+        };
+        println!(
+            "已连上「{}」（{} {}，屏幕 {}x{}）—— 正在打开窗口…",
+            c.host.name, c.host.os, c.host.version, c.host.screen.w, c.host.screen.h
+        );
+
+        // winit 的事件循环**必须在主线程上**（winit 0.30 会硬性拒绝在其他线程创建：
+        // “Initializing the event loop outside of the main thread is a significant
+        //  cross-platform compatibility hazard”）。而 `#[tokio::main]` 的 async 主体
+        // 本来就跑在主线程，所以这里**直接同步调用**，不要再 spawn 线程。
+        //
+        // 主线程被事件循环占住不影响画面：收流、喂解码器、取帧都是 tokio 任务，
+        // 跑在多线程运行时的 worker 上。
+        let r = uulan_client::window::run(rx, stats, overlay, args.seconds);
+        watcher.shutdown();
+        let s = watcher.snapshot();
+        println!(
+            "窗口已关闭。收到 AU {} / 关键帧 {} / 解出帧 {} / 丢帧 {} / 首帧 {}ms",
+            s.aus, s.keyframes, s.decoded, s.dropped, s.first_frame_ms
+        );
+        return r.context("窗口退出异常");
+    }
+
     if !args.json {
         println!(
             "画面：{}x{} {} {} fps（编码器 {}）",
