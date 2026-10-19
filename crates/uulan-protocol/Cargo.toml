@@ -1,0 +1,18 @@
+[package]
+name = "uulan-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "uulan 线协议：长度前缀帧 + 控制消息 + 会合(rendezvous)协议"
+
+[dependencies]
+tokio = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

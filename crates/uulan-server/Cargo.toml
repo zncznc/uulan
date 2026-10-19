@@ -1,0 +1,27 @@
+[package]
+name = "uulan-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "uulan 中继 / 会合服务器（盲转发，不持有任何设备凭据）"
+
+[[bin]]
+name = "uulan-server"
+path = "src/main.rs"
+
+[lib]
+name = "uulan_server"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uulan-protocol = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/uulan-protocol",
+    "crates/uulan-media",
+    "crates/uulan-server",
+    "crates/uulan-host",
+    "crates/uulan-client",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# rust-version 压到 1.85：尽可能让麒麟 V10 自带的/源里的旧 cargo 也能编。
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs", "process", "signal"] }
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+hex = "0.4"
+sha2 = "0.10"
+base64 = "0.22"
+
+uulan-protocol = { path = "crates/uulan-protocol" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

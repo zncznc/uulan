@@ -1,0 +1,32 @@
+[package]
+name = "uulan-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "uulan 控制端（麒麟 / Windows）"
+
+[lib]
+name = "uulan_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "uulan-client"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uulan-protocol = { workspace = true }
+uulan-media = { path = "../uulan-media" }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+uulan-server = { path = "../uulan-server" }
+uulan-host = { path = "../uulan-host" }
+uulan-media = { path = "../uulan-media" }

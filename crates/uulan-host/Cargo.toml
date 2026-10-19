@@ -1,0 +1,30 @@
+[package]
+name = "uulan-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "uulan 被控端（麒麟/Linux X11；采集走 ffmpeg 子进程，因此在任何平台都能编译与自测）"
+
+[lib]
+name = "uulan_host"
+path = "src/lib.rs"
+
+[[bin]]
+name = "uulan-host"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rand = { workspace = true }
+uulan-protocol = { workspace = true }
+uulan-media = { path = "../uulan-media" }
+
+[dev-dependencies]
+tokio = { workspace = true }
+uulan-server = { path = "../uulan-server" }

@@ -1,0 +1,26 @@
+M1 骨架完成 · 测试全绿
+
+cargo test --workspace
+  36 passed / 0 failed
+  · uulan-protocol  18  (帧编解码 · 控制消息)
+  · uulan-server     5  (设备台账)
+  · relay_flow      13  (端到端会合 · 中继 · 盲转发)
+
+已实现
+  · 长度前缀帧协议，8MiB 上限防 OOM，未知帧型报错不 panic
+  · control / video / bulk 三通道：输入事件不会被文件传输的大包堵住
+  · 三条连接都由两端主动拨出，不占任何入站端口
+  · 中继服务器：设备注册 · 在线查询 · 发起会话 · 三通道配对 · 盲转发 · 心跳 · 台账持久化
+  · 设备 ID 严格校验（9 位数字首位非 0），格式错立刻报错而不是去查一圈
+
+过程中修掉一个真 bug（测试自己抓出来的）
+  服务端配对时无条件把 host/client 两个槽都 take()，先拨号那一方的连接
+  会在「还没配上」的分支里被当成临时值丢掉，对端立刻读到 EOF。
+  也就是说——「被控端先拨号、控制端还在路上」这个完全正常的时序下必然连不上。
+  已修，并加了回归测试 first_dialer_is_held_open_not_dropped 把它钉死。
+
+下一步 M2：被控端 X11 采集 → H.264 编码 → 控制端解码显示
+  刚用真 ffmpeg 探明：libx264 / nvenc / vaapi 三种编码器都有原生 -aud 开关，
+  打开 AUD 后 AU 边界是精确的、不用猜。（注意 -flags +aud 在 ffmpeg 9 下
+  会失败，只有 -aud 1 和 h264_metadata=aud=insert 有效。）
+  参考项目正是在 AUD 这个点上栽过跟头，我们绕开。
