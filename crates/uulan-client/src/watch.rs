@@ -22,9 +22,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use uulan_media::annexb;
 use uulan_media::ffmpeg;
@@ -73,6 +74,11 @@ pub struct WatchStats {
     pub last_ts_us: AtomicU64,
     /// 解码流是否已结束。
     pub ended: AtomicBool,
+    /// 因为被控端换分辨率而重建解码器的次数。
+    pub resizes: AtomicU64,
+    /// 最新一条 `VideoCfg` 报的画幅宽 / 高（换过分辨率之后就是新值）。
+    pub cfg_w: AtomicU64,
+    pub cfg_h: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -87,6 +93,9 @@ pub struct WatchStatsSnapshot {
     pub host_fps_x10: u64,
     pub last_ts_us: u64,
     pub ended: bool,
+    pub resizes: u64,
+    pub cfg_w: u32,
+    pub cfg_h: u32,
 }
 
 impl WatchStats {
@@ -102,7 +111,18 @@ impl WatchStats {
             host_fps_x10: self.host_fps_x10.load(Ordering::Relaxed),
             last_ts_us: self.last_ts_us.load(Ordering::Relaxed),
             ended: self.ended.load(Ordering::Relaxed),
+            resizes: self.resizes.load(Ordering::Relaxed),
+            cfg_w: self.cfg_w.load(Ordering::Relaxed) as u32,
+            cfg_h: self.cfg_h.load(Ordering::Relaxed) as u32,
         }
+    }
+
+    /// 被控端**当前**画幅（最新 `VideoCfg` 报的）。换过分辨率后就是新值。
+    pub fn size(&self) -> (u32, u32) {
+        (
+            self.cfg_w.load(Ordering::Relaxed) as u32,
+            self.cfg_h.load(Ordering::Relaxed) as u32,
+        )
     }
 
     /// 被控端上报的实测编码帧率（fps）。0 表示「还没测出来」。
@@ -120,13 +140,15 @@ impl WatchStats {
     }
 }
 
-/// 收下一条 `VideoCfg`：更新实测帧率；返回「分辨率变了」（调用方据此报警）。
+/// 收下一条 `VideoCfg`：更新实测帧率与当前画幅；返回「分辨率变了」。
 ///
 /// 必须分得清这两种情况：**只报帧率**是每 2 秒一次的常规消息，绝不能因此重建解码器；
-/// 分辨率变了才是需要重建的那种（M2.5 的未完成项 —— 现在只报警，不假装修好了）。
+/// 分辨率变了才需要重建（返回 `true`，调用方据此重开 ffmpeg 解码进程）。
 pub fn apply_video_cfg(stats: &WatchStats, c: &HostVideoCfg, expect: (u32, u32)) -> bool {
     let x10 = (c.actual_fps.max(0.0) * 10.0).round() as u64;
     stats.host_fps_x10.store(x10, Ordering::Relaxed);
+    stats.cfg_w.store(c.w as u64, Ordering::Relaxed);
+    stats.cfg_h.store(c.h as u64, Ordering::Relaxed);
     c.w != expect.0 || c.h != expect.1
 }
 
@@ -147,14 +169,12 @@ pub struct VideoWatcher {
     rx: watch::Receiver<Option<Frame>>,
     stats: Arc<WatchStats>,
     started: Instant,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
-    /// 解码器子进程的宿主。
+    /// 收帧/喂流/重建解码器的总管任务句柄。
     ///
-    /// **必须由 watcher 持有，不能塞进任何后台任务里**：`VideoDecoder::drop`
-    /// 会 kill 掉 ffmpeg。曾经把它当作「保活守卫」放进喂流任务，结果那个任务
-    /// 一结束（喂完最后一帧、stdin 关闭）就把 ffmpeg 杀了 —— ffmpeg 还没来得及
-    /// 把已解出的帧冲刷到 stdout。表现出来就是「喂入 20 个 AU、解出 0 帧」。
-    _decoder: VideoDecoder,
+    /// **解码器子进程由这个任务持有，不再由 watcher 直接持有**：换分辨率时要先杀掉
+    /// 旧解码器再起新的，而「同一时刻只该有一个解码器活着」这条约束放在一个任务里
+    /// 最容易保证。`Drop` 会 abort 它，解码器随之被 kill（`VideoDecoder::drop`）。
+    tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl VideoWatcher {
@@ -224,92 +244,37 @@ impl VideoWatcher {
             )))
         })?;
 
-        let mut decoder = VideoDecoder::start(&ffmpeg_path, info.w, info.h).await?;
-        let (writer, mut reader) = decoder.split()?;
+        // 第一代解码器在这里起：起不来就当场返回错误，别让调用方拿到一个永远不出帧的 watcher。
+        let first = VideoDecoder::start(&ffmpeg_path, info.w, info.h).await?;
         let stats = Arc::new(WatchStats::default());
         // 首帧的 VideoCfg 里也带实测帧率（刚开播通常是 0，编码器重启时可能已经有值）。
         apply_video_cfg(&stats, &info, (info.w, info.h));
         let (latest_tx, latest_rx) = watch::channel::<Option<Frame>>(None);
         let started = Instant::now();
 
-        // 网络 → 有界队列
-        let (q_tx, q_rx) = mpsc::channel::<(u64, Vec<u8>)>(8);
-        let stats_pump = stats.clone();
-        let size = (info.w, info.h);
-        let pump = tokio::spawn(async move {
-            pump_video(video, q_tx, stats_pump, size).await;
-        });
-
-        // 队列 → ffmpeg stdin
-        let stats_feed = stats.clone();
-        let last_ts = Arc::new(AtomicU64::new(0));
-        let last_ts_feed = last_ts.clone();
-        let mut writer = writer;
-        // 参数帧之前攒下的 AU 先喂进去
-        for (ts, au) in pending {
-            let _ = writer.feed(&au).await;
-            last_ts_feed.store(ts, Ordering::Relaxed);
-        }
-        let feed = tokio::spawn(async move {
-            let mut rx = q_rx;
-            while let Some((ts, au)) = rx.recv().await {
-                if let Err(e) = writer.feed(&au).await {
-                    debug!(error = %e, "写解码器失败，喂流结束");
-                    break;
-                }
-                last_ts_feed.store(ts, Ordering::Relaxed);
-                stats_feed.fed.fetch_add(1, Ordering::Relaxed);
-            }
-            // writer 在这里 drop → 关掉 ffmpeg 的 stdin → 它会冲刷出剩余帧再退出。
-            // 注意这里**不**持有 `VideoDecoder`：它的 Drop 会 kill 子进程，
-            // 那会把还没冲刷出来的帧一起杀掉。宿主是 `VideoWatcher::_decoder`。
-        });
-
-        // ffmpeg stdout → watch（最新一帧）
-        let stats_dec = stats.clone();
-        let last_ts_dec = last_ts.clone();
-        let (w, h) = (info.w, info.h);
-        let decoded = tokio::spawn(async move {
-            let mut buf: Vec<u8> = Vec::new();
-            loop {
-                match reader.next_frame_into(&mut buf).await {
-                    Ok(true) => {
-                        let n = stats_dec.decoded.fetch_add(1, Ordering::Relaxed);
-                        if n == 0 {
-                            stats_dec
-                                .first_frame_ms
-                                .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
-                        }
-                        let frame = Frame {
-                            pixels: buf.clone(),
-                            width: w,
-                            height: h,
-                            ts_us: last_ts_dec.load(Ordering::Relaxed),
-                            at: Instant::now(),
-                        };
-                        // watch 只保留最新值：渲染端天然「追不上就跳帧」
-                        let _ = latest_tx.send(Some(frame));
-                    }
-                    Ok(false) => break,
-                    Err(e) => {
-                        debug!(error = %e, "解码读取结束");
-                        break;
-                    }
-                }
-            }
-            stats_dec.ended.store(true, Ordering::Relaxed);
-        });
+        let (read_half, write_half) = video.into_split();
+        let sup = tokio::spawn(supervise(
+            read_half,
+            write_half,
+            info.clone(),
+            pending,
+            ffmpeg_path,
+            first,
+            stats.clone(),
+            latest_tx,
+            started,
+        ));
 
         Ok(Self {
             info,
             rx: latest_rx,
             stats,
             started,
-            tasks: vec![pump, feed, decoded],
-            _decoder: decoder,
+            tasks: vec![sup],
         })
     }
 
+    /// 首帧的画面参数。**分辨率可能随后变化**，当前值看 `stats().size()`。
     pub fn info(&self) -> &HostVideoCfg {
         &self.info
     }
@@ -358,25 +323,199 @@ impl Drop for VideoWatcher {
     }
 }
 
-/// 从视频通道收帧，塞进有界队列。满了就丢 —— 宁可丢帧也不要拖延迟。
-async fn pump_video(
-    mut video: TcpStream,
+/// 一代收帧任务的结局。
+enum PumpEnd {
+    /// 被控端换了画幅：socket 交回来，由总管重建解码器。
+    Resize(HostVideoCfg),
+    /// 通道关闭（Bye / EOF / 读错误）。
+    Closed,
+}
+
+/// 总管：一代解码流水线跑完 → 若要换分辨率，杀旧解码器、起新解码器，接着跑。
+///
+/// ```text
+/// loop {
+///   ffmpeg 解码器(本代尺寸) ← feed ← 有界队列 ← pump(socket 读半)
+///                     └→ watch(最新一帧)
+///   pump 报「分辨率变了」→ kill 解码器 → 下一代（socket 两个半端原样交回）
+/// }
+/// ```
+///
+/// 为什么要分代而不是「一个解码器吃到死」：ffmpeg 的 rawvideo 输出尺寸在进程启动时
+/// 就定死了（`-video_size` + 每帧字节数），被控端换了分辨率之后继续喂，读出来的
+/// 就是错位的字节流 —— 画出来是一堆斜条纹，而且永远不会自愈。
+async fn supervise(
+    r: OwnedReadHalf,
+    w: OwnedWriteHalf,
+    mut info: HostVideoCfg,
+    mut pending: Vec<(u64, Vec<u8>)>,
+    ffmpeg: PathBuf,
+    first: VideoDecoder,
+    stats: Arc<WatchStats>,
+    latest_tx: watch::Sender<Option<Frame>>,
+    started: Instant,
+) {
+    let mut reuse = Some(first);
+    // socket 的两个半端在换代之间交接：pump 任务结束后把所有权带回来。
+    let mut halves = Some((r, w));
+    loop {
+        let (fw, fh) = (info.w, info.h);
+        let mut decoder = match reuse.take() {
+            Some(d) => d,
+            None => match VideoDecoder::start(&ffmpeg, fw, fh).await {
+                Ok(d) => d,
+                Err(e) => {
+                    // 新尺寸的解码器起不来：留着旧尺寸继续解码只会画出错位画面，
+                    // 所以老实收尾，让上层看到「视频结束」而不是一屏花屏。
+                    warn!(error = %e, w = fw, h = fh, "按新分辨率启动解码器失败，视频结束");
+                    stats.ended.store(true, Ordering::Relaxed);
+                    return;
+                }
+            },
+        };
+        let (mut writer, mut reader) = match decoder.split() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "解码器两端取不出来（已经 split 过？），视频结束");
+                stats.ended.store(true, Ordering::Relaxed);
+                return;
+            }
+        };
+
+        // 网络 → 有界队列
+        let (q_tx, mut q_rx) = mpsc::channel::<(u64, Vec<u8>)>(8);
+
+        // 参数帧之前攒下的 AU 先喂进去
+        for (ts, au) in pending.drain(..) {
+            if writer.feed(&au).await.is_err() {
+                break;
+            }
+            stats.fed.fetch_add(1, Ordering::Relaxed);
+            stats.last_ts_us.store(ts, Ordering::Relaxed);
+        }
+
+        // 队列 → ffmpeg stdin
+        let stats_feed = stats.clone();
+        let feed = tokio::spawn(async move {
+            while let Some((ts, au)) = q_rx.recv().await {
+                if let Err(e) = writer.feed(&au).await {
+                    debug!(error = %e, "写解码器失败，喂流结束");
+                    break;
+                }
+                stats_feed.last_ts_us.store(ts, Ordering::Relaxed);
+                stats_feed.fed.fetch_add(1, Ordering::Relaxed);
+            }
+            // writer 在这里 drop → 关掉 ffmpeg 的 stdin → 它会冲刷出剩余帧再退出。
+            // **不**持有解码器本体：Drop 会 kill 子进程，把还没冲刷的帧一起杀掉。
+        });
+
+        // ffmpeg stdout → watch（最新一帧）
+        let stats_dec = stats.clone();
+        let frame_tx = latest_tx.clone();
+        let mut decoded = tokio::spawn(async move {
+            let mut buf: Vec<u8> = Vec::new();
+            loop {
+                match reader.next_frame_into(&mut buf).await {
+                    Ok(true) => {
+                        let n = stats_dec.decoded.fetch_add(1, Ordering::Relaxed);
+                        if n == 0 {
+                            stats_dec
+                                .first_frame_ms
+                                .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                        }
+                        let frame = Frame {
+                            pixels: buf.clone(),
+                            width: fw,
+                            height: fh,
+                            ts_us: stats_dec.last_ts_us.load(Ordering::Relaxed),
+                            at: Instant::now(),
+                        };
+                        // watch 只保留最新值：渲染端天然「追不上就跳帧」
+                        let _ = frame_tx.send(Some(frame));
+                    }
+                    Ok(false) => break,
+                    Err(e) => {
+                        debug!(error = %e, "解码读取结束");
+                        break;
+                    }
+                }
+            }
+            stats_dec.ended.store(true, Ordering::Relaxed);
+        });
+
+        let (r0, w0) = halves.take().expect("socket 两半应当在每一代开头交回");
+        let mut pump = tokio::spawn(pump_generation(r0, w0, q_tx, stats.clone(), (fw, fh)));
+
+        let end = tokio::select! {
+            j = &mut pump => match j {
+                Ok((nr, nw, end)) => {
+                    halves = Some((nr, nw));
+                    end
+                }
+                Err(e) => {
+                    debug!(error = %e, "收帧任务异常退出");
+                    PumpEnd::Closed
+                }
+            },
+            // 解码先停（码流断了 / ffmpeg 崩了）：没有新帧可放，换尺寸也救不回来。
+            _ = &mut decoded => {
+                debug!("解码流水线先结束，视频通道收尾");
+                pump.abort();
+                stats.ended.store(true, Ordering::Relaxed);
+                return;
+            }
+        };
+
+        match end {
+            PumpEnd::Resize(cfg) => {
+                // 旧的一代整个丢掉：旧解码器的输出尺寸已经不对，留着只会出斜条纹。
+                feed.abort();
+                decoded.abort();
+                let _ = decoder.kill().await;
+                stats.resizes.fetch_add(1, Ordering::Relaxed);
+                info!(w = cfg.w, h = cfg.h, from_w = fw, from_h = fh, "被控端分辨率变了，解码器已重建");
+                info = cfg;
+                stats.ended.store(false, Ordering::Relaxed);
+                // 新码流以关键帧开头（被控端重启编码源必然先出 IDR），不需要再补旧帧
+                continue;
+            }
+            PumpEnd::Closed => {
+                // 让 ffmpeg 把已解出的帧冲刷出来再收工：不 abort feed ——
+                // 它会在队列排空、stdin 关闭后自然退出。
+                let _ = tokio::time::timeout(Duration::from_secs(2), &mut decoded).await;
+                feed.abort();
+                let _ = decoder.kill().await;
+                stats.ended.store(true, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+}
+
+/// 收一代的帧：socket 读半 → 有界队列。满了就丢 —— 宁可丢帧也不要拖延迟。
+///
+/// **返回值把 socket 的两个半端原样交回去**：换分辨率要重建解码器，但 TCP 连接
+/// 不能断，所以读半端必须能从一个 pump 交到下一个 pump（`JoinHandle` 的返回值
+/// 正好就是这条交接通道；用 `Arc<Mutex<TcpStream>>` 反而会把并发读写成串行）。
+async fn pump_generation(
+    mut r: OwnedReadHalf,
+    mut w: OwnedWriteHalf,
     tx: mpsc::Sender<(u64, Vec<u8>)>,
     stats: Arc<WatchStats>,
     size: (u32, u32),
-) {
-    loop {
-        let f = match read_frame(&mut video).await {
+) -> (OwnedReadHalf, OwnedWriteHalf, PumpEnd) {
+    let end = loop {
+        let f = match read_frame(&mut r).await {
             Ok(f) => f,
             Err(uulan_protocol::frame::FrameError::Io(e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
                 debug!("视频通道被对端关闭");
-                break;
+                break PumpEnd::Closed;
             }
             Err(e) => {
                 debug!(error = %e, "视频通道读取结束");
-                break;
+                break PumpEnd::Closed;
             }
         };
 
@@ -399,37 +538,34 @@ async fn pump_video(
                         // 但排队会让延迟一路涨上去，那才是致命的。
                         stats.dropped.fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    Err(mpsc::error::TrySendError::Closed(_)) => break PumpEnd::Closed,
                 }
             }
             FrameKind::Ping => {
-                let _ = write_frame(&mut video, FrameKind::Pong, &f.payload).await;
+                let _ = write_frame(&mut w, FrameKind::Pong, &f.payload).await;
             }
             FrameKind::Bye => {
                 debug!("被控端道别，视频通道结束");
-                break;
+                break PumpEnd::Closed;
             }
             // 画面参数/实测帧率的周期性上报。只改帧率时**绝不能**动解码器。
             FrameKind::Json => match f.decode_json::<H2C>() {
                 Ok(H2C::VideoCfg(c)) => {
                     if apply_video_cfg(&stats, &c, size) {
-                        warn!(
-                            host_w = c.w,
-                            host_h = c.h,
-                            "被控端分辨率变了，但控制端还没有重建解码器（M2.5 未完成项）：画面会停在旧尺寸，不会自动跟上"
-                        );
+                        break PumpEnd::Resize(c);
                     }
                 }
                 Ok(H2C::Bye { reason }) => {
                     debug!(%reason, "被控端道别，视频通道结束");
-                    break;
+                    break PumpEnd::Closed;
                 }
                 Ok(_) => {}
                 Err(e) => debug!(error = %e, "视频通道上收到无法解析的 JSON 帧"),
             },
             _ => {}
         }
-    }
+    };
+    (r, w, end)
 }
 
 #[cfg(test)]

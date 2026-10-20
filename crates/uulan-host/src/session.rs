@@ -302,6 +302,11 @@ pub struct SessionParams {
     /// 之所以做成可注入的：本机测试要塞一个「内存剪贴板」，才能在没有 X11 的机器上
     /// 断言「控制端复制的文字真的写进了被控端剪贴板、反过来也一样」。
     pub clipboard: Option<Box<dyn Clipboard>>,
+    /// 屏幕尺寸探测钩子。`None` = 按采集源自动决定（X11 且配置没钉死尺寸 → xdpyinfo）。
+    ///
+    /// 注入它的唯一理由是测试：本机没有 X11，要验「被控端换分辨率 → 控制端重建解码器」
+    /// 只能让探针按剧本返回不同尺寸。
+    pub screen_probe: Option<ScreenProbe>,
 }
 
 #[derive(Debug)]
@@ -361,6 +366,14 @@ pub async fn run_with_sink(
 
     // 视频参数的热更新通道：控制端改画质/帧率时不需要断开重连。
     let (set_tx, set_rx) = watch::channel(params.settings);
+    // 分辨率热变化的通道：视频任务探到屏幕尺寸变了 → 通知输入映射器换尺寸。
+    // 两条链路必须同步换：画面按新尺寸出，坐标却还按旧尺寸换算的话，
+    // 用户点哪儿都不对（而且这种偏差很难在真机上定位）。
+    let (size_tx, size_rx) = watch::channel(params.screen);
+    let probe = params
+        .screen_probe
+        .take()
+        .or_else(|| production_probe(&params.capture, &cfg));
     let video_task = tokio::spawn(video_loop(
         params.ffmpeg.clone(),
         params.capture.clone(),
@@ -368,11 +381,17 @@ pub async fn run_with_sink(
         params.encoder,
         params.state.device_id().unwrap_or_default(),
         set_rx,
+        probe,
+        size_tx,
         video,
     ));
 
     // 键鼠注入：Mapper 是纯状态机，sink 才是真后端。
-    let mut input = InputLoop::new(Mapper::new(params.screen.w, params.screen.h), sink);
+    let mut input = InputLoop::new(
+        Mapper::new(params.screen.w, params.screen.h),
+        sink,
+        size_rx,
+    );
     info!(sink = input.sink.name(), "键鼠注入后端");
     info!(backend = clip.name(), available = clip_available, "剪贴板后端");
 
@@ -519,6 +538,44 @@ async fn handshake(
 /// 每个鼠标移动都回一条 `InputError` 会把控制通道刷爆。
 const INPUT_ERROR_REPORT_EVERY: Duration = Duration::from_millis(2000);
 
+/// 屏幕尺寸探测周期（只看「变了没有」，1 秒足够灵敏又不浪费）。
+const SCREEN_POLL_INTERVAL: Duration = Duration::from_millis(1000);
+/// 一次探测最多等多久。xdpyinfo 正常是几毫秒；卡住就当作「没变」。
+const SCREEN_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 屏幕尺寸探测钩子。
+///
+/// 做成可注入的：本机没有 X11，测试要模拟「被控端分辨率变了」只能塞一个假探针。
+/// 返回 `None` 表示这一拍探测失败 —— 调用方必须当作「没变」，
+/// 不能因为一次探测失败就把好好的画面重开一遍。
+pub type ScreenProbe = Arc<dyn Fn() -> Option<Screen> + Send + Sync>;
+
+/// 调一次探针。阻塞型探针（跑 xdpyinfo）放到阻塞线程池里，别把 tokio worker 卡住。
+async fn probe_once(probe: &Option<ScreenProbe>) -> Option<Screen> {
+    let p = probe.as_ref()?.clone();
+    tokio::time::timeout(
+        SCREEN_PROBE_TIMEOUT,
+        tokio::task::spawn_blocking(move || p()),
+    )
+    .await
+    .ok()?
+    .ok()?
+}
+
+/// 生产环境的探针：抓 X11 屏幕、且配置里**没有**钉死尺寸时才启用。
+///
+/// 配置里写了 `screen_width/screen_height` 就是用户明确要求「就抓这一块」，
+/// 此时跟随屏幕尺寸变化反而会把用户钉的区域改掉。
+fn production_probe(capture: &CaptureInput, cfg: &HostConfig) -> Option<ScreenProbe> {
+    if cfg.screen_width > 0 && cfg.screen_height > 0 {
+        return None;
+    }
+    let disp = capture.display()?;
+    Some(Arc::new(move || {
+        crate::capture::detect_x11_screen_blocking(&disp).map(|(w, h)| Screen { w, h })
+    }))
+}
+
 /// 剪贴板同步的计数（会话结束时打印，作为「真的同步过」的机器可查证据）。
 #[derive(Debug, Default)]
 struct ClipStats {
@@ -534,6 +591,9 @@ struct ClipStats {
 struct InputLoop {
     mapper: Mapper,
     sink: Box<dyn InputSink>,
+    /// 被控端分辨率热变化的信号。变了就把 Mapper 的屏幕尺寸换掉 ——
+    /// 控制端发来的是归一化坐标，乘以旧尺寸会让点击整体偏到别处。
+    size_rx: watch::Receiver<Screen>,
     /// 收到的输入消息条数（排障与验收都看这个数）。
     events: u64,
     /// 注入失败次数（含被节流没上报的）。
@@ -542,8 +602,17 @@ struct InputLoop {
 }
 
 impl InputLoop {
-    fn new(mapper: Mapper, sink: Box<dyn InputSink>) -> Self {
-        Self { mapper, sink, events: 0, errors: 0, last_report: None }
+    fn new(mapper: Mapper, sink: Box<dyn InputSink>, size_rx: watch::Receiver<Screen>) -> Self {
+        Self { mapper, sink, size_rx, events: 0, errors: 0, last_report: None }
+    }
+
+    /// 分辨率变了就同步给 Mapper。**必须在换算坐标之前调**，否则这一条消息会按旧尺寸落点。
+    fn sync_screen(&mut self) {
+        if let Ok(true) = self.size_rx.has_changed() {
+            let s = *self.size_rx.borrow_and_update();
+            self.mapper.set_screen(s.w, s.h);
+            debug!(w = s.w, h = s.h, "屏幕尺寸已同步到输入映射器");
+        }
     }
 
     /// 执行一批注入指令。
@@ -640,6 +709,8 @@ async fn control_loop(
                                 continue;
                             }
                         };
+                        // 先同步屏幕尺寸，再换算坐标：换分辨率后的第一条消息也不会落偏。
+                        input.sync_screen();
                         match msg {
                             C2H::Bye { reason } => return Ok(Closed::Bye(reason)),
                             C2H::VideoSet(v) => {
@@ -745,17 +816,29 @@ async fn control_loop(
     }
 }
 
-/// 视频推送任务。参数变化时重启编码器。
+/// 视频推送任务。参数变化时重启编码器；**被控端分辨率变化也重启**（换 `-video_size`）。
+///
+/// 为什么必须重启而不能「接着编」：x11grab 的抓取区域尺寸在 ffmpeg 启动时就定死了。
+/// 屏幕从 1920x1080 变成 1280x720 之后继续按旧尺寸抓，抓到的是一块不存在的区域
+/// （ffmpeg 报错退出，或者补黑边）；反过来 1280x720 → 1920x1080 则只抓左上角一块。
+/// 所以发现尺寸变了就停掉编码源、按新尺寸重开，并用一条新的 `VideoCfg` 让控制端重建解码器。
+#[allow(clippy::too_many_arguments)]
 async fn video_loop(
     ffmpeg: PathBuf,
     capture: CaptureInput,
-    screen: Screen,
+    mut screen: Screen,
     encoder: Encoder,
     device_id: String,
     mut set_rx: watch::Receiver<VideoSettings>,
+    probe: Option<ScreenProbe>,
+    size_tx: watch::Sender<Screen>,
     mut video: TcpStream,
 ) {
     let mut cur = *set_rx.borrow();
+    // 分辨率探针：只在「没在配置里钉死尺寸」时才存在。1 秒一次，成本是一条 xdpyinfo。
+    let mut screen_tick = tokio::time::interval(SCREEN_POLL_INTERVAL);
+    screen_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    screen_tick.tick().await; // 第一拍立即触发，吃掉
     loop {
         let opts = make_capture_options(&capture, screen, encoder, cur);
         let input = capture.to_ffmpeg_input(&opts);
@@ -818,6 +901,17 @@ async fn video_loop(
                     Err(e) => {
                         warn!(error = %e, "读编码输出失败");
                         let _ = src.stop().await;
+                        // 抓屏源最常见的死因就是分辨率变了（按旧尺寸抓一块不存在的区域，
+                        // ffmpeg 直接退出）。这时别把会话关掉，换尺寸重开一次。
+                        if let Some(s) = probe_once(&probe).await {
+                            if s != screen {
+                                info!(from_w = screen.w, from_h = screen.h, to_w = s.w, to_h = s.h,
+                                      "编码源出错且分辨率已变，按新尺寸重启");
+                                screen = s;
+                                let _ = size_tx.send(screen);
+                                break true;
+                            }
+                        }
                         return;
                     }
                 },
@@ -836,6 +930,19 @@ async fn video_loop(
                         return;
                     }
                     break true;
+                }
+                _ = screen_tick.tick() => {
+                    // 屏幕尺寸变了就重开编码源。探针失败（xdpyinfo 没了/暂时读不到）
+                    // 一律当作「没变」—— 不能因为一次探测失败就把好好的画面重开一遍。
+                    if let Some(s) = probe_once(&probe).await {
+                        if s != screen {
+                            info!(from_w = screen.w, from_h = screen.h, to_w = s.w, to_h = s.h,
+                                  "被控端分辨率变了，重启编码源");
+                            screen = s;
+                            let _ = size_tx.send(screen);
+                            break true;
+                        }
+                    }
                 }
             }
         };
@@ -944,6 +1051,23 @@ mod tests {
         assert!(!ct_eq("aB3dE5fG", "aB3dE5f"));
         assert!(!ct_eq("aB3dE5f", "aB3dE5fG"));
         assert!(ct_eq("", ""));
+    }
+
+    #[test]
+    fn screen_probe_only_follows_an_unpinned_x11_screen() {
+        let mut cfg = HostConfig::default();
+        cfg.capture = crate::capture::CaptureInput::X11 { display: Some(":0.0".into()) };
+        assert!(
+            production_probe(&cfg.capture, &cfg).is_some(),
+            "抓 X11 且没钉死尺寸时，应当跟随屏幕分辨率变化"
+        );
+        // 配置里写了尺寸 = 用户要求「就抓这一块」，跟随反而会改掉他钉的区域
+        cfg.screen_width = 1920;
+        cfg.screen_height = 1080;
+        assert!(production_probe(&cfg.capture, &cfg).is_none(), "钉死尺寸时不该跟随");
+        // 合成源没有屏幕可探测
+        let lav = crate::capture::CaptureInput::parse("lavfi").unwrap();
+        assert!(production_probe(&lav, &HostConfig::default()).is_none());
     }
 
     #[test]

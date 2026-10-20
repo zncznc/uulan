@@ -130,6 +130,7 @@ async fn spawn_host(server: &str, cfg: HostConfig, cell: Cell) -> String {
                     encoder: Encoder::X264,
                     settings,
                     clipboard: Some(Box::new(FakeClipboard { cell: cell.clone() })),
+                    screen_probe: None,
                 };
                 let a = addr.clone();
                 tokio::spawn(async move {

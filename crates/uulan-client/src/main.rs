@@ -225,13 +225,14 @@ async fn main() -> Result<()> {
         watcher.shutdown();
         let s = watcher.snapshot();
         println!(
-            "窗口已关闭。收到 AU {} / 关键帧 {} / 解出帧 {} / 丢帧 {} / 首帧 {}ms / 被控端实测 {:.0} fps",
+            "窗口已关闭。收到 AU {} / 关键帧 {} / 解出帧 {} / 丢帧 {} / 首帧 {}ms / 被控端实测 {:.0} fps / 重建解码器 {} 次",
             s.aus,
             s.keyframes,
             s.decoded,
             s.dropped,
             s.first_frame_ms,
-            s.host_fps_x10 as f32 / 10.0
+            s.host_fps_x10 as f32 / 10.0,
+            s.resizes
         );
         return r.context("窗口退出异常");
     }
@@ -328,6 +329,7 @@ async fn main() -> Result<()> {
                 "stats": { "aus": s.aus, "keyframes": s.keyframes, "bytes": s.bytes,
                            "dropped": s.dropped, "decoded": s.decoded,
                            "first_frame_ms": s.first_frame_ms, "ended": s.ended,
+                           "resizes": s.resizes,
                            "host_fps": s.host_fps_x10 as f32 / 10.0 },
                 "rendered": count,
                 "elapsed_s": elapsed.as_secs_f64(),
@@ -348,6 +350,8 @@ async fn main() -> Result<()> {
             println!("  实测帧率   : {:.1} fps（控制端解出）", s.decoded as f64 / elapsed.as_secs_f64());
         }
         println!("  被控端帧率 : {:.2} fps（对面自己数的编码帧率）", s.host_fps_x10 as f32 / 10.0);
+        println!("  当前画幅   : {}x{}（最新一条画面参数）", s.cfg_w, s.cfg_h);
+        println!("  解码器重建 : {} 次（被控端换过分辨率）", s.resizes);
     }
 
     watcher.shutdown();

@@ -1,0 +1,70 @@
+uulan 里程碑 M2.5（分辨率变化重建解码器）—— 两端都做了，真机待验 ✅（本机全链路实测）
+
+【本轮做了什么】
+  控制端 crates/uulan-client/src/watch.rs：
+    整条解码流水线改成「按代」重建 —— 新增 supervise（总管任务）+ pump_generation（收一代的帧）
+    socket 用 into_split()，两个半端靠 pump 任务的返回值在换代之间交接（TCP 不断）
+    VideoCfg 画幅变了 → abort feed/decoded、kill 旧解码器、起新解码器、接着收
+    只报帧率的 VideoCfg 不触发重建（每 2 秒一次的那种）
+    通道正常关闭时先等 ffmpeg 冲刷完（2 秒超时）再 kill
+    WatchStats 新增 resizes / cfg_w / cfg_h，并提供 size()
+  被控端 crates/uulan-host/src/session.rs：
+    ScreenProbe（可注入的尺寸探针）+ probe_once（spawn_blocking + 3 秒超时）
+    production_probe：抓 X11 且配置没钉死尺寸时用 xdpyinfo；钉死/合成源一律 None
+    video_loop：1 秒一次探针；尺寸变了就停源、按新尺寸重开、发新 VideoCfg
+                编码源报错时也先探一次（分辨率变小时 x11grab 往往先崩）
+    InputLoop：新增 size_rx + sync_screen()，在换算坐标之前把新尺寸同步给 Mapper
+    （否则画面换尺寸、点击落点还按旧尺寸算）
+  capture.rs：
+    to_ffmpeg_input 里的 lavfi spec 跟随画幅（with_size 改写 size=WxH，别名不动）
+    detect_x11_screen_blocking（给同步探针用）
+  main.rs：统计里多打「当前画幅 WxH」「解码器重建 N 次」，JSON 加 resizes
+
+【本机实测数字（Windows 开发机，可重复）】
+  cargo test --workspace                                          206 passed / 0 failed
+                                              （基线 200，本轮新增 6；零警告）
+  cargo build --release                                           0 警告
+  cargo check -p uulan-host --target x86_64-unknown-linux-gnu     0 警告
+
+  新增测试构成（6 条）：
+    控制端 resize_path.rs（假发流器 + 真 ffmpeg 解码）        1 条
+    两端 resize_host.rs（真 server/会话/采集/编码/协议/解码）  1 条
+    capture::with_size / lavfi 跟随尺寸 / x11 抓取尺寸          3 条
+    session::production_probe 只在未钉死的 X11 场景启用         1 条
+
+【控制端单独一代 crates/uulan-client/tests/resize_path.rs】
+  假发流器按协议写：VideoCfg 320x240 → 一段 320x240 码流 →
+                    一条只报帧率的 VideoCfg(320x240, fps=14.7) → VideoCfg 480x360 → 一段 480x360 码流
+  实测：帧：320x240 3 帧 / 480x360 1 帧；重建 1 次；解出 4 帧 / 喂入 2 AU / 丢帧 0
+  断言：三条 VideoCfg 只重建一次（帧率上报不触发）；两代帧字节数各自正确；
+        除 320x240 / 480x360 外不出现第三种画幅；stats.cfg_w/h 跟到最新值
+
+【两端全链路 crates/uulan-client/tests/resize_host.rs】
+  真 server + 真被控端会话 + 真 lavfi 采集 + 真 x264 + 真协议 + 真 ffmpeg 解码；
+  替身只有两处：尺寸探针（本机没有 X11）、注入 sink（记录型）。
+  流程：先解 3 帧 320x240 → 把探针的原子量改成 480x360 → 再解 3 帧
+  实测：帧：320x240 3 帧 / 480x360 3 帧；重建 1 次；解出 349 / 喂入 456 AU / 丢帧 4386
+  断言：换之前只出 320x240；换之后出足够的新尺寸帧；stats.resizes >= 1；
+        换之后 (0.5,0.5) 注入成 MoveAbs{240,180}（不是 160,120）—— 坐标按新尺寸换算
+  （丢帧 4386 = lavfi 不限速跑满 CPU，真机 x11grab 30fps 不会这样）
+
+【窗口全链路回归 scripts/verify-window-e2e.sh（release，8 秒）】
+  窗口已关闭 painted=528 input_sent=1
+  收到 AU 2611 / 关键帧 175 / 解出帧 1483 / 丢帧 690 / 首帧 78ms / 重建解码器 0 次
+  （重建 0 次是对的：合成源尺寸没变，这条回归证明新结构没把正常路径弄坏）
+
+【必须在真麒麟 V10 SP1（X11/UKUI）上验 —— 本机没有 X11，探针是假的】
+  · 真 xrandr 改分辨率后 1 秒内 xdpyinfo 能否读到新尺寸（UKUI 下输出一致性）
+  · x11grab 在分辨率变小/变大时的真实表现（报错退出 / 补黑边 / 只抓左上角）三种都要试
+  · 换代那一瞬间控制端窗口改尺寸重绘是否正常（有无黑屏一拍）
+  · 输入映射器换尺寸后，真实点击落点与画面是否一致（多屏 / 缩放尤其要看）
+  **没有假装验过的**：生产探针（xdpyinfo 那行）在本机一行都没执行过。
+
+【已知限制（照实写）】
+  · 换分辨率会重开编码源，画面断约 0.3–1 秒，丢掉的帧不补发
+  · 分辨率跟随只看主屏；副屏热插拔不改变抓取区域
+  · 控制端换代边界上可能丢几帧（旧代任务被 abort）
+
+【下一步】
+  M2.5 的子项已全部完成 → 真机验（XTest 注入 / X11 剪贴板 / 分辨率跟随）
+  → M4 文件传输（bulk 通道已留好）→ 终端 → 端口映射

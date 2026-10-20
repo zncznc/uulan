@@ -98,7 +98,11 @@ impl CaptureInput {
         match self {
             CaptureInput::X11 { .. } => ffmpeg::x11grab_input(o),
             CaptureInput::Lavfi { spec, frames } => {
-                let mut a = vec!["-f".to_string(), "lavfi".to_string(), "-i".to_string(), spec.clone()];
+                // 合成源也跟随目标尺寸：`testsrc2=size=WxH` 里的尺寸改成 `-video_size` 那份。
+                // 这样 lavfi 才真的能模拟「抓屏设备分辨率变了」——否则 spec 里写死的尺寸
+                // 会让「重启编码源」只改了 VideoCfg、画面还是旧尺寸，测试就验不到东西。
+                let spec = with_size(spec, o.width, o.height);
+                let mut a = vec!["-f".to_string(), "lavfi".to_string(), "-i".to_string(), spec];
                 if let Some(n) = frames {
                     a.push("-frames:v".to_string());
                     a.push(n.to_string());
@@ -130,6 +134,28 @@ impl CaptureInput {
     }
 }
 
+/// 把 lavfi spec 里的 `size=WxH` 换成给定尺寸；spec 没写尺寸就原样返回。
+///
+/// 只替换真的形如 `数字x数字` 的值 —— `size=hd720` 这种别名不能动，
+/// 改坏了 ffmpeg 会直接报「无法解析的滤镜参数」。
+fn with_size(spec: &str, w: u32, h: u32) -> String {
+    if w == 0 || h == 0 {
+        return spec.to_string();
+    }
+    let Some(idx) = spec.find("size=") else {
+        return spec.to_string();
+    };
+    let start = idx + "size=".len();
+    let rest = &spec[start..];
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == 'x'))
+        .unwrap_or(rest.len());
+    if !rest[..end].contains('x') {
+        return spec.to_string();
+    }
+    format!("{}{}x{}{}", &spec[..start], w, h, &rest[end..])
+}
+
 /// 从 `xdpyinfo` 输出里解析屏幕尺寸。
 ///
 /// 输出形如：
@@ -153,6 +179,20 @@ pub fn parse_xdpyinfo_dimensions(text: &str) -> Option<(u32, u32)> {
         }
     }
     None
+}
+
+/// 阻塞版屏幕尺寸探测：给 `ScreenProbe` 用（探针本身是同步 trait object，
+/// 由调用方丢进 `spawn_blocking`）。异步版 [`detect_x11_screen`] 用它实现。
+pub fn detect_x11_screen_blocking(display: &str) -> Option<(u32, u32)> {
+    let out = std::process::Command::new("xdpyinfo")
+        .arg("-display")
+        .arg(display)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_xdpyinfo_dimensions(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// 探测 X11 屏幕尺寸。任何失败都返回 `None`，由调用方回退到配置值。
@@ -179,6 +219,34 @@ pub async fn detect_x11_screen(display: &str) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lavfi_spec_follows_the_requested_frame_size() {
+        // 分辨率变了之后编码源要用新尺寸重开；合成源必须跟着，
+        // 否则「重启」只改了 VideoCfg，画面还是旧尺寸（测试就测了个寂寞）。
+        let cap = CaptureInput::parse("lavfi:testsrc2=size=320x240:rate=10").unwrap();
+        let o = CaptureOptions::new(":0.0", 480, 360);
+        let args = cap.to_ffmpeg_input(&o);
+        assert_eq!(args[0], "-f");
+        assert_eq!(args[3], "testsrc2=size=480x360:rate=10");
+    }
+
+    #[test]
+    fn lavfi_size_alias_and_sizeless_spec_are_left_alone() {
+        // `size=hd720` 是别名，不认识数字形式就不能动；没有 size 参数的 spec 也不能硬塞
+        assert_eq!(with_size("testsrc2=size=hd720:rate=30", 640, 480), "testsrc2=size=hd720:rate=30");
+        assert_eq!(with_size("testsrc2=rate=30", 640, 480), "testsrc2=rate=30");
+        assert_eq!(with_size("testsrc2=size=320x240", 0, 0), "testsrc2=size=320x240");
+    }
+
+    #[test]
+    fn x11_input_carries_the_frame_size() {
+        // x11grab 的抓取区域就是 -video_size，分辨率变化必须体现在这里
+        let cap = CaptureInput::parse("x11::0.0").unwrap();
+        let o = CaptureOptions::new(":0.0", 1280, 720);
+        let args = cap.to_ffmpeg_input(&o).join(" ");
+        assert!(args.contains("1280x720"), "抓取尺寸没传给 x11grab: {args}");
+    }
 
     #[test]
     fn parse_x11_forms() {
