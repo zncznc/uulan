@@ -37,6 +37,69 @@ use crate::capture::CaptureInput;
 use crate::config::HostConfig;
 use crate::input::{default_sink, Inject, InputSink, Mapper};
 
+/// 实测帧率：按固定窗口统计编码器**真正产出**的 AU 数。
+///
+/// 为什么不是「累计帧数 / 总时长」：长会话里累计平均会越算越钝，
+/// 用户看不到「刚刚掉到 5 fps」这种事 —— 而那恰恰是最该看到的。
+///
+/// 为什么不直接信 ffmpeg 报的 fps：x11grab 在静止画面上本来就按「有变化才出帧」工作，
+/// 报的是请求帧率，不是实际帧率。真实数字只能靠自己数。
+#[derive(Debug)]
+pub struct FpsMeter {
+    count: u32,
+    since: Instant,
+    span: Duration,
+    last: f32,
+    samples: u64,
+}
+
+impl FpsMeter {
+    pub fn new(span: Duration) -> Self {
+        Self::starting_at(Instant::now(), span)
+    }
+
+    pub fn starting_at(now: Instant, span: Duration) -> Self {
+        Self { count: 0, since: now, span, last: 0.0, samples: 0 }
+    }
+
+    /// 记一帧；返回「刚好凑满一个窗口」（此时 [`FpsMeter::fps`] 已更新）。
+    pub fn tick(&mut self) -> bool {
+        self.tick_at(Instant::now())
+    }
+
+    pub fn tick_at(&mut self, now: Instant) -> bool {
+        self.count += 1;
+        let el = now.saturating_duration_since(self.since);
+        if el < self.span {
+            return false;
+        }
+        self.last = self.count as f32 / el.as_secs_f32().max(1e-6);
+        self.count = 0;
+        self.since = now;
+        self.samples += 1;
+        true
+    }
+
+    /// 最近一个完整窗口的帧率。还没测出来时报 0.0（「还没测」而不是「测得是 0」）。
+    pub fn fps(&self) -> f32 {
+        self.fps_at(Instant::now())
+    }
+
+    /// 同上，但以给定时刻判断「是不是已经停了」。
+    ///
+    /// 编码器卡住/停止出帧时必须把帧率归零：否则控制端会一直看到「30 fps」，
+    /// 而画面其实是冻住的 —— 那是比不显示更坏的误导。
+    pub fn fps_at(&self, now: Instant) -> f32 {
+        if self.samples == 0 {
+            return 0.0;
+        }
+        if now.saturating_duration_since(self.since) > self.span * 3 {
+            return 0.0;
+        }
+        self.last
+    }
+}
+
 /// 连续失败多少次开始锁定。
 pub const AUTH_MAX_FAILURES: u32 = 5;
 /// 首次锁定时长；之后每多错一次翻倍，封顶 [`AUTH_LOCK_CAP`]。
@@ -596,17 +659,14 @@ async fn video_loop(
         };
         info!(?cur, screen_w = screen.w, screen_h = screen.h, "编码源已启动");
 
-        let cfg_msg = H2C::VideoCfg(HostVideoCfg {
-            w: screen.w,
-            h: screen.h,
-            codec: "h264".into(),
-            fps: cur.fps,
-            encoder: encoder.codec_name().to_string(),
-            chroma: "420".into(),
-            // 实测帧率要到 M2.5 才统计（需要按秒滑动平均）；先如实报 0，
-            // 控制端看到 0 就知道「还没测」而不是「测得是 0」。
-            actual_fps: 0.0,
-        });
+        // 实测帧率：真实产出只能自己数。每次重启编码源都重新开一个窗口。
+        let mut fps = FpsMeter::new(Duration::from_secs(1));
+        // 每 2 秒把实测帧率推给控制端（顺带充当视频通道的保活）。
+        let mut report = tokio::time::interval(Duration::from_secs(2));
+        report.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        report.tick().await; // 第一拍是立即触发的，先吃掉，免得刚开播就推一条 0 fps
+
+        let cfg_msg = video_cfg(screen, encoder, cur, 0.0);
         if send_h2c(&mut video, &cfg_msg).await.is_err() {
             let _ = src.stop().await;
             return;
@@ -623,6 +683,9 @@ async fn video_loop(
                             debug!("视频通道写入失败，退出");
                             let _ = src.stop().await;
                             return;
+                        }
+                        if fps.tick() {
+                            debug!(fps = fps.fps(), "实测帧率（1 秒窗口）");
                         }
                     }
                     Ok(None) => {
@@ -643,6 +706,15 @@ async fn video_loop(
                         return;
                     }
                 },
+                _ = report.tick() => {
+                    // 分辨率/编码器没变，只是报一下实测帧率。
+                    // 编码器停了的时候 FpsMeter 会自己归零 —— 一直报 30 而画面冻住是最坏的误导。
+                    let msg = video_cfg(screen, encoder, cur, fps.fps());
+                    if send_h2c(&mut video, &msg).await.is_err() {
+                        let _ = src.stop().await;
+                        return;
+                    }
+                }
                 changed = set_rx.changed() => {
                     if changed.is_err() {
                         let _ = src.stop().await;
@@ -660,6 +732,19 @@ async fn video_loop(
             return;
         }
     }
+}
+
+/// 组装一条 `VideoCfg`。周期性上报实测帧率时也用它 —— 字段只写一遍，免得两处不一致。
+fn video_cfg(screen: Screen, encoder: Encoder, s: VideoSettings, actual_fps: f32) -> H2C {
+    H2C::VideoCfg(HostVideoCfg {
+        w: screen.w,
+        h: screen.h,
+        codec: "h264".into(),
+        fps: s.fps,
+        encoder: encoder.codec_name().to_string(),
+        chroma: "420".into(),
+        actual_fps,
+    })
 }
 
 fn make_capture_options(
@@ -870,6 +955,35 @@ mod tests {
         let saved = HostConfig::load(&p).unwrap();
         assert_eq!(saved.device_id.as_deref(), Some("123456789"));
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn fps_meter_reports_the_completed_window() {
+        let t0 = Instant::now();
+        let mut m = FpsMeter::starting_at(t0, Duration::from_secs(1));
+        assert_eq!(m.fps_at(t0), 0.0, "还没测出来时必须报 0，不能猜一个数");
+
+        // 30 帧/秒：第 30 帧刚好把 1 秒窗口填满
+        let mut closed = false;
+        for i in 1..=30 {
+            closed = m.tick_at(t0 + Duration::from_millis(i * 1000 / 30));
+        }
+        assert!(closed, "第 30 帧应当凑满窗口");
+        let f = m.fps_at(t0 + Duration::from_secs(1));
+        assert!((f - 30.0).abs() < 0.6, "测得 {f}");
+    }
+
+    #[test]
+    fn fps_meter_zeroes_out_when_frames_stop() {
+        let t0 = Instant::now();
+        let mut m = FpsMeter::starting_at(t0, Duration::from_secs(1));
+        for i in 1..=10 {
+            m.tick_at(t0 + Duration::from_millis(i * 100));
+        }
+        let t1 = t0 + Duration::from_secs(1);
+        assert!((m.fps_at(t1) - 10.0).abs() < 0.6, "测得 {}", m.fps_at(t1));
+        // 停了四个窗口就必须归零 —— 一直报「10 fps」而画面已经冻住，比不显示更坏。
+        assert_eq!(m.fps_at(t1 + Duration::from_secs(4)), 0.0);
     }
 
     #[test]

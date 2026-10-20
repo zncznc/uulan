@@ -203,8 +203,13 @@ async fn main() -> Result<()> {
         watcher.shutdown();
         let s = watcher.snapshot();
         println!(
-            "窗口已关闭。收到 AU {} / 关键帧 {} / 解出帧 {} / 丢帧 {} / 首帧 {}ms",
-            s.aus, s.keyframes, s.decoded, s.dropped, s.first_frame_ms
+            "窗口已关闭。收到 AU {} / 关键帧 {} / 解出帧 {} / 丢帧 {} / 首帧 {}ms / 被控端实测 {:.0} fps",
+            s.aus,
+            s.keyframes,
+            s.decoded,
+            s.dropped,
+            s.first_frame_ms,
+            s.host_fps_x10 as f32 / 10.0
         );
         return r.context("窗口退出异常");
     }
@@ -300,7 +305,8 @@ async fn main() -> Result<()> {
                            "encoder": info.encoder },
                 "stats": { "aus": s.aus, "keyframes": s.keyframes, "bytes": s.bytes,
                            "dropped": s.dropped, "decoded": s.decoded,
-                           "first_frame_ms": s.first_frame_ms, "ended": s.ended },
+                           "first_frame_ms": s.first_frame_ms, "ended": s.ended,
+                           "host_fps": s.host_fps_x10 as f32 / 10.0 },
                 "rendered": count,
                 "elapsed_s": elapsed.as_secs_f64(),
                 "bitrate_kbps": kbps,
@@ -317,8 +323,9 @@ async fn main() -> Result<()> {
         println!("  平均码率   : {:.0} kbps", kbps);
         println!("  持续时长   : {:.1} s", elapsed.as_secs_f64());
         if elapsed.as_secs_f64() > 0.0 {
-            println!("  实测帧率   : {:.1} fps", s.decoded as f64 / elapsed.as_secs_f64());
+            println!("  实测帧率   : {:.1} fps（控制端解出）", s.decoded as f64 / elapsed.as_secs_f64());
         }
+        println!("  被控端帧率 : {:.2} fps（对面自己数的编码帧率）", s.host_fps_x10 as f32 / 10.0);
     }
 
     watcher.shutdown();

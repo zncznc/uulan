@@ -48,6 +48,8 @@ pub struct Overlay {
     pub dropped: u64,
     /// 首帧延迟（ms），未收到首帧时为 None。
     pub first_frame_ms: Option<u64>,
+    /// 被控端上报的实测编码帧率（0 = 还没测出来）。
+    pub host_fps: f32,
 }
 
 impl Overlay {
@@ -56,6 +58,11 @@ impl Overlay {
             "uulan · {} · {}x{} · 画面 {}x{} · {:.0} fps · {:.0} kbps",
             self.host_name, self.screen.0, self.screen.1, w, h, self.fps, self.kbps
         );
+        // 这里的 fps 是「控制端解出多少帧」，被控端真正编码了多少帧是另一个数 ——
+        // 两者差太多就说明瓶颈在解码/网络，而不是对面。
+        if self.host_fps > 0.05 {
+            s.push_str(&format!(" · 被控端 {:.0} fps", self.host_fps));
+        }
         if self.dropped > 0 {
             s.push_str(&format!(" · 丢帧 {}", self.dropped));
         }
@@ -270,6 +277,7 @@ impl App {
         self.overlay.kbps = d_bytes * 8.0 / el / 1000.0;
         self.overlay.dropped = s.dropped;
         self.overlay.first_frame_ms = (s.first_frame_ms > 0).then_some(s.first_frame_ms);
+        self.overlay.host_fps = s.host_fps_x10 as f32 / 10.0;
         self.prev = s;
         self.overlay_since = std::time::Instant::now();
         window.set_title(&self.overlay.title(ww, wh));
@@ -515,5 +523,17 @@ mod tests {
         app.blit(&frame(100, 100, (0, 255, 0)), 10, 10);
         assert_eq!(app.buf.len(), 100);
         assert!(app.buf.iter().all(|p| *p == 0x0000_FF00), "应是满屏绿");
+    }
+
+    #[test]
+    fn title_shows_the_host_reported_fps_when_known() {
+        let mut o = Overlay { host_name: "KIRIN".into(), screen: (1920, 1080), fps: 28.0, ..Default::default() };
+        // 还不知道被控端帧率时不要瞎写一个 0
+        assert!(!o.title(1280, 720).contains("被控端"));
+        o.host_fps = 30.0;
+        let t = o.title(1280, 720);
+        assert!(t.contains("被控端 30 fps"), "{t}");
+        // 控制端自己的解码帧率仍然在
+        assert!(t.contains("28 fps"), "{t}");
     }
 }

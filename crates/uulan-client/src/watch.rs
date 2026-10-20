@@ -63,6 +63,12 @@ pub struct WatchStats {
     pub decoded: AtomicU64,
     /// 从会话开始到第一帧画面的毫秒数。
     pub first_frame_ms: AtomicU64,
+    /// 被控端上报的**实测编码帧率 ×10**（0 = 还没测出来）。
+    ///
+    /// 为什么要 ×10 存整数：这是跨线程共享的原子量，浮点没法原子地存。
+    /// 为什么不数控制端自己解出多少帧：解码端丢帧/跳帧都会让它偏离真实编码帧率，
+    /// 用户想知道的是「对面到底产了多少帧」。
+    pub host_fps_x10: AtomicU64,
     /// 最近一个 AU 的被控端时间戳（微秒）。
     pub last_ts_us: AtomicU64,
     /// 解码流是否已结束。
@@ -78,6 +84,7 @@ pub struct WatchStatsSnapshot {
     pub fed: u64,
     pub decoded: u64,
     pub first_frame_ms: u64,
+    pub host_fps_x10: u64,
     pub last_ts_us: u64,
     pub ended: bool,
 }
@@ -92,9 +99,15 @@ impl WatchStats {
             fed: self.fed.load(Ordering::Relaxed),
             decoded: self.decoded.load(Ordering::Relaxed),
             first_frame_ms: self.first_frame_ms.load(Ordering::Relaxed),
+            host_fps_x10: self.host_fps_x10.load(Ordering::Relaxed),
             last_ts_us: self.last_ts_us.load(Ordering::Relaxed),
             ended: self.ended.load(Ordering::Relaxed),
         }
+    }
+
+    /// 被控端上报的实测编码帧率（fps）。0 表示「还没测出来」。
+    pub fn host_fps(&self) -> f32 {
+        self.host_fps_x10.load(Ordering::Relaxed) as f32 / 10.0
     }
 
     /// 平均码率（kbps）。`elapsed` 是从会话开始到现在的时长。
@@ -105,6 +118,16 @@ impl WatchStats {
         }
         (self.bytes.load(Ordering::Relaxed) as f64 * 8.0) / s / 1000.0
     }
+}
+
+/// 收下一条 `VideoCfg`：更新实测帧率；返回「分辨率变了」（调用方据此报警）。
+///
+/// 必须分得清这两种情况：**只报帧率**是每 2 秒一次的常规消息，绝不能因此重建解码器；
+/// 分辨率变了才是需要重建的那种（M2.5 的未完成项 —— 现在只报警，不假装修好了）。
+pub fn apply_video_cfg(stats: &WatchStats, c: &HostVideoCfg, expect: (u32, u32)) -> bool {
+    let x10 = (c.actual_fps.max(0.0) * 10.0).round() as u64;
+    stats.host_fps_x10.store(x10, Ordering::Relaxed);
+    c.w != expect.0 || c.h != expect.1
 }
 
 /// 一帧已解码的 BGRA 画面。
@@ -204,14 +227,17 @@ impl VideoWatcher {
         let mut decoder = VideoDecoder::start(&ffmpeg_path, info.w, info.h).await?;
         let (writer, mut reader) = decoder.split()?;
         let stats = Arc::new(WatchStats::default());
+        // 首帧的 VideoCfg 里也带实测帧率（刚开播通常是 0，编码器重启时可能已经有值）。
+        apply_video_cfg(&stats, &info, (info.w, info.h));
         let (latest_tx, latest_rx) = watch::channel::<Option<Frame>>(None);
         let started = Instant::now();
 
         // 网络 → 有界队列
         let (q_tx, q_rx) = mpsc::channel::<(u64, Vec<u8>)>(8);
         let stats_pump = stats.clone();
+        let size = (info.w, info.h);
         let pump = tokio::spawn(async move {
-            pump_video(video, q_tx, stats_pump).await;
+            pump_video(video, q_tx, stats_pump, size).await;
         });
 
         // 队列 → ffmpeg stdin
@@ -337,6 +363,7 @@ async fn pump_video(
     mut video: TcpStream,
     tx: mpsc::Sender<(u64, Vec<u8>)>,
     stats: Arc<WatchStats>,
+    size: (u32, u32),
 ) {
     loop {
         let f = match read_frame(&mut video).await {
@@ -382,9 +409,17 @@ async fn pump_video(
                 debug!("被控端道别，视频通道结束");
                 break;
             }
-            // 画面参数变化（分辨率/帧率）到 M2.5 才处理；现在只记一条日志。
+            // 画面参数/实测帧率的周期性上报。只改帧率时**绝不能**动解码器。
             FrameKind::Json => match f.decode_json::<H2C>() {
-                Ok(H2C::VideoCfg(c)) => debug!(?c, "画面参数变化（当前实现不重建解码器）"),
+                Ok(H2C::VideoCfg(c)) => {
+                    if apply_video_cfg(&stats, &c, size) {
+                        warn!(
+                            host_w = c.w,
+                            host_h = c.h,
+                            "被控端分辨率变了，但控制端还没有重建解码器（M2.5 未完成项）：画面会停在旧尺寸，不会自动跟上"
+                        );
+                    }
+                }
                 Ok(H2C::Bye { reason }) => {
                     debug!(%reason, "被控端道别，视频通道结束");
                     break;
@@ -394,5 +429,50 @@ async fn pump_video(
             },
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(w: u32, h: u32, fps: f32) -> HostVideoCfg {
+        HostVideoCfg {
+            w,
+            h,
+            codec: "h264".into(),
+            fps: 30,
+            encoder: "libx264".into(),
+            chroma: "420".into(),
+            actual_fps: fps,
+        }
+    }
+
+    #[test]
+    fn video_cfg_updates_fps_without_flagging_a_resize() {
+        let s = WatchStats::default();
+        // 每 2 秒一次的常规上报：只带帧率，分辨率没变 —— 绝不能因此重建解码器
+        assert!(!apply_video_cfg(&s, &cfg(1280, 720, 29.6), (1280, 720)));
+        assert!((s.host_fps() - 29.6).abs() < 0.01, "{}", s.host_fps());
+        assert_eq!(s.snapshot().host_fps_x10, 296);
+
+        // 0 表示「还没测出来」，不是「测得是 0」
+        assert!(!apply_video_cfg(&s, &cfg(1280, 720, 0.0), (1280, 720)));
+        assert_eq!(s.host_fps(), 0.0);
+    }
+
+    #[test]
+    fn video_cfg_flags_a_real_resolution_change() {
+        let s = WatchStats::default();
+        assert!(apply_video_cfg(&s, &cfg(1920, 1080, 30.0), (1280, 720)));
+        assert!(!apply_video_cfg(&s, &cfg(1920, 1080, 30.0), (1920, 1080)));
+    }
+
+    #[test]
+    fn negative_fps_is_clamped_not_wrapped() {
+        // 陌生对端发负数：取绝对值会算出天文数字，必须夹到 0
+        let s = WatchStats::default();
+        apply_video_cfg(&s, &cfg(100, 100, -5.0), (100, 100));
+        assert_eq!(s.host_fps(), 0.0);
     }
 }
