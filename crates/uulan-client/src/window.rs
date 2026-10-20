@@ -27,10 +27,15 @@ use anyhow::{anyhow, Context, Result};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
+use crate::control::InputSender;
+use crate::input::{fit_rect, key_action, key_messages, line_units, norm_point, vk_from_key, Mods,
+                  Rect, WheelAccum};
 use crate::watch::{Frame, WatchStats, WatchStatsSnapshot};
+use uulan_protocol::msg::{C2H, MouseButton as ProtoButton};
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowId};
 
 /// 窗口标题里显示的统计，约每秒刷新一次。
@@ -79,6 +84,16 @@ struct App {
     overlay_since: std::time::Instant,
     /// 到点自动关窗（自测/脚本化验证用；None = 一直开着）。
     deadline: Option<std::time::Instant>,
+    /// 键鼠上报通道。`None` = 只读模式（`--no-input`，或没有图形会话的被控端）。
+    input: Option<InputSender>,
+    /// 当前修饰键状态。判断「这是快捷键还是文本输入」用。
+    mods: Mods,
+    /// 最近一帧的画面尺寸，用来把光标位置换算成画面坐标。
+    frame_sz: Option<(u32, u32)>,
+    /// 触摸板的像素滚动要攒够一行才发。
+    wheel: WheelAccum,
+    /// 上报了多少条键鼠消息（收工时的证据数字）。
+    input_sent: u64,
 }
 
 impl App {
@@ -87,6 +102,7 @@ impl App {
         stats: Arc<WatchStats>,
         overlay: Overlay,
         deadline: Option<std::time::Instant>,
+        input: Option<InputSender>,
     ) -> Self {
         Self {
             rx,
@@ -102,6 +118,26 @@ impl App {
             prev: WatchStatsSnapshot::default(),
             overlay_since: std::time::Instant::now(),
             deadline,
+            input,
+            mods: Mods::default(),
+            frame_sz: None,
+            wheel: WheelAccum::default(),
+            input_sent: 0,
+        }
+    }
+
+    /// 画面在窗口里的实际位置。光标换算必须用它，不能用整个窗口 —— 否则留黑边时点哪儿都偏。
+    fn image_rect(&self) -> Option<Rect> {
+        let (fw, fh) = self.frame_sz?;
+        let size = self.window.as_ref()?.inner_size();
+        Some(fit_rect(fw, fh, size.width, size.height))
+    }
+
+    fn send_input(&mut self, m: C2H) {
+        if let Some(i) = &self.input {
+            if i.send(m) {
+                self.input_sent += 1;
+            }
         }
     }
 
@@ -150,19 +186,20 @@ impl App {
             return;
         }
 
-        // 整倍缩放（1x / 2x…）—— 整数倍时最近邻刚好像素对齐，文字最清楚
-        let scale = (ww / frame.width).min(wh / frame.height).max(1);
-        let dw = (frame.width * scale).min(ww);
-        let dh = (frame.height * scale).min(wh);
-        let ox = (ww - dw) / 2;
-        let oy = (wh - dh) / 2;
+        // 整倍缩放（1x / 2x…）—— 整数倍时最近邻刚好像素对齐，文字最清楚。
+        // 几何和「点击位置换算」共用 `input::fit_rect`：两边各算一遍的话，黑边区域就会点偏。
+        let r = fit_rect(frame.width, frame.height, ww, wh);
+        let (dw, dh, ox, oy) = (r.w, r.h, r.ox, r.oy);
 
+        // 最近邻的倍率由实际画面尺寸反推（裁剪时 dw 会被窗口宽度夹住，那就是 1 倍）。
+        let scale = (dw / frame.width).max(1);
+        let (fw, fh) = (frame.width as usize, frame.height as usize);
         for y in 0..dh {
-            let sy = (y / scale) as usize;
-            let srow = sy * (frame.width as usize) * 4;
+            let sy = ((y / scale) as usize).min(fh - 1);
+            let srow = sy * fw * 4;
             let drow = ((oy + y) as usize) * (ww as usize);
             for x in 0..dw {
-                let sx = (x / scale) as usize;
+                let sx = ((x / scale) as usize).min(fw - 1);
                 let o = srow + sx * 4;
                 // FFmpeg 解出来是 BGRA（小端序），softbuffer 要 0RGB
                 let b = frame.pixels[o] as u32;
@@ -187,6 +224,7 @@ impl App {
                 return;
             }
             self.blit(f, size.width, size.height);
+            self.frame_sz = Some((f.width, f.height)); // 光标换算要用
             self.last_frame_at = Some(f.at);
         } else {
             // 还没收到首帧：画个深灰底，窗口不是白的就不至于像卡死
@@ -289,12 +327,53 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => self.redraw(),
-            // 键盘/鼠标事件在这里接 M2.5 之后的输入注入
-            WindowEvent::KeyboardInput { .. }
-            | WindowEvent::MouseInput { .. }
-            | WindowEvent::CursorMoved { .. }
-            | WindowEvent::MouseWheel { .. } => {
-                // 输入上报留到下一步；先不静默吞掉异常，只是不做处理。
+            // ── 键鼠上报（M2.5）──
+            WindowEvent::ModifiersChanged(m) => {
+                self.mods = Mods::from_state(m.state());
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let Some(r) = self.image_rect() else { return };
+                if let Some((x, y)) = norm_point(position.x, position.y, r) {
+                    self.send_input(C2H::MouseMoveAbs { x, y });
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if let Some(b) = proto_button(button) {
+                    let down = state == ElementState::Pressed;
+                    self.send_input(C2H::MouseButton { button: b, down });
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // winit 的正方向是「内容向右/向下滚动」，也就是向上滚 —— 和协议一致（正 = 上/右）。
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => line_units(x, y),
+                    MouseScrollDelta::PixelDelta(p) => self.wheel.feed_pixels(p.x, p.y),
+                };
+                if dx != 0 || dy != 0 {
+                    self.send_input(C2H::MouseWheel { dx, dy });
+                }
+            }
+            WindowEvent::KeyboardInput { event, is_synthetic, .. } => {
+                // 焦点切换时 winit 会补发「合成」的按下/松开事件。转发过去就成了
+                // 在对面莫名其妙敲一下键 —— 必须丢掉。
+                if is_synthetic {
+                    return;
+                }
+                let vk = match event.physical_key {
+                    PhysicalKey::Code(c) => vk_from_key(c),
+                    PhysicalKey::Unidentified(_) => None,
+                };
+                let pressed = event.state == ElementState::Pressed;
+                let action = key_action(
+                    vk,
+                    event.text.as_deref(),
+                    pressed,
+                    event.repeat,
+                    &self.mods,
+                );
+                for m in key_messages(&action) {
+                    self.send_input(m);
+                }
             }
             WindowEvent::ScaleFactorChanged { .. } => {
                 if let Some(w) = self.window.as_ref() {
@@ -323,21 +402,34 @@ impl ApplicationHandler for App {
 /// 跑窗口，直到用户关掉它。
 ///
 /// **必须在主线程调用**（winit 的硬性要求）。tokio 运行时应该已经跑在别的线程上，
-/// 这里的 `rx` 就是从那边 `VideoWatcher::subscribe()` 拿到的。
+/// 这里的 `rx` 就是从那边 `VideoWatcher::subscribe()` 拿到的；`input` 为 `None` 就是只读模式。
 pub fn run(
     rx: watch::Receiver<Option<Frame>>,
     stats: Arc<WatchStats>,
     overlay: Overlay,
     seconds: Option<f64>,
+    input: Option<InputSender>,
 ) -> Result<()> {
-    let event_loop = EventLoop::new().context("创建��件循环失败（没有可用的显示环境？）")?;
+    let event_loop = EventLoop::new().context("创建事件循环失败（没有可用的显示环境？）")?;
     // Poll：不睡等事件，保证有帧时能立刻画出来
     event_loop.set_control_flow(ControlFlow::Poll);
     let deadline = seconds.map(|s| std::time::Instant::now() + std::time::Duration::from_secs_f64(s));
-    let mut app = App::new(rx, stats, overlay, deadline);
+    let mut app = App::new(rx, stats, overlay, deadline, input);
     event_loop.run_app(&mut app).context("窗口事件循环异常退出")?;
-    info!(painted = app.painted, "窗口已关闭");
+    info!(painted = app.painted, input_sent = app.input_sent, "窗口已关闭");
     Ok(())
+}
+
+/// winit 的按钮 → 协议按钮。`Other(_)` 是八键鼠标上的额外键，协议里没有对应项，直接丢掉。
+fn proto_button(b: MouseButton) -> Option<ProtoButton> {
+    match b {
+        MouseButton::Left => Some(ProtoButton::Left),
+        MouseButton::Middle => Some(ProtoButton::Middle),
+        MouseButton::Right => Some(ProtoButton::Right),
+        MouseButton::Back => Some(ProtoButton::X1),
+        MouseButton::Forward => Some(ProtoButton::X2),
+        MouseButton::Other(_) => None,
+    }
 }
 
 /// 供状态栏使用：把 `Arc<WatchStats>` 的当前值快照出来。
@@ -380,7 +472,7 @@ mod tests {
 
     fn app_with(frame: Option<Frame>) -> App {
         let (_tx, rx) = watch::channel(frame);
-        App::new(rx, Arc::new(WatchStats::default()), Overlay::default(), None)
+        App::new(rx, Arc::new(WatchStats::default()), Overlay::default(), None, None)
     }
 
     #[test]

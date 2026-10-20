@@ -265,10 +265,43 @@ Error: 期望 Pong，收到 Incoming {...}
 
 | 功能 | 状态 |
 |---|---|
-| 窗口界面（winit + softbuffer） | 未做，当前控制端只有 headless 模式 |
-| 键鼠注入（XTest + uinput） | 未做，还不能操作对端 |
+| 窗口界面（winit + softbuffer） | ✅ 已完成（默认开窗口，`--headless` 保留） |
+| 键鼠注入（XTest） | ✅ 两端已接线，本机全链路测试通过；**真机未验** |
+| 键鼠注入（uinput 兜底） | 未做（X11 会话走 XTest 已够，uinput 只有 Wayland/无 X 时才需要） |
 | 剪贴板双向 | 未做 |
 | 文件传输 / 终端 / 端口映射 | 未做 |
 | 分辨率变化后重建解码器 | 未做（`xdpyinfo` 只在启动时探测一次） |
 | `actual_fps` 按秒滑动平均 | 未做，目前恒为 0 |
 | systemd 开机自启 | 未做 |
+
+## 8. 输入注入（M3）在麒麟上的编译与验证
+
+注入后端用 XTest，直接 `#[link(name = "X11")]` / `#[link(name = "Xtst")]` 声明符号，
+**不引第三方 crate**（这样整个 crate 仍能在 Windows 上编译和跑测试）。
+
+编译机要先装开发包（运行库有 ≠ 头/符号链接有）：
+
+```
+sudo apt install libx11-dev libxtst-dev      # 麒麟 V10 源里就有
+cargo build --release
+```
+
+验证（在麒麟本机盯着屏幕做，**这台 Windows 开发机上无法验证**）：
+
+```
+# 1) 后端是否就绪：日志里必须有这一行，sink 名是 xtest 而不是 none
+RUST_LOG=info ./uulan-host --config host.json
+#   → INFO uulan_host::session: 键鼠注入后端 sink="xtest"
+#   → INFO uulan_host::input::x11: XTest 注入后端已就绪 ... autorepeat_turned_off=true
+
+# 2) 控制端连过去，依次验：鼠标移动（点不准 = 坐标问题）、左键单击、
+#    滚轮上下、单个字母、Ctrl+C、按着字母不放看连发速率、中文输入
+# 3) 断开后必须满足：
+#    - 被控端本机的键盘连发恢复正常（说明 XAutoRepeatOn 还原了）
+#    - 没有任何键处于按下状态
+#    - 被控端日志有 `键鼠事件统计 events=N inject_errors=0`
+#    - 控制端退出时有 `输入上报：移动 … 按键 …（被控端拒绝 0）`
+```
+
+`sink="none"` 说明 X 显示打不开或没有 XTest 扩展 —— 这时键鼠一条都注入不了，
+但画面照常，容易误判成「能用但点不动」。控制端会持续收到 `InputError`（2 秒节流一条）。

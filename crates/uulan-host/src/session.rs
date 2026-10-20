@@ -35,6 +35,7 @@ use uulan_protocol::rvclient::RelaySet;
 
 use crate::capture::CaptureInput;
 use crate::config::HostConfig;
+use crate::input::{default_sink, Inject, InputSink, Mapper};
 
 /// 连续失败多少次开始锁定。
 pub const AUTH_MAX_FAILURES: u32 = 5;
@@ -243,8 +244,22 @@ pub enum SessionOutcome {
     Error(String),
 }
 
-/// 跑完一次会话。
+/// 跑完一次会话。注入后端按采集源自动挑（X11 → XTest，合成源 → 不注入）。
 pub async fn run(params: SessionParams, relays: RelaySet, peer: String) -> SessionOutcome {
+    let sink = default_sink(&params.capture);
+    run_with_sink(params, relays, peer, sink).await
+}
+
+/// 同 [`run`]，但注入后端由调用方指定。
+///
+/// 单独开这个入口是为了让「协议消息 → 注入指令」这段能在没有 X11 的机器上被端到端测到：
+/// 测试塞一个记录用的 sink，就能断言被控端到底打算注入什么。生产路径用 [`run`]。
+pub async fn run_with_sink(
+    params: SessionParams,
+    relays: RelaySet,
+    peer: String,
+    sink: Box<dyn InputSink>,
+) -> SessionOutcome {
     let RelaySet { control, video, bulk } = relays;
     let mut control = control;
     // bulk 通道到 M4（文件传输 / 端口映射）才用得上；现在只保持连接不关。
@@ -278,7 +293,20 @@ pub async fn run(params: SessionParams, relays: RelaySet, peer: String) -> Sessi
         video,
     ));
 
-    let outcome = control_loop(&mut control, &set_tx).await;
+    // 键鼠注入：Mapper 是纯状态机，sink 才是真后端。
+    let mut input = InputLoop::new(Mapper::new(params.screen.w, params.screen.h), sink);
+    info!(sink = input.sink.name(), "键鼠注入后端");
+
+    let outcome = control_loop(&mut control, &set_tx, &mut input).await;
+
+    // 会话结束（正常/异常/断线）都要把还按着的键松开、把全局状态还原，
+    // 否则被控端上会留下一个「一直按住 Ctrl」的键盘。
+    input.finish().await;
+    info!(
+        events = input.events,
+        inject_errors = input.errors,
+        "键鼠事件统计"
+    );
 
     video_task.abort();
     let _ = control.shutdown().await;
@@ -378,10 +406,69 @@ async fn handshake(
     }
 }
 
+/// 注入错误最多多久上报一次。注入不了的时候（比如被控端跑的不是 X11 桌面），
+/// 每个鼠标移动都回一条 `InputError` 会把控制通道刷爆。
+const INPUT_ERROR_REPORT_EVERY: Duration = Duration::from_millis(2000);
+
+/// 控制通道上的输入处理：状态机 + 后端 + 错误上报。
+struct InputLoop {
+    mapper: Mapper,
+    sink: Box<dyn InputSink>,
+    /// 收到的输入消息条数（排障与验收都看这个数）。
+    events: u64,
+    /// 注入失败次数（含被节流没上报的）。
+    errors: u64,
+    last_report: Option<Instant>,
+}
+
+impl InputLoop {
+    fn new(mapper: Mapper, sink: Box<dyn InputSink>) -> Self {
+        Self { mapper, sink, events: 0, errors: 0, last_report: None }
+    }
+
+    /// 执行一批注入指令。
+    ///
+    /// **注入失败不终止会话**：远控里「鼠标点不动」比「直接断线」好 ——
+    /// 但必须让人看得见，所以按 [`INPUT_ERROR_REPORT_EVERY`] 节流回一条 `InputError`。
+    async fn apply(&mut self, batch: Vec<Inject>, control: &mut TcpStream) -> Result<(), String> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        self.events += 1;
+        let Err(e) = self.sink.apply(&batch) else {
+            return Ok(());
+        };
+        self.errors += 1;
+        let due = self
+            .last_report
+            .map(|t| t.elapsed() >= INPUT_ERROR_REPORT_EVERY)
+            .unwrap_or(true);
+        if !due {
+            debug!(error = %e, "键鼠注入失败（已节流，不重复上报）");
+            return Ok(());
+        }
+        self.last_report = Some(Instant::now());
+        warn!(sink = self.sink.name(), error = %e, total = self.errors, "键鼠注入失败，已通知控制端");
+        send_h2c(control, &H2C::InputError { message: e }).await
+    }
+
+    /// 会话收尾：松开所有还按着的键/按钮，恢复 X 的全局状态（autorepeat、键盘映射）。
+    async fn finish(&mut self) {
+        let batch = self.mapper.release_all();
+        if !batch.is_empty() {
+            if let Err(e) = self.sink.apply(&batch) {
+                debug!(error = %e, "会话收尾释放按键时出错");
+            }
+        }
+        self.sink.finish();
+    }
+}
+
 /// 控制通道循环。返回对端为何结束。
 async fn control_loop(
     control: &mut TcpStream,
     set_tx: &watch::Sender<VideoSettings>,
+    input: &mut InputLoop,
 ) -> Result<Closed, String> {
     loop {
         // 控制帧和心跳都可能从这条连接来，所以直接读帧再分类。
@@ -436,6 +523,33 @@ async fn control_loop(
                         } else {
                             debug!("画面参数与当前一致，无需重启");
                         }
+                    }
+                    // ── 键鼠注入（M2.5/M3）──
+                    C2H::MouseMoveAbs { x, y } => {
+                        let batch: Vec<Inject> =
+                            input.mapper.mouse_abs(x, y).into_iter().collect();
+                        input.apply(batch, control).await?;
+                    }
+                    C2H::MouseMoveRel { dx, dy } => {
+                        let batch: Vec<Inject> =
+                            input.mapper.mouse_rel(dx, dy).into_iter().collect();
+                        input.apply(batch, control).await?;
+                    }
+                    C2H::MouseButton { button, down } => {
+                        let batch = input.mapper.button(button, down);
+                        input.apply(batch, control).await?;
+                    }
+                    C2H::MouseWheel { dx, dy } => {
+                        let batch = input.mapper.wheel(dx, dy);
+                        input.apply(batch, control).await?;
+                    }
+                    C2H::Key { vk, down, repeat } => {
+                        let batch = input.mapper.key(vk, down, repeat);
+                        input.apply(batch, control).await?;
+                    }
+                    C2H::KeyChar(k) => {
+                        let batch = input.mapper.key_char(&k.target, k.down);
+                        input.apply(batch, control).await?;
                     }
                     // M2 只声明了桌面推送能力，控制端不该发这些。
                     // 收到了就如实忽略并记日志，绝不假装成功。

@@ -31,6 +31,8 @@ struct Args {
     save_frame: Option<PathBuf>,
     /// 不开窗口，走原来的命令行模式。
     headless: bool,
+    /// 只读模式：不上报键鼠（排障、旁观时用）。
+    no_input: bool,
 }
 
 const HELP: &str = "\
@@ -47,6 +49,7 @@ uulan-client —— uulan 内网远控的控制端
   --ffmpeg <path>     ffmpeg 可执行文件（默认走 PATH）
   --save-frame <path> 退出时把最后一帧存成 PPM（排查「对面到底画的是什么」用）
   --headless          不开窗口，只打印统计（自测 / 无显示环境用）
+  --no-input          只读模式：不上报键鼠（排障、旁观时用）
   --json              以 JSON 输出统计（仅 --headless 下生效）
   -h, --help          显示本帮助
 
@@ -65,6 +68,7 @@ fn parse_args() -> Result<Args> {
         json: false,
         save_frame: None,
         headless: false,
+        no_input: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -83,6 +87,7 @@ fn parse_args() -> Result<Args> {
             "--save-frame" => a.save_frame = Some(PathBuf::from(it.next().unwrap_or_default())),
             "--json" => a.json = true,
             "--headless" => a.headless = true,
+            "--no-input" => a.no_input = true,
             "-h" | "--help" => {
                 println!("{HELP}");
                 std::process::exit(0);
@@ -174,7 +179,27 @@ async fn main() -> Result<()> {
         //
         // 主线程被事件循环占住不影响画面：收流、喂解码器、取帧都是 tokio 任务，
         // 跑在多线程运行时的 worker 上。
-        let r = uulan_client::window::run(rx, stats, overlay, args.seconds);
+        //
+        // 键鼠就从这条控制连接上报：`ControlLink` 里一半任务写、一半任务读，
+        // 窗口线程只管往无界队列里塞消息（同步调用，不会卡住事件循环）。
+        let link = uulan_client::control::ControlLink::start(c.control);
+        let input = if c.host.has_desktop && !args.no_input {
+            Some(link.input())
+        } else {
+            println!("只读模式：不上报键鼠（--no-input 或被控端没有图形会话）");
+            None
+        };
+
+        let r = uulan_client::window::run(rx, stats, overlay, args.seconds, input);
+        // 道别：让被控端立刻收尾（松开按键、断开视频），而不是等 TCP 超时。
+        // 统计要在 close 之前拿到（close 会消费掉 link）。
+        let in_stats = link.stats();
+        link.close("控制端关闭窗口").await;
+        let si = in_stats.snapshot();
+        println!(
+            "输入上报：移动 {} / 按键 {} / 文本 {} / 点击 {} / 滚轮 {}（未送出 {}；被控端拒绝 {}）",
+            si.moves, si.keys, si.chars, si.buttons, si.wheels, si.dropped, si.host_errors
+        );
         watcher.shutdown();
         let s = watcher.snapshot();
         println!(

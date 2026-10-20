@@ -1,0 +1,63 @@
+uulan 里程碑 M2.5（键鼠注入部分）—— 两端已接上，真机待验 🔄
+
+【本轮做了什么】
+  控制端：窗口键鼠事件 → 协议消息（uulan-client/src/input.rs + control.rs + window.rs）
+  被控端：协议消息 → 注入指令 → XTest（uulan-host/src/input/{mod.rs,x11.rs} + session.rs）
+  协议侧一行没改（消息早就定义好了），只补了一个缺失的 VK：VK_OEM_102 (0xe2) → 反斜杠。
+
+【本机实测数字（Windows 开发机，可重复）】
+  cargo test --workspace                                         181 passed / 0 failed
+                                             （基线 146，本轮新增 35；零警告）
+  cargo build --release                                          0 警告
+  cargo check -p uulan-host --target x86_64-unknown-linux-gnu    0 警告（X11 后端在 Linux 目标下编译通过）
+
+  新增测试构成（35 条）：
+    被控端 input::Mapper 状态机       16 条
+    控制端 input::（几何/滚轮/键表）   15 条
+    控制端 control::ControlLink        2 条
+    两端全链路 input_path.rs           2 条
+
+【两端全链路测试 crates/uulan-client/tests/input_path.rs】
+  真实 server + 真实被控端会话 + 真实 wire 报文；唯一替身是 XTest（换成记录型 sink）。
+  keys_and_mouse_reach_the_host_injector —— 8 条注入指令逐条相等：
+    MoveAbs{160,120}
+    Button{1,down} / Button{1,up}
+    Key{0x61,down} / Key{0x61,up}                 （KeyCode::KeyA → VK 0x41 → KeySym 'a'）
+    Wheel{4,1}                                     （1 行 = 120 单位 → 向上一格）
+    Key{0x0100_4e2d,down} / Key{0x0100_4e2d,up}    （输入法上屏的「中」= Unicode KeySym）
+  耗时 0.35s。
+  unknown_vk_and_sub_notch_wheel_inject_nothing —— 未知 VK (0x100)、不足一格滚轮 (60)、
+  没按下过的松开，全部产生 0 条注入指令。
+
+【真实窗口跑一遍（release，合成源被控端，10 秒）】
+  窗口已就绪
+  窗口已关闭 painted=657 input_sent=1
+  输入上报：移动 1 / 按键 0 / 文本 0 / 点击 0 / 滚轮 0（未送出 0；被控端拒绝 1）
+  收到 AU 4281 / 关键帧 286 / 解出 2064 / 丢帧 1519 / 首帧 53ms
+  → 「被控端拒绝 1」是期望结果：窗口创建时光标落在里面产生一次 CursorMoved，
+    MouseMoveAbs 到达被控端，合成源没有可注入的桌面 → 回 InputError。
+    这一来一回证明控制通道的两个方向都通了（而画面 painted=657 说明窗口没被新代码弄坏）。
+
+【已经验（本机 cargo test 可复现）】
+  · 键位表 130 项，逐个断言被控端的 vk_to_keysym 认识（写完第一次跑就抓出 0xe2 缺失）
+  · 键位表无重复 KeyCode / 无重复 VK
+  · 归一化坐标 ↔ 像素：边界、越界夹边、NaN/Inf 丢弃；窗口黑边区域夹边
+  · fit_rect 与 window::blit 共用同一份几何（点哪儿画哪儿，不会因留黑边偏移）
+  · 滚轮 120 单位/格、像素增量攒够 40px 才发、不足一格丢弃、单次上限 50 格
+  · 按键按下/松开配对；未知 VK 不注入；没按下过的松开忽略；重复按下不双击
+  · 自动连发：repeat=true 只补一次「按下」、不配松开；改的是按下集合之外的状态
+  · 收尾 release_all 按「后按先松」释放（Ctrl 最后起来），清空按下集合
+  · 字符注入：大写用 Shift 包裹、小写不需要、用户自己按着的 Shift 不会重复按/被松开
+  · CJK 走 0x01000000+码点；ASCII 走 char_to_keysym
+  · 注入失败按 2 秒节流回 InputError，不中断会话
+
+【必须在真麒麟 V10 SP1（X11/UKUI）上验 —— 本机一行 XTest syscall 都没执行过】
+  · XTestFakeMotionEvent/KeyEvent/ButtonEvent 是否真的生效（指针能移、键能敲）
+  · XAutoRepeatOff 是否真的把连发交给控制端、断开后 XAutoRepeatOn 是否恢复
+  · 动态注册的 Unicode keycode 能否在 UKUI 应用里打出中文（输入法可能截走 keysym）
+  · 多屏 / 缩放下的坐标一致性；滚轮按钮号 4/5/6/7 在各应用里的实际效果
+  · 构建机需要 libx11-dev + libxtst-dev（链接期依赖，运行库有≠能编）
+
+【下一步】
+  剪贴板双向（C2H/H2C 的 Clip/ClipOffer 已定义，两端未接）→ 实测帧率上报
+  → 分辨率变化重建解码器 → M3 收尾（真机验注入，必要时补 uinput 兜底）

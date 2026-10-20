@@ -104,6 +104,9 @@ pub fn vk_to_keysym(vk: u16) -> Option<u32> {
         0xdc => 0x005c, // \ |
         0xdd => 0x005d, // ] }
         0xde => 0x0027, // ' "
+        // ISO 键盘上左 Shift 左边的那个键（VK_OEM_102）。中文 Windows 上少见，
+        // 但外接键盘/笔记本可能发出来 —— 按反斜杠处理，比丢掉整次按键好。
+        0xe2 => 0x005c, // \\ |
         // 输入法相关：中文 Windows 上输入法状态切换常被映射成这些
         0x15 => 0xff13, // VK_HANGUL → Pause
         0x19 => 0xff14, // VK_HANJA → Scroll_Lock
@@ -272,6 +275,9 @@ mod tests {
         assert_eq!(vk_to_keysym(0xdc), Some(b'\\' as u32));
         assert_eq!(vk_to_keysym(0xde), Some(b'\'' as u32));
         assert_eq!(vk_to_keysym(0xc0), Some(b'`' as u32));
+        // ISO 键盘左 Shift 旁的键：按反斜杠处理，不能返回 None
+        // （返回 None 的表现是「这个键按下去没反应」，很难查）。
+        assert_eq!(vk_to_keysym(0xe2), Some(b'\\' as u32));
     }
 
     #[test]

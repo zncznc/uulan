@@ -11,6 +11,7 @@
 
 pub mod capture;
 pub mod config;
+pub mod input;
 pub mod session;
 
 pub use capture::CaptureInput;
