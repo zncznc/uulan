@@ -268,7 +268,7 @@ Error: 期望 Pong，收到 Incoming {...}
 | 窗口界面（winit + softbuffer） | ✅ 已完成（默认开窗口，`--headless` 保留） |
 | 键鼠注入（XTest） | ✅ 两端已接线，本机全链路测试通过；**真机未验** |
 | 键鼠注入（uinput 兜底） | 未做（X11 会话走 XTest 已够，uinput 只有 Wayland/无 X 时才需要） |
-| 剪贴板双向 | 未做 |
+| 剪贴板双向 | ✅ 文本已实现（Win32 + X11 后端，本机全链路 + 真 Win32 剪贴板实测）；**X11 一侧真机未验** |
 | 文件传输 / 终端 / 端口映射 | 未做 |
 | 分辨率变化后重建解码器 | 未做（`xdpyinfo` 只在启动时探测一次） |
 | `actual_fps` 按秒滑动平均 | 未做，目前恒为 0 |
@@ -305,3 +305,33 @@ RUST_LOG=info ./uulan-host --config host.json
 
 `sink="none"` 说明 X 显示打不开或没有 XTest 扩展 —— 这时键鼠一条都注入不了，
 但画面照常，容易误判成「能用但点不动」。控制端会持续收到 `InputError`（2 秒节流一条）。
+
+## 9. 剪贴板（M2.5）在麒麟上的验证
+
+剪贴板后端与采集用**同一个显示号**（`$DISPLAY`），因为 selection 是每个 X 显示独立的：
+抓的是哪个桌面，剪贴板就必须是哪个桌面的。它只依赖 libX11（已在 §8 装过）。
+
+```
+# 1) 后端就绪：日志必须有这一行，backend 是 x11 而不是 none
+RUST_LOG=info ./uulan-host --config host.json
+#   → INFO uulan_host::session: 剪贴板后端 backend="x11" available=true
+#   → INFO uulan_clip::x11: X11 剪贴板后端已就绪
+
+# 2) 四个方向都要过一遍（每条都要真的粘贴出来看）：
+#    a. 控制端 Ctrl+C 一段中文 → 麒麟上 Ctrl+V
+#    b. 麒麟上 Ctrl+C 一段中文 → 控制端 Ctrl+V
+#    c. 麒麟上用鼠标中键粘贴（走 PRIMARY）—— 应当也是那段文字
+#    d. 在麒麟上用浏览器复制一段带换行和 emoji 的文本 → 控制端粘贴
+# 3) 断开后再看：
+#    - 被控端日志 `剪贴板同步统计 sent=… recv=… errors=0 skipped_same=…`
+#      （skipped_same 会一直涨，这是正常的：两边的轮询大多数时候看到的都是同一份内容）
+#    - 控制端退出时有 `剪贴板同步：发送 … / 接收 …（本机写入失败 0）`
+```
+
+几个已知的现场现象，别当成 bug：
+
+- **被控端进程退出后，它写进 X11 剪贴板的那段文字会失效**（selection 归所有者进程）。
+- 超过 192 KiB 的内容不同步（日志里 `skipped_oversize` 会涨），不截断。
+- 「清空剪贴板」不会传到对端。
+- 有些程序（少数 Electron 应用）只提供 `text/html` 不接受 `UTF8_STRING`，
+  读出来是 `None`，表现是「复制了但对面没反应」——日志里是「剪贴板所有者拒绝提供 UTF8_STRING」。

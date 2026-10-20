@@ -29,9 +29,11 @@ use uulan_media::ffmpeg::{CaptureOptions, Encoder};
 use uulan_media::VideoSource;
 use uulan_protocol::frame::{read_frame, write_frame, video, FrameKind};
 use uulan_protocol::msg::{
-    quality_preset, AuthFailReason, C2H, H2C, HostHelloOk, HostVideoCfg, Quality, Screen,
+    quality_preset, AuthFailReason, C2H, Cap, H2C, HostHelloOk, HostVideoCfg, Quality, Screen,
 };
 use uulan_protocol::rvclient::RelaySet;
+
+use uulan_clip::{poll_outbound, ClipSync, Clipboard, POLL_INTERVAL};
 
 use crate::capture::CaptureInput;
 use crate::config::HostConfig;
@@ -295,6 +297,11 @@ pub struct SessionParams {
     pub screen: Screen,
     pub encoder: Encoder,
     pub settings: VideoSettings,
+    /// 剪贴板后端。`None` = 按采集源自动挑（X11 采集 → X11 剪贴板）。
+    ///
+    /// 之所以做成可注入的：本机测试要塞一个「内存剪贴板」，才能在没有 X11 的机器上
+    /// 断言「控制端复制的文字真的写进了被控端剪贴板、反过来也一样」。
+    pub clipboard: Option<Box<dyn Clipboard>>,
 }
 
 #[derive(Debug)]
@@ -328,8 +335,16 @@ pub async fn run_with_sink(
     // bulk 通道到 M4（文件传输 / 端口映射）才用得上；现在只保持连接不关。
     let _bulk = bulk;
 
+    // 剪贴板后端：抓的是哪个 X 显示，剪贴板就得是哪个 X 显示的。
+    let mut params = params;
+    let mut clip: Box<dyn Clipboard> = params
+        .clipboard
+        .take()
+        .unwrap_or_else(|| uulan_clip::default_clipboard(params.capture.display().as_deref()));
+    let clip_available = clip.available();
+
     let cfg = params.state.snapshot();
-    let client = match handshake(&mut control, &params, &peer).await {
+    let client = match handshake(&mut control, &params.state, params.screen, &peer, clip_available).await {
         Ok(Some(c)) => c,
         // 鉴权没过：已经回过 AuthFail 了
         Ok(None) => return SessionOutcome::Unauthenticated(peer.clone()),
@@ -359,8 +374,24 @@ pub async fn run_with_sink(
     // 键鼠注入：Mapper 是纯状态机，sink 才是真后端。
     let mut input = InputLoop::new(Mapper::new(params.screen.w, params.screen.h), sink);
     info!(sink = input.sink.name(), "键鼠注入后端");
+    info!(backend = clip.name(), available = clip_available, "剪贴板后端");
 
-    let outcome = control_loop(&mut control, &set_tx, &mut input).await;
+    // 收发分两半：控制通道现在**同时**要有「读一帧」和「每秒两次轮询剪贴板」
+    // 两条独立的时间线，共用一个 `&mut TcpStream` 是借不动的（也是会互相阻塞的）。
+    let (mut rd, mut wr) = control.into_split();
+    let mut clip_sync = ClipSync::new();
+    let mut clip_stats = ClipStats::default();
+
+    let outcome = control_loop(
+        &mut rd,
+        &mut wr,
+        &set_tx,
+        &mut input,
+        &mut clip,
+        &mut clip_sync,
+        &mut clip_stats,
+    )
+    .await;
 
     // 会话结束（正常/异常/断线）都要把还按着的键松开、把全局状态还原，
     // 否则被控端上会留下一个「一直按住 Ctrl」的键盘。
@@ -370,9 +401,19 @@ pub async fn run_with_sink(
         inject_errors = input.errors,
         "键鼠事件统计"
     );
+    let (over, empty, same) = clip_sync.skipped();
+    info!(
+        sent = clip_stats.sent,
+        recv = clip_stats.recv,
+        errors = clip_stats.errors,
+        skipped_oversize = over,
+        skipped_empty = empty,
+        skipped_same = same,
+        "剪贴板同步统计"
+    );
 
     video_task.abort();
-    let _ = control.shutdown().await;
+    let _ = wr.shutdown().await;
 
     match outcome {
         Ok(Closed::Bye(reason)) => SessionOutcome::Closed(format!("对端道别: {reason}")),
@@ -389,10 +430,12 @@ enum Closed {
 /// 握手 + 鉴权。返回 `Ok(None)` 表示鉴权未通过（已回复 AuthFail）。
 async fn handshake(
     control: &mut TcpStream,
-    params: &SessionParams,
+    state: &HostState,
+    screen: Screen,
     peer: &str,
+    clip_available: bool,
 ) -> Result<Option<uulan_protocol::msg::ClientHello>, String> {
-    let cfg = params.state.snapshot();
+    let cfg = state.snapshot();
 
     // 1) 等 Hello
     let client = match read_c2h(control).await? {
@@ -402,6 +445,11 @@ async fn handshake(
     };
 
     // 2) 报自己的信息，让控制端先能显示设备名与屏幕尺寸
+    //    能力只声明**真的实现**了的：声明了却没实现，控制端就会出现「点了没反应」的按钮。
+    let mut caps = vec![];
+    if clip_available {
+        caps.push(Cap::Clipboard);
+    }
     send_h2c(
         control,
         &H2C::HelloOk(HostHelloOk {
@@ -409,10 +457,8 @@ async fn handshake(
             os: std::env::consts::OS.to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             name: cfg.name.clone(),
-            screen: params.screen.clone(),
-            // M2 只实现了桌面推送，所以只声明这一项能力。
-            // 声明了却没实现的能力会让控制端 UI 上出现「点了没反应」的按钮。
-            caps: vec![],
+            screen,
+            caps,
             has_desktop: true,
         }),
     )
@@ -427,7 +473,7 @@ async fn handshake(
 
     // 4) 先看锁定
     let now = Instant::now();
-    if let Some(left) = params.state.auth.locked_for(now) {
+    if let Some(left) = state.auth.locked_for(now) {
         warn!(%peer, remaining_ms = left.as_millis() as u64, "鉴权处于锁定期，拒绝");
         send_h2c(
             control,
@@ -441,9 +487,9 @@ async fn handshake(
     }
 
     // 5) 校验
-    match params.state.authenticate(&given) {
+    match state.authenticate(&given) {
         AuthResult::Ok { used_temp_code } => {
-            params.state.auth.record_success();
+            state.auth.record_success();
             info!(
                 %peer,
                 used_temp_code,
@@ -453,7 +499,7 @@ async fn handshake(
             Ok(Some(client))
         }
         AuthResult::Bad => {
-            let (n, lock) = params.state.auth.record_failure(now);
+            let (n, lock) = state.auth.record_failure(now);
             // 绝不打印密码本身，只记次数。
             warn!(%peer, failures = n, locked_ms = lock.as_millis() as u64, "鉴权失败");
             send_h2c(
@@ -472,6 +518,17 @@ async fn handshake(
 /// 注入错误最多多久上报一次。注入不了的时候（比如被控端跑的不是 X11 桌面），
 /// 每个鼠标移动都回一条 `InputError` 会把控制通道刷爆。
 const INPUT_ERROR_REPORT_EVERY: Duration = Duration::from_millis(2000);
+
+/// 剪贴板同步的计数（会话结束时打印，作为「真的同步过」的机器可查证据）。
+#[derive(Debug, Default)]
+struct ClipStats {
+    /// 被控端 → 控制端：真的发出去的条数。
+    sent: u64,
+    /// 控制端 → 被控端：真的写进本地剪贴板的条数。
+    recv: u64,
+    /// 写本地剪贴板失败次数（X11 上没有桌面、被别的程序占着）。
+    errors: u64,
+}
 
 /// 控制通道上的输入处理：状态机 + 后端 + 错误上报。
 struct InputLoop {
@@ -493,7 +550,11 @@ impl InputLoop {
     ///
     /// **注入失败不终止会话**：远控里「鼠标点不动」比「直接断线」好 ——
     /// 但必须让人看得见，所以按 [`INPUT_ERROR_REPORT_EVERY`] 节流回一条 `InputError`。
-    async fn apply(&mut self, batch: Vec<Inject>, control: &mut TcpStream) -> Result<(), String> {
+    async fn apply<W: tokio::io::AsyncWrite + Unpin>(
+        &mut self,
+        batch: Vec<Inject>,
+        wr: &mut W,
+    ) -> Result<(), String> {
         if batch.is_empty() {
             return Ok(());
         }
@@ -512,7 +573,7 @@ impl InputLoop {
         }
         self.last_report = Some(Instant::now());
         warn!(sink = self.sink.name(), error = %e, total = self.errors, "键鼠注入失败，已通知控制端");
-        send_h2c(control, &H2C::InputError { message: e }).await
+        send_h2c(wr, &H2C::InputError { message: e }).await
     }
 
     /// 会话收尾：松开所有还按着的键/按钮，恢复 X 的全局状态（autorepeat、键盘映射）。
@@ -528,104 +589,158 @@ impl InputLoop {
 }
 
 /// 控制通道循环。返回对端为何结束。
+///
+/// 读、写两半是分开传进来的：剪贴板轮询要能在「没有输入消息」的时候也往对面发东西，
+/// 而读帧是长期挂起的 —— 同一个 `&mut TcpStream` 上做不到这两件事。
+#[allow(clippy::too_many_arguments)]
 async fn control_loop(
-    control: &mut TcpStream,
+    rd: &mut tokio::net::tcp::OwnedReadHalf,
+    wr: &mut tokio::net::tcp::OwnedWriteHalf,
     set_tx: &watch::Sender<VideoSettings>,
     input: &mut InputLoop,
+    clip: &mut Box<dyn Clipboard>,
+    clip_sync: &mut ClipSync,
+    clip_stats: &mut ClipStats,
 ) -> Result<Closed, String> {
+    let mut tick = tokio::time::interval(POLL_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // 基线：会话建立这一刻被控端剪贴板里已有的内容不算「新内容」，
+    // 不推给控制端 —— 否则一连上就把对面正在用的剪贴板换掉。
+    // 代价说明：X11 上这一读是同步的（最多 400ms 等所有者回应），但只在会话开头做一次，
+    // 期间到达的输入帧留在 TCP 缓冲里，不会丢。
+    let mut clip_armed = false;
+    let baseline = clip.get_text();
+    let _ = poll_outbound(clip_sync, baseline.as_deref(), &mut clip_armed);
+
     loop {
         // 控制帧和心跳都可能从这条连接来，所以直接读帧再分类。
-        let frame = match read_frame(control).await {
-            Ok(f) => f,
-            Err(uulan_protocol::frame::FrameError::Io(e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                return Ok(Closed::Eof)
-            }
-            Err(e) => return Err(format!("读控制帧失败: {e}")),
-        };
-
-        match frame.kind {
-            FrameKind::Ping => {
-                write_frame(control, FrameKind::Pong, &frame.payload)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-            FrameKind::Json => {
-                let msg: C2H = match frame.decode_json() {
-                    Ok(m) => m,
-                    Err(e) => {
-                        warn!(error = %e, "控制消息解析失败，已忽略");
-                        continue;
+        tokio::select! {
+            frame = read_frame(rd) => {
+                let frame = match frame {
+                    Ok(f) => f,
+                    Err(uulan_protocol::frame::FrameError::Io(e))
+                        if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                    {
+                        return Ok(Closed::Eof)
                     }
+                    Err(e) => return Err(format!("读控制帧失败: {e}")),
                 };
-                match msg {
-                    C2H::Bye { reason } => return Ok(Closed::Bye(reason)),
-                    C2H::VideoSet(v) => {
-                        let mut cur = *set_tx.borrow();
-                        let mut changed = false;
-                        if v.fps > 0 && v.fps != cur.fps {
-                            cur.fps = v.fps.clamp(1, 144);
-                            changed = true;
+
+                match frame.kind {
+                    FrameKind::Ping => {
+                        write_frame(wr, FrameKind::Pong, &frame.payload)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    }
+                    FrameKind::Json => {
+                        let msg: C2H = match frame.decode_json() {
+                            Ok(m) => m,
+                            Err(e) => {
+                                warn!(error = %e, "控制消息解析失败，已忽略");
+                                continue;
+                            }
+                        };
+                        match msg {
+                            C2H::Bye { reason } => return Ok(Closed::Bye(reason)),
+                            C2H::VideoSet(v) => {
+                                let mut cur = *set_tx.borrow();
+                                let mut changed = false;
+                                if v.fps > 0 && v.fps != cur.fps {
+                                    cur.fps = v.fps.clamp(1, 144);
+                                    changed = true;
+                                }
+                                if (v.scale - cur.scale).abs() > 0.001 && v.scale > 0.05 && v.scale <= 1.0 {
+                                    cur.scale = v.scale;
+                                    changed = true;
+                                }
+                                if v.quality != cur.quality {
+                                    cur.quality = v.quality;
+                                    changed = true;
+                                }
+                                if v.max_bitrate_kbps > 0 && v.max_bitrate_kbps != cur.max_bitrate_kbps {
+                                    cur.max_bitrate_kbps = v.max_bitrate_kbps;
+                                    changed = true;
+                                }
+                                if changed {
+                                    info!(fps = cur.fps, scale = cur.scale, ?cur.quality, "画面参数变更，重启编码器");
+                                    let _ = set_tx.send(cur);
+                                } else {
+                                    debug!("画面参数与当前一致，无需重启");
+                                }
+                            }
+                            // ── 键鼠注入（M2.5/M3）──
+                            C2H::MouseMoveAbs { x, y } => {
+                                let batch: Vec<Inject> =
+                                    input.mapper.mouse_abs(x, y).into_iter().collect();
+                                input.apply(batch, wr).await?;
+                            }
+                            C2H::MouseMoveRel { dx, dy } => {
+                                let batch: Vec<Inject> =
+                                    input.mapper.mouse_rel(dx, dy).into_iter().collect();
+                                input.apply(batch, wr).await?;
+                            }
+                            C2H::MouseButton { button, down } => {
+                                let batch = input.mapper.button(button, down);
+                                input.apply(batch, wr).await?;
+                            }
+                            C2H::MouseWheel { dx, dy } => {
+                                let batch = input.mapper.wheel(dx, dy);
+                                input.apply(batch, wr).await?;
+                            }
+                            C2H::Key { vk, down, repeat } => {
+                                let batch = input.mapper.key(vk, down, repeat);
+                                input.apply(batch, wr).await?;
+                            }
+                            C2H::KeyChar(k) => {
+                                let batch = input.mapper.key_char(&k.target, k.down);
+                                input.apply(batch, wr).await?;
+                            }
+                            // ── 剪贴板 ──
+                            C2H::Clip { text } => {
+                                if let Some(t) = clip_sync.inbound(&text) {
+                                    match clip.set_text(&t) {
+                                        Ok(()) => {
+                                            clip_stats.recv += 1;
+                                            debug!(bytes = t.len(), "已写入本地剪贴板");
+                                        }
+                                        Err(e) => {
+                                            clip_stats.errors += 1;
+                                            warn!(error = %e, "写本地剪贴板失败（对面内容不丢，只是这台机器粘不了）");
+                                        }
+                                    }
+                                }
+                            }
+                            C2H::ClipOffer { len } => {
+                                // 第一版只支持「直接带正文」的同步；offer 留给以后做按需拉取，
+                                // 现在如实记一笔而不是假装处理过。
+                                debug!(len, "收到剪贴板 offer（暂不支持按需拉取）");
+                            }
+                            // M2 只声明了桌面推送能力，控制端不该发这些。
+                            // 收到了就如实忽略并记日志，绝不假装成功。
+                            other => {
+                                debug!(kind = ?std::mem::discriminant(&other), "收到尚未实现的控制消息，已忽略");
+                            }
                         }
-                        if (v.scale - cur.scale).abs() > 0.001 && v.scale > 0.05 && v.scale <= 1.0 {
-                            cur.scale = v.scale;
-                            changed = true;
-                        }
-                        if v.quality != cur.quality {
-                            cur.quality = v.quality;
-                            changed = true;
-                        }
-                        if v.max_bitrate_kbps > 0 && v.max_bitrate_kbps != cur.max_bitrate_kbps {
-                            cur.max_bitrate_kbps = v.max_bitrate_kbps;
-                            changed = true;
-                        }
-                        if changed {
-                            info!(fps = cur.fps, scale = cur.scale, ?cur.quality, "画面参数变更，重启编码器");
-                            let _ = set_tx.send(cur);
-                        } else {
-                            debug!("画面参数与当前一致，无需重启");
-                        }
                     }
-                    // ── 键鼠注入（M2.5/M3）──
-                    C2H::MouseMoveAbs { x, y } => {
-                        let batch: Vec<Inject> =
-                            input.mapper.mouse_abs(x, y).into_iter().collect();
-                        input.apply(batch, control).await?;
+                    FrameKind::Blob => {
+                        // bulk 通道才是数据通道，控制连接上不该出现 Blob。
+                        debug!("控制连接上收到意外的 Blob 帧，已忽略");
                     }
-                    C2H::MouseMoveRel { dx, dy } => {
-                        let batch: Vec<Inject> =
-                            input.mapper.mouse_rel(dx, dy).into_iter().collect();
-                        input.apply(batch, control).await?;
-                    }
-                    C2H::MouseButton { button, down } => {
-                        let batch = input.mapper.button(button, down);
-                        input.apply(batch, control).await?;
-                    }
-                    C2H::MouseWheel { dx, dy } => {
-                        let batch = input.mapper.wheel(dx, dy);
-                        input.apply(batch, control).await?;
-                    }
-                    C2H::Key { vk, down, repeat } => {
-                        let batch = input.mapper.key(vk, down, repeat);
-                        input.apply(batch, control).await?;
-                    }
-                    C2H::KeyChar(k) => {
-                        let batch = input.mapper.key_char(&k.target, k.down);
-                        input.apply(batch, control).await?;
-                    }
-                    // M2 只声明了桌面推送能力，控制端不该发这些。
-                    // 收到了就如实忽略并记日志，绝不假装成功。
-                    other => {
-                        debug!(kind = ?std::mem::discriminant(&other), "收到尚未实现的控制消息，已忽略");
-                    }
+                    _ => {}
                 }
             }
-            FrameKind::Blob => {
-                // bulk 通道才是数据通道，控制连接上不该出现 Blob。
-                debug!("控制连接上收到意外的 Blob 帧，已忽略");
+            _ = tick.tick() => {
+                // 轮询本机剪贴板。读不到（None）绝不能当成「剪贴板被清空」——
+                // 那会在一次 X11 超时之后把对面的剪贴板擦掉。
+                let cur = clip.get_text();
+                if let Some(text) = poll_outbound(clip_sync, cur.as_deref(), &mut clip_armed) {
+                    if send_h2c(wr, &H2C::Clip { text: text.clone() }).await.is_err() {
+                        return Ok(Closed::Eof);
+                    }
+                    clip_stats.sent += 1;
+                    debug!(bytes = text.len(), "已把本地剪贴板变化推给控制端");
+                }
             }
-            _ => {}
         }
     }
 }
@@ -780,7 +895,7 @@ async fn read_c2h(s: &mut TcpStream) -> Result<Option<C2H>, String> {
     f.decode_json().map(Some).map_err(|e| e.to_string())
 }
 
-async fn send_h2c(s: &mut TcpStream, m: &H2C) -> Result<(), String> {
+async fn send_h2c<W: tokio::io::AsyncWrite + Unpin>(s: &mut W, m: &H2C) -> Result<(), String> {
     let bytes = serde_json::to_vec(m).map_err(|e| e.to_string())?;
     write_frame(s, FrameKind::Json, &bytes).await.map_err(|e| e.to_string())
 }

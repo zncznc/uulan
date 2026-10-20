@@ -1,0 +1,72 @@
+uulan 里程碑 M2.5（剪贴板部分）—— 文本双向已接上，X11 后端待真机验 🔄
+
+【本轮做了什么】
+  新增 crate crates/uulan-clip（与平台无关的去重状态机 + 两个真实后端，不引第三方 crate）：
+    lib.rs  ClipSync：防回声（内容指纹，换行归一化）、大小上限、绝不传播「剪贴板被清空」
+    win.rs  Win32 后端：user32/kernel32 直接 FFI，CF_UNICODETEXT，打开剪贴板带重试
+    x11.rs  X11 后端：CLIPBOARD/PRIMARY selection，读取走 XConvertSelection + INCR 分段，
+           写入由独立 service 线程当 owner 回答 SelectionRequest
+  被控端 crates/uulan-host/src/session.rs：
+    控制通道拆成读/写两半（select：读帧 + 500ms 剪贴板轮询）
+    C2H::Clip → 写本地剪贴板；本地变化 → H2C::Clip
+    HelloOk 只在后端真的可用时才声明 Cap::Clipboard
+  控制端 crates/uulan-client/src/control.rs：
+    ControlLink::start_with_clipboard；同一个任务里 select（上报队列 / 读回报 / 轮询剪贴板）
+    H2C::Clip → 写本机剪贴板；本机变化 → C2H::Clip
+  新增 --no-clipboard 开关；收工统计多打一行「剪贴板同步：发送 N / 接收 M（本机写入失败 K）」
+
+【本机实测数字（Windows 开发机，可重复）】
+  cargo test --workspace                                         200 passed / 0 failed
+                                             （基线 187，本轮新增 13；零警告）
+  cargo build --release                                          0 警告
+  cargo check -p uulan-host -p uulan-clip --target x86_64-unknown-linux-gnu
+                                                                 0 警告（X11 后端在 Linux 目标下编译通过）
+  注：控制端 crate 无法在 Windows 上交叉 check linux 目标（winit/softbuffer 需要 X11 开发库），
+      但控制端用的就是 uulan-clip 里那套 X11 代码，随该 crate 一起被类型检查。
+
+  新增测试构成（13 条）：
+    uulan-clip::ClipSync / 后端不可用 / 基线规则   10 条
+    uulan-clip::win 真实 Win32 读写（写→读回→还原） 1 条  ← 真的执行了，不是 skip
+    两端全链路 clipboard_path.rs                    2 条
+
+【两端全链路测试 crates/uulan-client/tests/clipboard_path.rs】
+  真实 server + 真实被控端会话 + 真实 wire；唯一替身是「系统剪贴板」（内存版）。
+  clipboard_syncs_both_ways_without_echo —— 中文/换行/emoji 双向各一次都到达，
+    并且两端剪贴板各自只被对面写过 1 次（再等 1.6 秒仍是 1 次，说明没有回声）
+  session_start_does_not_push_pre_existing_clipboard —— 连上之前就有的内容两边都没被覆盖，
+    之后用户真的复制了新内容仍然同步（不会因为「第一拍不发」卡死）
+  耗时 2.66s。
+
+【真实系统剪贴板实测（scripts/verify-clipboard-e2e.sh，release）】
+  本机同时当被控端（Win32 后端）与控制端，会话中途用 PowerShell 改一次剪贴板：
+    被控端：backend="win32" available=true
+    被控端统计：sent=1 recv=0 errors=0 skipped_same=23
+    控制端：剪贴板同步：发送 0 / 接收 1（本机写入失败 0）
+  即：真实剪贴板的变化 → 协议 → 对端真实写回，整条链路通。跑完已把原剪贴板文字还原。
+
+【窗口全链路（scripts/verify-window-e2e.sh，本轮新加，release，10 秒）】
+  窗口已就绪 / 窗口已关闭 painted=656 input_sent=1
+  输入上报：移动 1 / 按键 0 / 文本 0 / 点击 0 / 滚轮 0（未送出 0；被控端拒绝 1）
+  剪贴板同步：发送 0 / 接收 0（本机写入失败 0）
+  收到 AU 4209 / 关键帧 281 / 解出帧 1985 / 丢帧 1507 / 首帧 63ms / 被控端实测 428 fps
+  （合成源不限速，428 fps 是 lavfi 的真实产出，不是 bug；真机 x11grab 才会是 30 上下）
+
+【已经验 / 只能在真麒麟上验】
+  已验（本机可复现）：
+    · 去重、防回声（含 Windows CRLF 改写）、超限不截断、空内容不发
+    · 「读不到 ≠ 被清空」这条（X11 超时要靠它保命）
+    · 基线规则：会话建立那一刻的内容不外推
+    · Win32 后端的真实读写（UTF-16、GB 级长度、中文、emoji）
+    · 两端全链路的两个方向（真 wire）
+  只能真麒麟验：
+    · X11 selection 的 set/get 全流程（XConvertSelection、SelectionNotify、INCR 分段）
+    · 别的程序（浏览器/编辑器）粘贴我们写的内容是什么效果
+    · UKUI 上 PRIMARY 中键粘贴的实际行为
+    · 剪贴板所有者进程退出后内容失效，在真机上用户是否觉得突兀
+  **没有假装验过的**：x11.rs 里每一个 Xlib 调用在本机一行都没执行过。
+
+【已知限制（照实写）】
+  · 只同步文本；图片、文件列表（text/uri-list）不同步
+  · 不传播「剪贴板被清空」
+  · 单条上限 192 KiB（X11 单请求约 256 KiB，第一版不写 INCR 发送）
+  · 被控端进程退出后，它在 X11 里持有的剪贴板内容随之消失（X11 固有行为）

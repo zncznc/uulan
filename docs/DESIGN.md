@@ -249,9 +249,14 @@ uulan/
 │  ├─ uulan-server/            # 中继/信令，bin: uulan-server
 │  ├─ uulan-host/              # 被控端，bin: uulan-host（Linux only）
 │  ├─ uulan-client/            # 控制端，bin: uulan-client（Windows + Linux）
+│  ├─ uulan-clip/              # 剪贴板：平台无关的去重状态机 + Win32/X11 后端
 │  └─ uulan-x11/               # X11 采集参数、输入注入、剪贴板（host 专用，隔离平台代码）
 └─ tools/
-   └─ xvfb-test.sh             # 在无头 Linux 上用 Xvfb 起一个假的麒麟桌面来测
+   ├─ xvfb-test.sh             # 在无头 Linux 上用 Xvfb 起一个假的麒麟桌面来测
+   └─ smoke-local.sh           # 本机冒烟（含 CLI、配置落盘）
+└─ scripts/
+   ├─ verify-window-e2e.sh     # 拷出工作区跑全链路 + 断言窗口真的呈现了帧
+   └─ verify-clipboard-e2e.sh  # 真实系统剪贴板改一次，断言它经协议到了对端
 ```
 
 ## 8. 里程碑
@@ -262,7 +267,7 @@ uulan/
 |---|---|---|---|
 | **M1 骨架** | ✅ | workspace 能编译；protocol 单测过；server 能注册设备并配对转发 | `cargo test` 全绿；本机起 server，两端能配对三条通道并盲转发 |
 | **M2 能看见** | ✅ | 被控端采集编码、控制端解码；端到端视频通路 | 进程内端到端测试全绿；**并在真麒麟 V10 SP1 上跑通**：Windows 控制端看到 1920x1080 真实桌面，首帧 216ms、零丢帧、画面与实机截图相关系数 0.9995 |
-| **M2.5 画好** | 🔄 | 窗口 ✅；**键鼠注入 ✅（两端已接，本机全链路验证）**；**实测帧率上报 ✅**；剪贴板 ⬜、分辨率变化重建解码器 ⬜ | 能远程操作并双向粘文字（键鼠部分已单测+全链路覆盖，真机注入待验；剪贴板未做） |
+| **M2.5 画好** | 🔄 | 窗口 ✅；**键鼠注入 ✅（两端已接，本机全链路验证）**；**实测帧率上报 ✅**；**剪贴板文本双向 ✅（本机全链路 + 真 Win32 剪贴板实测；X11 后端待真机验）**；分辨率变化重建解码器 ⬜ | 能远程操作并双向粘文字（键鼠部分已单测+全链路覆盖，真机注入待验；剪贴板文本双向已在本机实测通过） |
 | **M3 能操作** | 🔄 | XTest 注入 + 按键连发处理**已实现**（Linux 目标编译通过，逻辑单测覆盖）；uinput 兜底未做 | 能在控制端敲命令、拖窗口 —— **必须在麒麟 X11 上实测**，本机无法验证 |
 | **M4 工具齐全** | ⬜ | 文件传输、终端、端口映射 | 三项功能逐个实测通过 |
 | **M5 麒麟落地** | ⬜ | 麒麟安装包 + systemd 开机自启 + 部署文档 | 在真麒麟 V10 SP1 上跑通 M2–M4 |
@@ -389,6 +394,89 @@ unknown_vk_and_sub_notch_wheel_inject_nothing
 **没有假装验过的**：XTest 的每一个 syscall 在本机一行都没执行过。上面「已验」的
 是「被控端打算注入什么」，不是「X 真的照做了」。
 
+### M2.5 进行中：剪贴板双向（文本已完成）
+
+独立 crate `crates/uulan-clip`，沿用键鼠那套分层：
+
+```
+ClipSync（纯状态机：该不该发 / 该不该写 / 该不该闭嘴）        ← 任何平台都能 cargo test
+  ├─ Win32 后端（控制端在 Windows 上）：user32/kernel32 直接 FFI，CF_UNICODETEXT
+  └─ X11 后端（麒麟被控端 + Linux 控制端）：CLIPBOARD/PRIMARY selection
+```
+
+两端各一条 500ms 轮询（[`uulan_clip::POLL_INTERVAL`]），走的是**已有的 control 连接**，
+协议一行没改 —— `C2H::Clip` / `H2C::Clip` 早就在 `msg.rs` 里躺着。
+
+#### 几个不是「照协议填一遍」的地方
+
+- **防回声靠「已知内容指纹」，不是靠标志位**。远端内容写进本机剪贴板后会被自己的轮询读到，
+  若原样回发就成无限循环。做法是记住最近一次已知内容（不论来源），哈希相同就不再发。
+  指纹**先做换行归一化**（丢掉 `\r`）：Windows 把 `\n` 存成 `\r\n`，不归一化就会
+  「A 发 B、B 又发 A」地刷一晚上。这个变换幂等，所以回路一定收敛。
+- **绝不传播「剪贴板被清空」**。X11 读剪贴板是一次跨进程请求，所有者可能不回应 ——
+  超时读出来是 `None`。若把 `None` 当成「内容变成空」，一次超时就会把对面剪贴板擦掉。
+  所以只同步非空文本，`None` 一律当「没读到」（`ClipSync::outbound(None) == None`，有测试钉住）。
+- **会话建立那一刻的内容不外推**。两端都在会话开头读一次基线并记成「已知」：
+  否则一连上就把对面正在用的剪贴板换成「我这边的历史内容」。代价是连接后几百毫秒内
+  复制的内容不会同步（下次变化照常），这条写进了测试 `session_start_does_not_push_pre_existing_clipboard`。
+- **超限整条丢弃，不截断**。单条上限 192 KiB（X11 单个请求约 256 KiB，第一版不做 INCR 发送）。
+  截断的剪贴板比不同步更坑人，所以选择「不发 + 记数」。
+- **X11 写入必须一直有人守着**。`set_text` 之后，别的程序来取数据是**我们**要回答的 ——
+  所以 X11 后端专门起一个 service 线程（独占第二条 `Display*` 连接、一个 1x1 隐藏窗口当
+  owner）回答 `SelectionRequest`；`CLIPBOARD` 与 `PRIMARY` 一起拿下（只同步 CLIPBOARD 会出现
+  「Ctrl+V 可以、中键不行」）。别的程序把 selection 抢走时收到 `SelectionClear`，
+  必须立刻丢掉手里的 `own_text`，否则 `get_text` 会永远返回旧内容。
+- **读取要处理 INCR**。大内容时所有者分段送：先 `XDeleteProperty` 表示「收到了，继续」，
+  再按 `PropertyNotify` 一段段收，收到空段为止，整体 1.5 秒超时。
+- **控制通道拆成读/写两半**。原来 `control_loop` 拿着 `&mut TcpStream` 死等一帧；
+  现在要「读帧」和「每 500ms 轮询剪贴板」并行，共用一个 `&mut` 既借不动也会互相阻塞，
+  所以 `into_split()` 后 `select!`。
+- **能力如实声明**：`HelloOk.caps` 只在后端真的可用时才带 `Clipboard`。
+  没桌面（`UU_DESKTOP_BACKEND=none`）时后端是 `NoClipboard`，`set_text` **报错而不是装作成功**。
+
+#### 实测（本机，可重复）
+
+```
+cargo test --workspace                                         200 passed / 0 failed  （基线 187，+13）
+cargo build --release                                          0 警告
+cargo check -p uulan-host -p uulan-clip --target x86_64-unknown-linux-gnu   0 警告
+```
+
+两端全链路（`crates/uulan-client/tests/clipboard_path.rs`，真 server + 真会话 + 真 wire，
+只把「系统剪贴板」换成内存版）：
+
+```
+clipboard_syncs_both_ways_without_echo
+  中文/换行/emoji 双向各一次都到达；再等 1.6 秒，两端剪贴板各自仍只被对面写过 1 次（无回声）
+session_start_does_not_push_pre_existing_clipboard
+  连上之前的内容两边都没被覆盖；之后用户新复制的仍照常同步
+```
+
+真实系统剪贴板（`scripts/verify-clipboard-e2e.sh`，本机同时当被控端与控制端，
+会话中途用 PowerShell 改一次剪贴板，跑完还原原内容）：
+
+```
+被控端：backend="win32" available=true
+被控端统计：sent=1 recv=0 errors=0 skipped_same=23
+控制端：剪贴板同步：发送 0 / 接收 1（本机写入失败 0）
+```
+
+即「真实剪贴板变化 → 协议 → 对端真实写回」这条完整链路是通的（发送数为 0 是因为
+两端共享同一个剪贴板，被控端先看到了这次变化）。窗口同时跑着 `painted=1350`。
+
+#### 已经验过 / 只能在真麒麟上验
+
+| 已经验（本机 `cargo test` 可复现） | 必须在真麒麟 X11 上验 |
+|---|---|
+| 去重、防回声（含 Windows CRLF 改写）、空内容不发 | `XConvertSelection` / `SelectionNotify` 的真实往返 |
+| 超限整条丢弃（不截断）、基线不外推 | 大内容的 INCR 分段接收 |
+| 「读不到 ≠ 被清空」 | 别的程序（浏览器/编辑器）粘贴我们写的内容 |
+| Win32 后端真实读写（UTF-16、中文、emoji、写后还原） | `PRIMARY` 中键粘贴在 UKUI 下的实际行为 |
+| 两端全链路两个方向（真 wire） | 所有者进程退出后剪贴板内容失效，用户观感如何 |
+
+**没有假装验过的**：`x11.rs` 里每一个 Xlib 调用在本机一行都没执行过 ——
+它只被 `cargo check --target x86_64-unknown-linux-gnu` 类型检查过。
+
 #### 本机开发环境的两个坑（会重复踩）
 
 1. **链接 `windows-sys` 需要 `dlltool.exe`**，它不在 PATH 上。在
@@ -438,6 +526,11 @@ M2 分两层验收，**两层都做完了**。
 - **被控端构建需要 `libx11-dev` / `libxtst-dev`**（链接期）。只装运行时库
   `libXtst.so.6` 能跑但编不过；这条写进了 [`docs/DEPLOY-KYLIN.md`](DEPLOY-KYLIN.md)。
 - 注入失败不会让会话中断：控制端只在状态里看到「被控端拒绝 N 条」，不会弹窗。
+- **剪贴板只同步文本**（第一版）。图片、文件列表（`text/uri-list`）不同步；
+  单条上限 192 KiB，超过就整条不同步（不截断）；「清空剪贴板」不传播
+  （X11 上读不到不等于内容变空，按「没读到」处理）。
+- **被控端进程退出后，它写进 X11 剪贴板的内容随之失效** —— 这是 X11 的固有行为
+  （selection 归所有者进程所有），不是缺陷；控制端退出同理，Windows 一侧会保留最后一次写的内容。
 
 ## 10. 与参考项目的差异一览
 

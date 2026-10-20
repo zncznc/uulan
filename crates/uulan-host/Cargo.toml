@@ -24,6 +24,7 @@ tracing-subscriber = { workspace = true }
 rand = { workspace = true }
 uulan-protocol = { workspace = true }
 uulan-media = { path = "../uulan-media" }
+uulan-clip = { path = "../uulan-clip" }
 
 [dev-dependencies]
 tokio = { workspace = true }

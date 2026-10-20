@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/uulan-protocol",
     "crates/uulan-media",
+    "crates/uulan-clip",
     "crates/uulan-server",
     "crates/uulan-host",
     "crates/uulan-client",

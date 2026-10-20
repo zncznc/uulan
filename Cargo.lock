@@ -1473,11 +1473,19 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uulan-clip",
  "uulan-host",
  "uulan-media",
  "uulan-protocol",
  "uulan-server",
  "winit",
+]
+
+[[package]]
+name = "uulan-clip"
+version = "0.1.0"
+dependencies = [
+ "tracing",
 ]
 
 [[package]]
@@ -1492,6 +1500,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uulan-clip",
  "uulan-media",
  "uulan-protocol",
  "uulan-server",

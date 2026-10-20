@@ -33,6 +33,8 @@ struct Args {
     headless: bool,
     /// 只读模式：不上报键鼠（排障、旁观时用）。
     no_input: bool,
+    /// 不参与剪贴板同步（排障 / 不希望本机剪贴板被对面改写时用）。
+    no_clipboard: bool,
 }
 
 const HELP: &str = "\
@@ -50,6 +52,7 @@ uulan-client —— uulan 内网远控的控制端
   --save-frame <path> 退出时把最后一帧存成 PPM（排查「对面到底画的是什么」用）
   --headless          不开窗口，只打印统计（自测 / 无显示环境用）
   --no-input          只读模式：不上报键鼠（排障、旁观时用）
+  --no-clipboard      不同步剪贴板（不希望本机剪贴板被对面改写时用）
   --json              以 JSON 输出统计（仅 --headless 下生效）
   -h, --help          显示本帮助
 
@@ -69,6 +72,7 @@ fn parse_args() -> Result<Args> {
         save_frame: None,
         headless: false,
         no_input: false,
+        no_clipboard: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -88,6 +92,7 @@ fn parse_args() -> Result<Args> {
             "--json" => a.json = true,
             "--headless" => a.headless = true,
             "--no-input" => a.no_input = true,
+            "--no-clipboard" => a.no_clipboard = true,
             "-h" | "--help" => {
                 println!("{HELP}");
                 std::process::exit(0);
@@ -124,9 +129,22 @@ async fn main() -> Result<()> {
 
     let args = parse_args()?;
 
-    // M2 只实现了「看画面」。能力列表必须如实：声明了没实现的能力，
-    // 被控端会准备好对应通道，而控制端点了没反应 —— 那种 bug 最难查。
-    let caps: Vec<Cap> = vec![];
+    // 能力列表必须如实：声明了没实现的能力，被控端会准备好对应通道，
+    // 而控制端点了没反应 —— 那种 bug 最难查。剪贴板只在真有后端时才声明。
+    let clipboard: Option<Box<dyn uulan_clip::Clipboard>> =
+        if args.no_clipboard || args.no_input {
+            if args.no_clipboard {
+                println!("剪贴板同步已按 --no-clipboard 关闭");
+            }
+            None
+        } else {
+            Some(uulan_clip::default_clipboard(None))
+        };
+    let clip_ok = clipboard.as_ref().map(|c| c.available()).unwrap_or(false);
+    let mut caps: Vec<Cap> = vec![];
+    if clip_ok {
+        caps.push(Cap::Clipboard);
+    }
 
     info!(server = %args.server, device = %args.device, "正在连接");
     let c = match connect::connect(&args.server, &args.device, &args.password, &args.name, caps).await
@@ -182,7 +200,7 @@ async fn main() -> Result<()> {
         //
         // 键鼠就从这条控制连接上报：`ControlLink` 里一半任务写、一半任务读，
         // 窗口线程只管往无界队列里塞消息（同步调用，不会卡住事件循环）。
-        let link = uulan_client::control::ControlLink::start(c.control);
+        let link = uulan_client::control::ControlLink::start_with_clipboard(c.control, clipboard);
         let input = if c.host.has_desktop && !args.no_input {
             Some(link.input())
         } else {
@@ -199,6 +217,10 @@ async fn main() -> Result<()> {
         println!(
             "输入上报：移动 {} / 按键 {} / 文本 {} / 点击 {} / 滚轮 {}（未送出 {}；被控端拒绝 {}）",
             si.moves, si.keys, si.chars, si.buttons, si.wheels, si.dropped, si.host_errors
+        );
+        println!(
+            "剪贴板同步：发送 {} / 接收 {}（本机写入失败 {}）",
+            si.clips_sent, si.clips_recv, si.clip_errors
         );
         watcher.shutdown();
         let s = watcher.snapshot();

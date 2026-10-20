@@ -19,6 +19,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use uulan_clip::{poll_outbound, ClipSync, Clipboard, POLL_INTERVAL};
 use uulan_protocol::frame::{read_frame, write_frame, FrameKind};
 use uulan_protocol::msg::{C2H, H2C};
 
@@ -34,6 +35,12 @@ pub struct InputStats {
     pub dropped: AtomicU64,
     /// 被控端报告的输入错误数（比如被控端不是 X11、XTest 被拦）。
     pub host_errors: AtomicU64,
+    /// 剪贴板：本端 → 被控端，真的送出去的条数。
+    pub clips_sent: AtomicU64,
+    /// 剪贴板：被控端 → 本端，真的写进本地剪贴板的条数。
+    pub clips_recv: AtomicU64,
+    /// 写本地剪贴板失败次数。
+    pub clip_errors: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -45,6 +52,9 @@ pub struct InputStatsSnapshot {
     pub wheels: u64,
     pub dropped: u64,
     pub host_errors: u64,
+    pub clips_sent: u64,
+    pub clips_recv: u64,
+    pub clip_errors: u64,
 }
 
 impl InputStatsSnapshot {
@@ -63,6 +73,9 @@ impl InputStats {
             wheels: self.wheels.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
             host_errors: self.host_errors.load(Ordering::Relaxed),
+            clips_sent: self.clips_sent.load(Ordering::Relaxed),
+            clips_recv: self.clips_recv.load(Ordering::Relaxed),
+            clip_errors: self.clip_errors.load(Ordering::Relaxed),
         }
     }
 }
@@ -112,14 +125,34 @@ pub struct ControlLink {
 }
 
 impl ControlLink {
-    /// 接管已鉴权的控制连接。
+    /// 接管已鉴权的控制连接（不启用剪贴板同步）。
     pub fn start(control: TcpStream) -> Self {
+        Self::start_with_clipboard(control, None)
+    }
+
+    /// 同上，但带上剪贴板后端。
+    ///
+    /// 剪贴板轮询和键鼠上报**共用这一条控制连接、这一个任务**：
+    /// 三件事（等上报 → 读回报 → 定时轮询剪贴板）都是「有就干、没有就等」，
+    /// 拆成多个任务反而要额外加锁去抢同一个写半边。
+    pub fn start_with_clipboard(control: TcpStream, clipboard: Option<Box<dyn Clipboard>>) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<C2H>();
         let stats = Arc::new(InputStats::default());
         let st = stats.clone();
 
         let handle = tokio::spawn(async move {
             let (mut rd, mut wr) = control.into_split();
+            let mut clip = clipboard;
+            let mut clip_sync = ClipSync::new();
+            // 基线：连接这一刻本机剪贴板里已有的内容不算「新内容」，不推给对面。
+            // 在任务开头就读一次（而不是等第一拍轮询），把「刚连上就复制」的窗口压到最小。
+            let mut clip_armed = false;
+            let baseline = clip.as_mut().and_then(|c| c.get_text());
+            let _ = poll_outbound(&mut clip_sync, baseline.as_deref(), &mut clip_armed);
+
+            let mut tick = tokio::time::interval(POLL_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
             loop {
                 tokio::select! {
                     msg = rx.recv() => {
@@ -151,6 +184,29 @@ impl ControlLink {
                                     info!(reason = %reason, "被控端道别");
                                     break;
                                 }
+                                Ok(H2C::Clip { text }) => {
+                                    // 写进本机剪贴板。写入失败不算致命：对面内容不会丢，
+                                    // 只是这台机器粘不出来 —— 所以计数后继续。
+                                    match clip.as_mut() {
+                                        None => debug!(bytes = text.len(), "没有剪贴板后端，收到的内容已丢弃"),
+                                        Some(c) => match clip_sync.inbound(&text) {
+                                            None => debug!("收到的剪贴板内容与已知内容相同，忽略"),
+                                            Some(t) => match c.set_text(&t) {
+                                                Ok(()) => {
+                                                    st.clips_recv.fetch_add(1, Ordering::Relaxed);
+                                                    debug!(bytes = t.len(), "已写入本机剪贴板");
+                                                }
+                                                Err(e) => {
+                                                    st.clip_errors.fetch_add(1, Ordering::Relaxed);
+                                                    warn!(error = %e, "写本机剪贴板失败");
+                                                }
+                                            },
+                                        },
+                                    }
+                                }
+                                Ok(H2C::ClipOffer { len }) => {
+                                    debug!(len, "被控端声明有新剪贴板内容（第一版只支持直接内容）");
+                                }
                                 Ok(H2C::Metrics(_)) => debug!("收到被控端指标"),
                                 Ok(_) => {}
                                 Err(e) => debug!(error = %e, "控制通道上收到无法解析的 JSON"),
@@ -158,6 +214,19 @@ impl ControlLink {
                             FrameKind::Bye => break,
                             _ => {}
                         }
+                    }
+                    _ = tick.tick() => {
+                        let Some(c) = clip.as_mut() else { continue };
+                        let cur = c.get_text();
+                        let Some(text) = clip_sync.outbound(cur.as_deref()) else {
+                            continue;
+                        };
+                        let m = C2H::Clip { text };
+                        let Ok(bytes) = serde_json::to_vec(&m) else { continue };
+                        if write_frame(&mut wr, FrameKind::Json, &bytes).await.is_err() {
+                            break;
+                        }
+                        st.clips_sent.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }

@@ -1,0 +1,13 @@
+[package]
+name = "uulan-clip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "uulan 剪贴板同步：与平台无关的去重状态机 + Windows/X11 后端"
+
+[lib]
+name = "uulan_clip"
+path = "src/lib.rs"
+
+[dependencies]
+tracing = { workspace = true }

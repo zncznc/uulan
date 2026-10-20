@@ -271,6 +271,8 @@ async fn run_forever(
                     screen,
                     encoder,
                     settings,
+                    // None = 按采集源自动挑（X11 采集 → X11 剪贴板）。
+                    clipboard: None,
                 };
                 let conn_addr = state.snapshot().server.clone();
                 tokio::spawn(async move {

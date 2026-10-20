@@ -97,6 +97,8 @@ async fn spawn_host(server: &str, cfg: HostConfig, out: Arc<Mutex<Vec<Inject>>>)
                     screen,
                     encoder: Encoder::X264,
                     settings,
+                    // 输入链路测试不碰系统剪贴板。
+                    clipboard: Some(Box::new(uulan_clip::NoClipboard::new("输入链路测试"))),
                 };
                 let a = addr.clone();
                 let rec = out.clone();
