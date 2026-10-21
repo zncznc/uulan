@@ -341,6 +341,16 @@ RUST_LOG=info ./uulan-host --config host.json
 终端只在**被控端**起进程（`portable-pty` → `/dev/ptmx` + fork），控制端只是把本机 stdin/stdout
 接上去。所以麒麟这边要确认的是「真 PTY 起得来、真 shell 收得干净」。
 
+先在仓库里跑一遍**自动化**那条（本机在 Windows 上也过：
+
+```bash
+bash scripts/verify-term-e2e.sh
+#   ① 远端 shell 执行 echo uulan-term-ok；② backend="portable-pty"；
+#   ③ 日志有「终端会话已开启 / 结束」；④ 控制端无 panic
+```
+
+麒麟上再按下面手工过一遍（Linux 独有的 termios / 信号行为只能这么验）：
+
 ```
 # 1) 被控端日志：这一轮起会有这两行（说明后端真的选上了 portable-pty）
 RUST_LOG=info ./uulan-host --config host.json

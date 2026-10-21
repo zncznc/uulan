@@ -24,7 +24,16 @@ cargo test -p uulan-client --test term_path
     4) resize 到 140x40 之后，shell 自己读到的窗口大小就是 140x40
     5) 主动关闭 → TermExit code 129
 
-二、这一轮修掉的两个 bug（都是靠上面这些测试抓出来的）
+cargo test -p uulan-host --lib term 里新增 1 项反压测试（现在 16 项）：
+  控制端不收时消息一条不丢、顺序不乱（先全拒、再放开、退出事件必须补上）
+
+bash scripts/verify-term-e2e.sh            ← **真 PTY + 真进程**
+    PASS：被控端日志 backend="portable-pty"、shell=cmd.exe（Windows 上是 ConPTY）；
+         远端 cmd.exe 真的执行了 echo uulan-term-ok；
+         客户端退出码 = 远端 shell 的退出码（7）；
+         日志有「终端会话已开启 / 终端会话结束 code=7」；控制端 stderr 无 panic
+
+二、这一轮修掉的三个 bug（都是靠上面这些测试抓出来的）
 ------------------------------------------------------
 
 1) 退出事件被吞：后端的输出通道先关（读线程收尾）不等于进程已退出。
@@ -37,6 +46,9 @@ cargo test -p uulan-client --test term_path
 
 三、本机验不了的（必须上麒麟）
 ------------------------------
+
+0) 说明：本机（Windows）跑的是 ConPTY，**真进程**那一层已经过了；
+   下面是 Linux 独有、ConPTY 覆盖不到的部分。
 
 1) 真 PTY：/dev/ptmx、termios 回显、行缓冲 vs raw 模式
    - 开一个会话，敲 ls、方向键上下翻历史、Ctrl-C 打断

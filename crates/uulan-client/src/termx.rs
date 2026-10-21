@@ -25,6 +25,7 @@
 //! unix 上用 `cfmakeraw`；**Windows 控制端暂未接**（要 `SetConsoleMode`，见 DESIGN 的已知限制）。
 
 use std::io::{Read, Write};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
@@ -197,6 +198,11 @@ impl TermLink {
         }
     }
 
+    /// 拿一个「只能关闭」的句柄（给看门狗任务用）。
+    pub fn closer(&self) -> CloseHandle {
+        CloseHandle { tx: self.tx.clone(), id: self.id }
+    }
+
     /// 收摊：先关连接，再把两个任务收回来（别让它们悬在运行时里）。
     pub async fn finish(mut self) {
         drop(self.tx);
@@ -205,6 +211,24 @@ impl TermLink {
         let _ = (&mut self.reader).await;
     }
 }
+
+/// 只能发「关闭会话」的句柄：看门狗要在别的任务里关会话，但又不需要整套 `TermLink`。
+pub struct CloseHandle {
+    tx: mpsc::Sender<ToHost>,
+    id: u32,
+}
+
+impl CloseHandle {
+    pub async fn close(&self) -> Result<()> {
+        self.tx
+            .send(ToHost::Json(C2H::Term(TermOp::Close { id: self.id })))
+            .await
+            .map_err(|_| anyhow::anyhow!("控制通道已关闭"))
+    }
+}
+
+/// 本机 stdin 结束后，等远端 shell 自己退出最多这么久，然后强制关会话。
+const EOF_GRACE: Duration = Duration::from_secs(3);
 
 /// 交互式终端：把本机 stdin/stdout 接到远端 PTY 上，返回远端 shell 的退出码。
 pub async fn run(control: TcpStream, opts: Options) -> Result<i32> {
@@ -239,14 +263,24 @@ pub async fn run(control: TcpStream, opts: Options) -> Result<i32> {
     });
 
     let mut stdin_done = false;
+    // ConPTY（Windows 被控端）一开就会给「终端」发一条 DSR（ESC[6n）问光标位置，
+    // 不回答它就不会往下画。我们不是完整终端仿真器，但这一条必须答 ——
+    // 答 `ESC[1;1R` 就够了（远端的纯文本 shell 不在乎具体位置）。
+    // unix 的 PTY 不发这个，所以麒麟路径上这段是空转。
+    let mut tail: Vec<u8> = Vec::new();
     let code = loop {
         tokio::select! {
             ev = link.next_event() => match ev {
                 Some(Ev::Output(b)) => {
-                    let out = std::io::stdout();
-                    let mut out = out.lock();
-                    out.write_all(&b).context("写本机终端失败")?;
-                    out.flush().ok();
+                    {
+                        let out = std::io::stdout();
+                        let mut out = out.lock();
+                        out.write_all(&b).context("写本机终端失败")?;
+                        out.flush().ok();
+                    }
+                    if answers_dsr(&mut tail, &b) {
+                        link.input(CPR).await?;
+                    }
                 }
                 Some(Ev::Exit(code)) => break code,
                 Some(Ev::Error(e)) => {
@@ -263,9 +297,16 @@ pub async fn run(control: TcpStream, opts: Options) -> Result<i32> {
                 Some(Some(b)) => link.input(&b).await?,
                 Some(None) | None => {
                     stdin_done = true;
-                    // 本机 stdin 没了（管道结束 / 用户 Ctrl-D）：礼貌地关远端会话，
-                    // 然后继续收尾 —— 退出码还是要报出来的。
-                    link.close().await?;
+                    // 本机 stdin 结束**不等于**用户要断开：终端里的惯例是发一个 EOT（Ctrl-D），
+                    // 让远端 shell 自己决定退出。这里直接 Close 会把它杀掉，
+                    // 例子：把 `ls` 和 `exit 7` 从管道喂给 --term，客户端退出码必须是 7，不是 129。
+                    link.input(&[0x04]).await?;
+                    // 但对方也可能只是挂在提示符上（EOT 不该退出），所以留一个看门狗。
+                    let closer = link.closer();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(EOF_GRACE).await;
+                        let _ = closer.close().await;
+                    });
                 }
             },
         }
@@ -273,6 +314,33 @@ pub async fn run(control: TcpStream, opts: Options) -> Result<i32> {
 
     link.finish().await;
     Ok(code)
+}
+
+/// ConPTY（Windows 被控端）会发 DSR 问光标位置：`ESC[6n`。
+const DSR: &[u8] = &[0x1b, b'[', b'6', b'n'];
+/// 回答：光标在第 1 行第 1 列（`ESC[1;1R`）。纯文本 shell 不在乎具体位置。
+const CPR: &[u8] = &[0x1b, b'[', b'1', b';', b'1', b'R'];
+
+/// 输出里出现 DSR（`ESC[6n`）就回一句光标位置（`ESC[1;1R`）。
+///
+/// 用 `tail` 记住上次结尾的几个字节：序列可能正好被两帧切开。
+fn answers_dsr(tail: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    let mut hit = false;
+    let mut scan = tail.clone();
+    scan.extend_from_slice(chunk);
+    let mut i = 0;
+    while i + DSR.len() <= scan.len() {
+        if &scan[i..i + DSR.len()] == DSR {
+            hit = true;
+            i += DSR.len();
+        } else {
+            i += 1;
+        }
+    }
+    // 留最后 3 个字节（DSR 长度 - 1）当上下文。
+    let keep = DSR.len() - 1;
+    *tail = scan[scan.len().saturating_sub(keep)..].to_vec();
+    hit
 }
 
 // ───────────────────────────── 本机终端 raw 模式 ─────────────────────────────
@@ -359,6 +427,19 @@ mod tests {
     fn options_keep_explicit_size() {
         let o = Options { shell: Some("/bin/sh".into()), cols: 100, rows: 40 }.resolved();
         assert_eq!((o.cols, o.rows), (100, 40));
+    }
+
+    #[test]
+    fn dsr_is_detected_across_frame_boundaries() {
+        let dsr = [0x1b, b'[', b'6', b'n'];
+        let mut tail = Vec::new();
+        assert!(answers_dsr(&mut tail, &dsr), "完整序列要认出来");
+        // 被切成两帧也要认出来（ConPTY 的输出是流，帧边界随便切）。
+        let mut tail = Vec::new();
+        assert!(!answers_dsr(&mut tail, &[b'a', b'b', b'c', 0x1b, b'[']));
+        assert!(answers_dsr(&mut tail, &[b'6', b'n']), "跨帧的 DSR 必须认出来");
+        let mut tail = Vec::new();
+        assert!(!answers_dsr(&mut tail, b"ls -l\r\nno escape here"));
     }
 
     #[test]

@@ -296,7 +296,7 @@ uulan/
 | **M2 能看见** | ✅ | 被控端采集编码、控制端解码；端到端视频通路 | 进程内端到端测试全绿；**并在真麒麟 V10 SP1 上跑通**：Windows 控制端看到 1920x1080 真实桌面，首帧 216ms、零丢帧、画面与实机截图相关系数 0.9995 |
 | **M2.5 画好** | 🔄 | 窗口 ✅；**键鼠注入 ✅（两端已接，本机全链路验证）**；**实测帧率上报 ✅**；**剪贴板文本双向 ✅（本机全链路 + 真 Win32 剪贴板实测；X11 后端待真机验）**；**分辨率变化重建解码器 ✅（两端都做了，本机全链路实测）** | 能远程操作并双向粘文字、被控端换分辨率后画面自动跟上（键鼠/剪贴板/分辨率的真机行为待验；本机均已实测通过） |
 | **M3 能操作** | 🔄 | XTest 注入 + 按键连发处理**已实现**（Linux 目标编译通过，逻辑单测覆盖）；uinput 兜底未做 | 能在控制端敲命令、拖窗口 —— **必须在麒麟 X11 上实测**，本机无法验证 |
-| **M4 工具齐全** | 🔄 | **文件传输 ✅**（列/取/送/建/删/改名/哈希 + 路径沙箱 + sha256，真二进制实测 6 MiB 往返一致）；**端口映射 ✅**（bulk 多路复用 + `--forward`，真二进制实测 256 KiB 单流 + 两条并发流逐字节一致）；**终端（PTY）✅ 本机全链路**（15 项状态机 + 4 项真 TCP 端到端，PTY 后端可注入） | 三项都用真 server + 真被控端 + 真客户端链路验过。终端唯一没验的是**真 PTY 本身**（termios / SIGHUP→SIGKILL / 真 shell 交互）—— 本机没有可用的 PTY 路径，必须上麒麟 |
+| **M4 工具齐全** | 🔄 | **文件传输 ✅**（列/取/送/建/删/改名/哈希 + 路径沙箱 + sha256，真二进制实测 6 MiB 往返一致）；**端口映射 ✅**（bulk 多路复用 + `--forward`，真二进制实测 256 KiB 单流 + 两条并发流逐字节一致）；**终端（PTY）✅ 本机全链路**（16 项状态机 + 4 项真 TCP 端到端 + 真 PTY 脚本 4 项断言） | 三项都用真 server + 真被控端 + 真客户端链路验过。终端在本机连**真 PTY** 都验了（Windows ConPTY + 真 cmd.exe 进程）；只剩 Linux 独有的 termios / SIGHUP→SIGKILL / 麒麟 bash 交互要上真机 |
 | **M5 麒麟落地** | ⬜ | 麒麟安装包 + systemd 开机自启 + 部署文档 | 在真麒麟 V10 SP1 上跑通 M2–M4 |
 | **M6 加固** | ⬜ | E2E 加密、临时验证码轮换、日志脱敏 | 中继抓包看不到明文内容 |
 
@@ -811,16 +811,28 @@ bash scripts/verify-window-e2e.sh    窗口呈现 506 帧 / 首帧 74ms         
 - 协议补了一条 `H2C::TermError{id,error}`：开不出 shell / id 不认识 / 输入不是合法 base64
   必须能说清是**哪条会话**出错 —— 静默丢弃会变成「按了键、屏幕没反应、日志也没有」。
 
-实测（本机：真 TCP、真协议、真 id 注册表，PTY 换成内存假 shell）：
+实测分两层，**两层都在本机跑过**：
 
 ```text
-cargo test -p uulan-host --lib term              15 passed   （状态机：开/写/改大小/关/退出/上限/切帧）
-cargo test -p uulan-client --test term_path       4 passed   （真 TCP 端到端）
+# 第一层：协议与状态机（PTY 换成内存假 shell，可以断言每个细节）
+cargo test -p uulan-host --lib term              16 passed
+cargo test -p uulan-client --test term_path       4 passed
   回显逐字节一致；退出码 7 原样上报；
-  40000 字节切成 3+ 帧且一个字节不少（单帧 ≤ 16 KiB）；
+  10009 字节切成 3+ 帧且一个字节不少（单帧 ≤ 16 KiB）；
   resize 到 140x40 后 shell 读到的窗口大小确实是 140x40；
-  主动关闭报 129（128+SIGHUP）
+  主动关闭报 129（128+SIGHUP）；控制端不收时反压生效（消息一条不丢、顺序不乱）
+
+# 第二层：真 PTY + 真进程（真二进制、真 server、真 client）
+bash scripts/verify-term-e2e.sh
+  → 被控端日志 backend="portable-pty"、shell=cmd.exe
+  → 远端 cmd.exe 真的执行了 echo uulan-term-ok
+  → 客户端退出码 = 远端 shell 的退出码（7）
 ```
+
+第二层在 Windows 上走的是 **ConPTY**（`portable-pty` 的 native 后端），所以
+「起 shell → 读输出 → 写输入 → 传退出码 → 会话收尾」这套管线对**真进程**是成立的，
+不只是对假后端成立。麒麟上要额外验的是 Linux 独有的部分（`/dev/ptmx`、termios、
+SIGHUP→SIGKILL 的收尾），见 docs/DEPLOY-KYLIN.md §10。
 
 #### 这一轮踩到的两个坑（都已钉成测试）
 
@@ -828,6 +840,14 @@ cargo test -p uulan-client --test term_path       4 passed   （真 TCP 端到�
   早期写法在输出通道关掉时直接 `break`，于是 `TermExit` 永远发不出去 —— 控制端的窗口会挂死。
   现在分两步：拿到退出码后先给 200ms 把最后一批输出刷完，再发 `TermExit`
   （顺序反了就是「命令失败但看不到任何报错」）。
+- **ConPTY 会先问光标位置，不答就不往下画**：Windows 被控端一开会话，ConPTY 就给「终端」
+  发一条 DSR（`ESC[6n`），等一句 `ESC[row;colR`。控制端只是个字节管道，不回答的话
+  shell 就卡在那里（表现是「连上了、什么都没有、3 秒后会话被杀」）。
+  现在控制端在输出里见到 DSR 就回 `ESC[1;1R`（跨帧也要认，所以留了 3 字节尾巴）。
+  这不是做终端仿真，只是把「必须回的那一条」回了；unix 的 PTY 不发这个，麒麟路径上是空转。
+- **本机 stdin 结束 ≠ 用户要断开**：`printf 'ls\nexit 7\n' | uulan-client --term` 里
+  stdin 一关就发 `Close` 会把 shell 杀掉，退出码变成 129。现在按终端惯例先发 EOT（Ctrl-D），
+  再挂一个 3 秒看门狗：对方自己走就拿它的退出码，赖着不走才强关。
 - **`Close` 之后退出事件找不到会话**：`Close` 必须把 id 从注册表摘掉（之后的输入不能进死进程），
   但 `TermExit` 是进程真死之后才来的。少了 `closing` 集合，这次退出会被当成「未知会话」忽略。
   现在 `live`（还活着）与 `closing`（已下关闭指令、等退出）分开记，两种来源都要上报。
@@ -836,13 +856,14 @@ cargo test -p uulan-client --test term_path       4 passed   （真 TCP 端到�
 
 | 已经验（本机可复现） | 只能在真麒麟上验 |
 |---|---|
-| 开/写/改大小/关/退出整条状态机；id 复用、重复 id 拒绝、会话数上限 | 真 PTY：`/dev/ptmx`、termios 回显、行缓冲与 raw 模式的真实行为 |
-| 输出切帧与字节完整性；退出码（含被信号杀的 128+signo） | SIGHUP→SIGKILL 对**交互式** shell 是否真的收得干净（bash 忽略 SIGTERM 是已知行为） |
-| 协议与 base64；控制通道收尾时所有残留会话被收掉 | 麒麟自带 `bash/dash` 的启动文件、中文 locale 下的宽度/换行 |
-| 控制端 unix raw 模式（stdin 是管道时自动跳过） | 真终端上的方向键 / `vim` / `top`；**Windows 控制端的 raw 模式尚未接（`SetConsoleMode`）** |
+| 开/写/改大小/关/退出整条状态机；id 复用、重复 id 拒绝、会话数上限 | `/dev/ptmx` 起的真 PTY：termios 回显、行缓冲与 raw 模式的真实行为 |
+| **真 PTY 起真进程**（ConPTY + cmd.exe）：执行命令、拿回输出、退出码 7 原样传递 | SIGHUP→SIGKILL 对**交互式** shell 是否真的收得干净（bash 忽略 SIGTERM 是已知行为） |
+| 输出切帧与字节完整性；退出码（含被信号杀的 128+signo）；反压不丢字节 | 麒麟自带 `bash/dash` 的启动文件、中文 locale 下的宽度/换行 |
+| 控制端 unix raw 模式（stdin 是管道时自动跳过）、ConPTY 的 DSR 应答 | 真终端上的方向键 / `vim` / `top`；**Windows 控制端的 raw 模式尚未接（`SetConsoleMode`）** |
 
-**没有假装验过的**：真 PTY 一行都没在本机跑过。`cargo check -p uulan-host --target x86_64-unknown-linux-gnu`
-只证明 `cfg(unix)` 那几行（`libc::kill(SIGKILL)`）类型上成立，不证明它在麒麟上行为正确。
+**没有假装验过的**：Linux 的 PTY 路径一行都没跑过。本机跑通的是 Windows ConPTY；
+`cargo check -p uulan-host --target x86_64-unknown-linux-gnu` 只证明 `cfg(unix)` 那几行
+（`libc::kill(SIGKILL)`）类型上成立，不证明它在麒麟上行为正确。
 
 ### M2 实际验收方式（重要）
 
