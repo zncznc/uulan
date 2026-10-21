@@ -1527,6 +1527,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
+name = "uulan-bulk"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "uulan-protocol",
+]
+
+[[package]]
 name = "uulan-client"
 version = "0.1.0"
 dependencies = [
@@ -1540,6 +1551,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uulan-bulk",
  "uulan-clip",
  "uulan-fs",
  "uulan-host",
@@ -1581,6 +1593,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uulan-bulk",
  "uulan-clip",
  "uulan-fs",
  "uulan-media",

@@ -27,6 +27,7 @@ uulan-protocol = { workspace = true }
 uulan-media = { path = "../uulan-media" }
 uulan-clip = { path = "../uulan-clip" }
 uulan-fs = { path = "../uulan-fs" }
+uulan-bulk = { path = "../uulan-bulk" }
 
 [dev-dependencies]
 tokio = { workspace = true }

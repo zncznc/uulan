@@ -37,6 +37,8 @@ struct Args {
     no_clipboard: bool,
     /// 文件操作（给了就只干这件事，不开窗口也不收画面）。
     fs_op: Option<uulan_client::fsx::Op>,
+    /// 端口映射规则（给了就只干这件事，不开窗口也不收画面）。
+    forward: Vec<uulan_client::ForwardSpec>,
 }
 
 const HELP: &str = "\
@@ -63,6 +65,12 @@ uulan-client —— uulan 内网远控的控制端
   --put <本地路径> <远程路径>  上传
   --rm <远程路径>            删除文件（目录必须为空）
   --mkdir <远程路径>         新建目录
+
+端口映射（做完就退出，不开窗口、不收画面；可写多次）：
+  --forward [绑定地址:]本地端口:目标主机:目标端口
+                             例：--forward 2222:127.0.0.1:22
+                             目标地址站在被控端的立场解析，白名单由被控端判定
+                             不加 --seconds 就一直转发，Ctrl-C 结束
   -h, --help          显示本帮助
 
 退出码：0 正常；1 被控端拒绝（密码错/离线）；2 用法错。
@@ -83,6 +91,7 @@ fn parse_args() -> Result<Args> {
         no_input: false,
         no_clipboard: false,
         fs_op: None,
+        forward: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -103,6 +112,10 @@ fn parse_args() -> Result<Args> {
             "--headless" => a.headless = true,
             "--no-input" => a.no_input = true,
             "--no-clipboard" => a.no_clipboard = true,
+            "--forward" => {
+                let spec = it.next().context("--forward 需要 [绑定地址:]本地端口:目标主机:目标端口")?;
+                a.forward.push(uulan_client::ForwardSpec::parse(&spec)?);
+            }
             "--ls" => {
                 let p = it.next().context("--ls 需要一个远程路径")?;
                 a.fs_op = Some(uulan_client::fsx::Op::Ls(p));
@@ -181,6 +194,10 @@ async fn main() -> Result<()> {
         // 只有真的要传文件才声明这个能力：声明了不实现，被控端会准备好通道而控制端不用。
         caps.push(Cap::Files);
     }
+    if !args.forward.is_empty() {
+        // 端口映射同样只声明、不实现就别声明：这里是真要用。
+        caps.push(Cap::PortMap);
+    }
 
     info!(server = %args.server, device = %args.device, "正在连接");
     let c = match connect::connect(&args.server, &args.device, &args.password, &args.name, caps).await
@@ -207,6 +224,35 @@ async fn main() -> Result<()> {
     if let Some(op) = args.fs_op.clone() {
         drop(c.video);
         uulan_client::fsx::run(c.control, c.bulk, op).await.context("文件操作失败")?;
+        return Ok(());
+    }
+
+    // 端口映射：同样不开窗口、不收画面 —— 只在本机起监听，把字节经被控端转出去。
+    if !args.forward.is_empty() {
+        drop(c.video);
+        if !c.host.caps.contains(&Cap::PortMap) {
+            eprintln!("被控端不支持端口映射（对面版本太旧，或没实现这个能力）");
+            std::process::exit(2);
+        }
+        let fwd = uulan_client::Forwarder::start(c.control, c.bulk);
+        for spec in &args.forward {
+            let addr = fwd.listen(spec.clone()).await.context("本机监听失败")?;
+            println!(
+                "端口映射：本机 {addr} → 被控端 {}:{}",
+                spec.target_host, spec.target_port
+            );
+        }
+        // 这一行是给脚本看的「就绪信号」：后面才可能出现真实转发。
+        println!("转发已就绪（{} 条）", args.forward.len());
+        match args.seconds {
+            Some(s) => tokio::time::sleep(Duration::from_secs_f64(s)).await,
+            None => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+        let (conns, up, down) = fwd.stats();
+        println!("端口映射结束：连接 {conns} / 上行 {up} 字节 / 下行 {down} 字节");
+        fwd.shutdown();
         return Ok(());
     }
 

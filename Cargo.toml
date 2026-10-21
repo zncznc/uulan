@@ -5,6 +5,7 @@ members = [
     "crates/uulan-media",
     "crates/uulan-clip",
     "crates/uulan-fs",
+    "crates/uulan-bulk",
     "crates/uulan-server",
     "crates/uulan-host",
     "crates/uulan-client",

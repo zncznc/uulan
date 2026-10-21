@@ -1,0 +1,66 @@
+uulan 里程碑 M4（端口映射）—— bulk 改成多路复用，端口映射两端接通，本机全链路实测 ✅
+
+【本轮做了什么】
+  新增 crate crates/uulan-bulk（bulk 连接的多路复用，协议一行没改）：
+    读任务  read_frame → BulkFrame::decode → HashMap<id, Sender> 分派（全进程唯一读者）
+    写任务  Receiver<BulkFrame> → write_frame（唯一写者，帧不会被交错切碎）
+    Stream  按 id 绑定的流；Drop 即注销，业务任务 panic 也不会留下死 id
+  新增 crate 内的 uulan-fs 改造：
+    server.rs 抽出 BulkPeer trait（Bulk<R,W> 与多路复用流各实现一份），handle 泛型化
+  crates/uulan-host/src/portmap.rs（新）：目标白名单 + 建流 + socket 桥
+    PortPolicy：默认只允许本机回环；portmap_allow 支持 * / CIDR / 单 IP，写错就报错并退回回环
+    PortMap::open：解析 → 白名单（逐个地址检查）→ connect(5s) → 注册 bulk 流 → 起桥任务
+    半关闭语义：读 EOF 发 END；收到 END 关本地写半边；两个方向都结束才退
+  crates/uulan-host/src/session.rs：
+    bulk 从「文件服务独占」变成 uulan_bulk::spawn，fs_loop 与 portmap_loop 共用
+    fs_loop：Get/Put 时注册 id → MuxPeer，其余操作传 NoBulk（真用了就报错）
+    control_loop 只把 PortMapOp 排队，绝不在里面等 DNS/TCP
+    handshake 声明 Cap::PortMap；会话收尾 PortMap::shutdown() + mux.close()
+  crates/uulan-client/src/forward.rs（新）：--forward [绑定地址:]本地端口:目标主机:目标端口
+    控制通道读任务按 id 派发 PortMapOk/Err；本机监听到一条连接就 Open → 等 Ok → 桥接
+    目标连不上时立刻关掉本机连接（不让人对着一个死连接等自己的超时）
+  crates/uulan-client/src/main.rs：--forward 模式（独立会话，不开窗不收画面）
+  scripts/verify-portmap-e2e.sh（新）
+
+【实测（本机，可重复）】
+  cargo test --workspace        278 passed / 0 failed   （上一轮基线 256，新增 22）
+  cargo build --release         0 警告
+
+  bash scripts/verify-portmap-e2e.sh（真二进制，拷到 D:/uulan-bin/pm-* 下跑）
+    ① 控制端「转发已就绪」     本机 127.0.0.1:21989 → 被控端 127.0.0.1:21988
+    ② 单流 262144 字节         逐字节一致（sha256 625d8ffe332e03f7）
+    ③ 两条并发流 131072/196608 各自逐字节一致，没有串流
+    ④ 控制端统计               连接 3 / 上行 589824 字节 / 下行 589824 字节
+    ⑤ 被控端日志               白名单 allow=127.0.0.1/8, ::1/128
+                               端口映射已建立 id=1..3，每条的 up/down 对称
+
+  crates/uulan-client/tests/portmap_path.rs（真 server + 真被控端会话 + 真 wire + 真 TCP）
+    forwards_bytes_to_a_loopback_target              19 字节往返，统计上/下行各 19
+    concurrent_streams_do_not_mix                    3 条流（4/11/18 KiB）同时跑，各自对称
+    dead_target_fails_the_local_connection_quickly   目标没人听 → 本机连接立刻被关，不计入转发数
+    target_outside_whitelist_is_rejected_by_the_host 192.0.2.1 被拒，错误里必须出现「白名单」
+
+  uulan-bulk 单元测试 8 条：两条流不串、END 按流送达、未知 id 丢弃、同 id 不能注册两次、
+    Drop 释放 id、对端 EOF 唤醒所有流、close() 之后不能注册、64 KiB 往返
+
+  回归（这一轮改了 bulk 的所有权，两个都必须一起跑）
+    bash scripts/verify-files-e2e.sh    6 MiB 往返 sha256 一致（2fb40c0ef380）   ✅
+    bash scripts/verify-window-e2e.sh   窗口呈现 506 帧 / 首帧 74ms                ✅
+
+【只能真麒麟验】
+  · 真实内网链路（MTU/丢包/长肥管道）下的转发吞吐
+  · 连被控端本机 sshd / VNC / 数据库长连接能不能顶几小时
+  · 内网域名解析（/etc/resolv.conf）行为
+  · ss/netstat 看到的连接与日志里的 id 是否一一对应
+  没有假装验过的：真麒麟所在的内网拓扑。本机跑的是 loopback，延迟 <0.1ms、无丢包。
+
+【已知限制（写进 DESIGN.md 的「已知限制」）】
+  · 目标只支持 IPv4 字面量与主机名；IPv6 字面量第一版直接报错
+  · --forward 是独立会话：边看画面边转发要开两个客户端进程
+  · 默认白名单只有本机回环，放开到网段必须自己写 portmap_allow
+  · bulk 读任务单线程分派：一条流转发卡住会反压整条 bulk（流队列有界 8 帧，不会爆内存）
+
+【下一步】
+  终端（PTY）：portable-pty 起 shell，输出 term_out（base64）、输入 term_input、resize 走 term_resize。
+  协议、控制通道读写分离、bulk 多路复用都已就位，缺的只是被控端 term_loop 与控制端 CLI。
+  收尾要先 SIGHUP 再 SIGKILL（交互式 shell 会忽略 SIGTERM）。

@@ -30,18 +30,22 @@ use uulan_media::ffmpeg::{CaptureOptions, Encoder};
 use uulan_media::VideoSource;
 use uulan_protocol::frame::{read_frame, write_frame, video, FrameKind};
 use uulan_protocol::msg::{
-    quality_preset, AuthFailReason, C2H, Cap, FsOp, H2C, HostHelloOk, HostVideoCfg, Quality, Screen,
+    quality_preset, AuthFailReason, C2H, Cap, FsOp, H2C, HostHelloOk, HostVideoCfg, PortMapOp,
+    Quality, Screen,
 };
 use uulan_protocol::rvclient::RelaySet;
 
+use uulan_bulk::{Mux, Stream};
 use uulan_clip::{poll_outbound, ClipSync, Clipboard, POLL_INTERVAL};
 use uulan_fs::path::FsRoots;
-use uulan_fs::server::{self as fs_server, Bulk};
+use uulan_fs::server::{self as fs_server, BulkPeer};
+use uulan_protocol::bulk::BulkFrame;
 use uulan_protocol::frame::FrameError;
 
 use crate::capture::CaptureInput;
 use crate::config::HostConfig;
 use crate::input::{default_sink, Inject, InputSink, Mapper};
+use crate::portmap::{PortMap, PortPolicy};
 
 /// 实测帧率：按固定窗口统计编码器**真正产出**的 AU 数。
 ///
@@ -415,14 +419,34 @@ pub async fn run_with_sink(
     let reader = tokio::spawn(read_loop(rd, in_tx));
     let writer = tokio::spawn(write_loop(wr, out_rx));
 
-    // 文件服务：独占 bulk 通道。请求从控制通道转过来，结果从 out_tx 回去。
+    // 文件服务与端口映射共用 **一条多路复用的 bulk 连接**（M4 的改造）。
+    //
+    // 为什么不再让文件服务独占：端口映射要的是「一条 SSH 能长时间占着 id 而别的流照常走」，
+    // 而「一次只处理一条 FsOp」的结构会把它堵在队列里。拆法见 `uulan_bulk` 的模块注释：
+    // 读任务分派 / 写任务串行 / 每条流一个业务任务。
     let fs_roots = params
         .fs_roots
         .take()
         .unwrap_or_else(|| FsRoots::new(uulan_fs::path::home_dir(), cfg.fs_allow_absolute));
     info!(home = %fs_roots.home.display(), allow_absolute = fs_roots.allow_absolute, "文件服务已就绪");
+
+    let (bulk_rd, bulk_wr) = bulk.into_split();
+    let mux = uulan_bulk::spawn(bulk_rd, bulk_wr);
+
+    // 端口映射白名单：配置写错就退回「只允许回环」，绝不因为一行配置写错而放开全网段。
+    let policy = PortPolicy::from_config(&cfg.portmap_allow).unwrap_or_else(|e| {
+        warn!(error = %e, "portmap_allow 配置有误，退回「只允许本机回环」");
+        PortPolicy::loopback()
+    });
+    let portmap = Arc::new(PortMap::new(mux.clone(), policy));
+
     let (fs_tx, fs_rx) = mpsc::channel::<FsOp>(4);
-    let fs_task = tokio::spawn(fs_loop(bulk, fs_roots, fs_rx, out_tx.clone()));
+    let fs_task = tokio::spawn(fs_loop(mux.clone(), fs_roots, fs_rx, out_tx.clone()));
+
+    // 建映射要解析域名 + 连 TCP（最长几秒），**不能**在 control_loop 里等 ——
+    // 那条循环还负责键鼠和剪贴板，卡一下用户就能感觉到。
+    let (pm_tx, pm_rx) = mpsc::channel::<PortMapOp>(8);
+    let pm_task = tokio::spawn(portmap_loop(portmap.clone(), pm_rx, out_tx.clone()));
 
     let mut clip_sync = ClipSync::new();
     let mut clip_stats = ClipStats::default();
@@ -436,6 +460,7 @@ pub async fn run_with_sink(
         &mut clip_sync,
         &mut clip_stats,
         &fs_tx,
+        &pm_tx,
     )
     .await;
 
@@ -460,6 +485,10 @@ pub async fn run_with_sink(
 
     video_task.abort();
     fs_task.abort();
+    pm_task.abort();
+    // 会话没了就绝不能留下还开着的内网连接（用户以为断了，其实通道还通着）。
+    portmap.shutdown().await;
+    mux.close();
     let _ = out_tx.send(Out::Shutdown);
     let _ = tokio::time::timeout(Duration::from_millis(500), writer).await;
     reader.abort();
@@ -499,6 +528,8 @@ async fn handshake(
     if clip_available {
         caps.push(Cap::Clipboard);
     }
+    // 端口映射不依赖平台（就是 tokio 的 TcpStream），所以总是可用。
+    caps.push(Cap::PortMap);
     send_h2c(
         control,
         &H2C::HelloOk(HostHelloOk {
@@ -702,6 +733,7 @@ async fn control_loop(
     clip_sync: &mut ClipSync,
     clip_stats: &mut ClipStats,
     fs_tx: &mpsc::Sender<FsOp>,
+    pm_tx: &mpsc::Sender<PortMapOp>,
 ) -> Result<Closed, String> {
     let mut tick = tokio::time::interval(POLL_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -797,6 +829,12 @@ async fn control_loop(
                                     let _ = out.send(Out::Json(H2C::InputError {
                                         message: "文件服务不可用（bulk 通道已断开）".into(),
                                     }));
+                                }
+                            }
+                            // ── 端口映射（M4）：建/拆映射交给独立任务，别在这里等 DNS 和 TCP ──
+                            C2H::PortMap(op) => {
+                                if pm_tx.send(op).await.is_err() {
+                                    debug!("端口映射任务已结束，PortMapOp 无法投递");
                                 }
                             }
                             // ── 剪贴板 ──
@@ -914,26 +952,43 @@ async fn write_loop(mut wr: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Out>
     let _ = wr.shutdown().await;
 }
 
-/// 文件服务任务：独占 bulk 通道，**一次只处理一条 `FsOp`**。
+/// 文件服务任务：请求从控制通道转过来，数据走 **多路复用的 bulk 流**。
 ///
-/// 串行是有意的（第一版）：协议里按 id 多路复用的能力已经有了，但并发传输还要在
-/// `handle` 外面再做一层按 id 分派，而远控的文件操作本来就是用户一次点一个。
-/// 等端口映射需要长时间并存的流时再拆。
+/// 仍然坚持「一次只处理一条 `FsOp`」：远控里的文件操作本来就是用户一次点一个，
+/// 串行的代价远小于并发分派带来的复杂度。真正的并发发生在 bulk 上 ——
+/// 端口映射的流和这里的流互不影响（各有各的 id）。
 async fn fs_loop(
-    bulk: TcpStream,
+    mux: Mux,
     roots: FsRoots,
     mut rx: mpsc::Receiver<FsOp>,
     out: mpsc::UnboundedSender<Out>,
 ) {
-    let (br, bw) = bulk.into_split();
-    let mut bulk = Bulk::new(br, bw);
     while let Some(op) = rx.recv().await {
         let started = Instant::now();
         let id = op_id(&op);
-        let r = fs_server::handle(&op, &roots, &mut bulk, &mut |m| {
+        let mut notify = |m: H2C| {
             let _ = out.send(Out::Json(m));
-        })
-        .await;
+        };
+
+        let r = if needs_bulk(&op) {
+            match mux.register(id) {
+                Some(stream) => {
+                    // `peer` 出作用域即注销 id（`uulan_bulk` 的 Core::Drop），
+                    // 所以中途 return / panic 都不会在表里留下一个死 id。
+                    let mut peer = MuxPeer { stream };
+                    fs_server::handle(&op, &roots, &mut peer, &mut notify).await
+                }
+                None => fs_server::error_result(
+                    id,
+                    "bulk 通道不可用（连接已断开，或该 id 已被别的流占用）",
+                ),
+            }
+        } else {
+            // List/Mkdir/... 不用 bulk。传一个「用了就报错」的替身，
+            // 而不是让它去抢一条流：真用了就是代码写错了，要立刻炸出来。
+            fs_server::handle(&op, &roots, &mut NoBulk, &mut notify).await
+        };
+
         let ms = started.elapsed().as_millis() as u64;
         if let H2C::FsResult { ok, error, .. } = &r {
             if *ok {
@@ -946,7 +1001,83 @@ async fn fs_loop(
             break;
         }
     }
-    debug!("文件服务结束（bulk 通道关闭）");
+    debug!("文件服务结束（控制通道关闭）");
+}
+
+/// 这条 `FsOp` 要不要用 bulk 通道。
+fn needs_bulk(op: &FsOp) -> bool {
+    matches!(op, FsOp::Get { .. } | FsOp::Put { .. })
+}
+
+/// 把多路复用里的一条流当成「独占的 bulk」交给文件服务用。
+///
+/// `id` 参数刻意忽略：这条流本来就绑在一个 id 上（注册时用的就是 `op_id`），
+/// 再按参数里的 id 分派一次没有任何意义。
+struct MuxPeer {
+    stream: Stream,
+}
+
+impl BulkPeer for MuxPeer {
+    async fn send_data(&mut self, _id: u32, data: &[u8]) -> std::io::Result<()> {
+        // 文件服务一次最多发 `CHUNK`（64 KiB），正好一帧，不需要再切。
+        self.stream.send_data(data).await
+    }
+
+    async fn send_end(&mut self, _id: u32) -> std::io::Result<()> {
+        self.stream.send_end().await
+    }
+
+    async fn recv(&mut self) -> std::io::Result<Option<BulkFrame>> {
+        Ok(self.stream.recv().await)
+    }
+}
+
+/// 不使用 bulk 的操作（列目录、建目录、删除、改名、哈希）收到这个。
+/// 一旦被真的调用就是程序写错了 —— 如实报错，别静默成功。
+struct NoBulk;
+
+impl BulkPeer for NoBulk {
+    async fn send_data(&mut self, _id: u32, _data: &[u8]) -> std::io::Result<()> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "这条操作不使用 bulk 通道"))
+    }
+    async fn send_end(&mut self, _id: u32) -> std::io::Result<()> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "这条操作不使用 bulk 通道"))
+    }
+    async fn recv(&mut self) -> std::io::Result<Option<BulkFrame>> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "这条操作不使用 bulk 通道"))
+    }
+}
+
+/// 端口映射的建/拆任务。
+///
+/// 建一条映射要解析域名 + 连 TCP，最坏几秒 —— 所以**不能**在 `control_loop` 里做。
+/// 串行处理是够的：用户一次点一条，而映射建好之后的字节流走 bulk，不经过这里。
+async fn portmap_loop(
+    pm: Arc<PortMap>,
+    mut rx: mpsc::Receiver<PortMapOp>,
+    out: mpsc::UnboundedSender<Out>,
+) {
+    while let Some(op) = rx.recv().await {
+        match op {
+            PortMapOp::Open { id, target_host, target_port } => {
+                match pm.open(id, &target_host, target_port).await {
+                    Ok(()) => {
+                        if send_out(&out, H2C::PortMapOk { id }).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(id, target = %format!("{target_host}:{target_port}"), error = %e, "端口映射建立失败");
+                        if send_out(&out, H2C::PortMapErr { id, error: e }).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            PortMapOp::Close { id } => pm.close(id),
+        }
+    }
+    debug!("端口映射任务结束");
 }
 
 fn op_id(op: &FsOp) -> u32 {

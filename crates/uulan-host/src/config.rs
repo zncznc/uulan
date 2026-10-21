@@ -76,6 +76,13 @@ pub struct HostConfig {
     /// 只想让人看家目录就设成 `false`。注意 `~/` 开头的路径任何时候都出不了家目录。
     #[serde(default = "default_true")]
     pub fs_allow_absolute: bool,
+
+    /// 端口映射的目标白名单。空列表 = 只允许本机回环（`127.0.0.0/8`、`::1`）。
+    ///
+    /// 支持 `*`（不限制）、`10.0.0.0/8`、`192.168.1.5`（单机）。**这是安全边界**：
+    /// 放开到网段就等于把这台机器变成内网跳板，只给信任的控制端开。
+    #[serde(default)]
+    pub portmap_allow: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -124,6 +131,7 @@ impl Default for HostConfig {
             screen_width: 0,
             screen_height: 0,
             fs_allow_absolute: true,
+            portmap_allow: Vec::new(),
         }
     }
 }

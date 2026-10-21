@@ -12,8 +12,10 @@
 pub mod capture;
 pub mod config;
 pub mod input;
+pub mod portmap;
 pub mod session;
 
 pub use capture::CaptureInput;
 pub use config::{validate_password, HostConfig};
+pub use portmap::{PortMap, PortPolicy};
 pub use session::{AuthState, HostState, SessionOutcome, SessionParams, VideoSettings};

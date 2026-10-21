@@ -98,19 +98,51 @@ where
     }
 }
 
+/// bulk 数据的收发口。
+///
+/// 为什么要有这一层：文件传输需要「独占一条连接、串行地收或发」，而生产环境里的 bulk
+/// 是**多路复用**的（见 `uulan_bulk`）—— 一次传输只是其中一条 id 流。
+/// 让 fs 的逻辑只依赖这个窄接口，两边的实现可以完全不同：
+///
+/// - [`Bulk`]：独占整条连接（单元测试直接用 `duplex` 造一条）；
+/// - `uulan_host::session::MuxPeer`：包着多路复用里的某一条流。
+///
+/// `async fn` 在这里是安全的（不做 trait object），所以不必引 `async-trait`。
+#[allow(async_fn_in_trait)]
+pub trait BulkPeer {
+    async fn send_data(&mut self, id: u32, data: &[u8]) -> io::Result<()>;
+    async fn send_end(&mut self, id: u32) -> io::Result<()>;
+    async fn recv(&mut self) -> io::Result<Option<BulkFrame>>;
+}
+
+impl<R, W> BulkPeer for Bulk<R, W>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    async fn send_data(&mut self, id: u32, data: &[u8]) -> io::Result<()> {
+        Bulk::send_data(self, id, data).await
+    }
+    async fn send_end(&mut self, id: u32) -> io::Result<()> {
+        Bulk::send_end(self, id).await
+    }
+    async fn recv(&mut self) -> io::Result<Option<BulkFrame>> {
+        Bulk::recv(self).await
+    }
+}
+
 /// 处理一条 `FsOp`，返回要回给控制端的最终消息。
 ///
 /// `notify` 用来发中途通知（`FsStream`）。它刻意是同步闭包：被控端那边就是往
 /// 无界队列里塞一条，不需要在这里 `await` 一个通道。
-pub async fn handle<R, W>(
+pub async fn handle<P>(
     op: &FsOp,
     roots: &FsRoots,
-    bulk: &mut Bulk<R, W>,
+    bulk: &mut P,
     notify: &mut (dyn FnMut(H2C) + Send),
 ) -> H2C
 where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
+    P: BulkPeer,
 {
     match op {
         FsOp::List { id, path: spec } => list(*id, roots, spec).await,
@@ -121,6 +153,12 @@ where
         FsOp::Rename { id, from, to } => rename(*id, roots, from, to).await,
         FsOp::Hash { id, path: spec } => hash(*id, roots, spec).await,
     }
+}
+
+/// 造一条「失败」结果。用在前置条件就不满足的地方（比如 bulk 通道已经断了），
+/// 让控制端能立刻拿到一条 `FsResult` 而不是干等到超时。
+pub fn error_result(id: u32, message: impl Into<String>) -> H2C {
+    err(id, message)
 }
 
 fn ok(id: u32, path: Option<String>, hash: Option<String>) -> H2C {
@@ -227,16 +265,15 @@ async fn list(id: u32, roots: &FsRoots, spec: &str) -> H2C {
     }
 }
 
-async fn get<R, W>(
+async fn get<P>(
     id: u32,
     roots: &FsRoots,
     spec: &str,
-    bulk: &mut Bulk<R, W>,
+    bulk: &mut P,
     notify: &mut (dyn FnMut(H2C) + Send),
 ) -> H2C
 where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
+    P: BulkPeer,
 {
     let p = match resolve_any(roots, spec).await {
         Ok(p) => p,
@@ -292,17 +329,16 @@ where
     ok(id, Some(p.display().to_string()), Some(hex(&hasher.finalize())))
 }
 
-async fn put<R, W>(
+async fn put<P>(
     id: u32,
     roots: &FsRoots,
     spec: &str,
     size: u64,
-    bulk: &mut Bulk<R, W>,
+    bulk: &mut P,
     notify: &mut (dyn FnMut(H2C) + Send),
 ) -> H2C
 where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
+    P: BulkPeer,
 {
     let p = match resolve_any(roots, spec).await {
         Ok(p) => p,

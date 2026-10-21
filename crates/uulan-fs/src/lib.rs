@@ -20,4 +20,4 @@ pub mod server;
 pub mod testutil;
 
 pub use path::{FsRoots, PathError, Target};
-pub use server::{Bulk, PART_SUFFIX};
+pub use server::{Bulk, BulkPeer, PART_SUFFIX};

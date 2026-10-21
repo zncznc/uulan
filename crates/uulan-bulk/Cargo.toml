@@ -1,0 +1,20 @@
+[package]
+name = "uulan-bulk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "uulan 的 bulk 连接多路复用：读任务分派 / 写任务串行 / 每条流一个业务任务"
+
+[lib]
+name = "uulan_bulk"
+path = "src/lib.rs"
+
+[dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uulan-protocol = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
