@@ -250,10 +250,19 @@ async fn main() -> Result<()> {
         }
     };
 
-    println!(
-        "已连上「{}」（{} {}，屏幕 {}x{}，编码器 {}）",
-        c.host.name, c.host.os, c.host.version, c.host.screen.w, c.host.screen.h, c.host.caps.len()
-    );
+    // `--term` 模式下 stdout 就是远端的 PTY 字节流，**不能**往里掺任何一行自己的话：
+    // 掺进去就变成「shell 里凭空多出一行中文」，管道里重定向出来的内容也脏了。
+    if !args.term {
+        println!(
+            "已连上「{}」（{} {}，屏幕 {}x{}，编码器 {}）",
+            c.host.name,
+            c.host.os,
+            c.host.version,
+            c.host.screen.w,
+            c.host.screen.h,
+            c.host.caps.len()
+        );
+    }
     info!(session = %c.session, os = %c.host.os, "鉴权通过");
 
     // 文件操作：不开窗口、不收画面，干完就退出。视频通道连上就丢掉（被控端看到 EOF

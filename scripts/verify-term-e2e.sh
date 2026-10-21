@@ -96,6 +96,12 @@ else
   check 1 "退出码应当是 7，实际 $CODE（129 = 会话被我们提前关掉，说明 EOT 收尾没走对）"
 fi
 
+if strip "$WORK/term.out" | grep -q "已连上"; then
+  check 1 "stdout 里掺了客户端自己的横幅（PTY 字节流必须是干净的）"
+else
+  check 0 "stdout 只有 PTY 字节流（没有掺客户端自己的输出）"
+fi
+
 echo "──────── ② 终端后端是 portable-pty ────────"
 if strip "$WORK/host.log" | grep -q '终端服务已就绪 backend="portable-pty"'; then
   check 0 "被控端日志：backend=\"portable-pty\""
