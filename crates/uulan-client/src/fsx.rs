@@ -183,7 +183,9 @@ async fn ls(ctl: &mut Ctl, path: String) -> Result<()> {
         bail!("列目录失败：{}", error.unwrap_or_default());
     }
     let entries = entries.unwrap_or_default();
-    println!("目录：{}", shown.unwrap_or(path));
+    // 时间一律按 UTC 显示并明说 —— 本机没有时区换算（不引时区库），
+    // 与其让人对着差 8 小时的目录瞎猜，不如标清楚。
+    println!("目录：{}（时间均为 UTC）", shown.unwrap_or(path));
     if entries.is_empty() {
         println!("  （空）");
     }
