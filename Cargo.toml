@@ -14,7 +14,7 @@ version = "0.1.0"
 edition = "2021"
 # rust-version 压到 1.85：尽可能让麒麟 V10 自带的/源里的旧 cargo 也能编。
 rust-version = "1.85"
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1"
