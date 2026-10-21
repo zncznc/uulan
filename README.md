@@ -124,8 +124,25 @@ ffmpeg 4.2.2-1kylin1k23.8，glibc 2.31。
 
 ## 许可
 
-[GPL-3.0](LICENSE)（GNU General Public License v3.0）。
+**GPL-3.0-or-later**（GNU General Public License v3.0 或更新版本），
+全文见 [`LICENSE`](LICENSE)。
+
+```
+本程序是自由软件：你可以依据自由软件基金会发布的 GNU 通用公共许可证条款
+重新分发和/或修改它，条款版本为第 3 版或（由你选择）任何更新的版本。
+本程序分发的目的是希望它有用，但没有任何担保，甚至没有适销性或特定用途
+适用性的默示担保。详见 GNU 通用公共许可证。
+```
+
+`Cargo.toml` 的 `[workspace.package] license = "GPL-3.0-or-later"` 与上面一致，
+六个 crate 全部继承该声明。
 
 选它的原因：设计阶段深读过 [`VallierDev/uu-remote-linux`](https://github.com/VallierDev/uu-remote-linux)
 （GPL-3.0）的代码与踩坑记录。虽然本项目是重写的、架构也完全不同（无 WebRTC、
 无 GTK、无 C 引擎），但用同一个许可证最没有争议。
+
+### 依赖许可证
+
+190 个依赖全部为宽松许可（MIT / Apache-2.0 / BSD / Zlib / ISC / Unlicense），
+**没有 AGPL、没有未知许可、没有与 GPL-3.0 不兼容的条款**。
+Apache-2.0 与 GPL-3.0 兼容（注意：与 GPL-2.0 不兼容，本项目是 3.0）。
