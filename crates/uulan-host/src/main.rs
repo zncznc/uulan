@@ -275,6 +275,8 @@ async fn run_forever(
                     clipboard: None,
                     screen_probe: None,
                     fs_roots: None,
+                    // None = 生产用的 portable-pty。
+                    pty: None,
                 };
                 let conn_addr = state.snapshot().server.clone();
                 tokio::spawn(async move {

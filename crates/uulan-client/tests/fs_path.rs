@@ -82,6 +82,7 @@ async fn spawn_host(server: &str, cfg: HostConfig, home: PathBuf) -> String {
                     settings,
                     clipboard: Some(Box::new(uulan_clip::NoClipboard::new("文件链路测试"))),
                     screen_probe: None,
+                    pty: None,   // 终端后端：None = 生产用的 portable-pty
                     fs_roots: Some(FsRoots::new(home.clone(), true)),
                 };
                 let a = addr.clone();

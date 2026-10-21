@@ -100,6 +100,7 @@ async fn spawn_host(server: &str, cfg: HostConfig, out: Arc<Mutex<Vec<Inject>>>)
                     // 输入链路测试不碰系统剪贴板。
                     clipboard: Some(Box::new(uulan_clip::NoClipboard::new("输入链路测试"))),
                     screen_probe: None,
+                    pty: None,   // 终端后端：None = 生产用的 portable-pty
                     fs_roots: None,
                 };
                 let a = addr.clone();

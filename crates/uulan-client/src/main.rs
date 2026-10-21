@@ -39,6 +39,12 @@ struct Args {
     fs_op: Option<uulan_client::fsx::Op>,
     /// 端口映射规则（给了就只干这件事，不开窗口也不收画面）。
     forward: Vec<uulan_client::ForwardSpec>,
+    /// 开一个远端终端（交互式），同样不开窗口也不收画面。
+    term: bool,
+    /// 终端行列（`--term-size 140x40`）。不给就按本机终端大小来。
+    term_size: Option<(u16, u16)>,
+    /// 远端 shell（不给用被控端配置/环境里的）。
+    term_shell: Option<String>,
 }
 
 const HELP: &str = "\
@@ -66,6 +72,11 @@ uulan-client —— uulan 内网远控的控制端
   --rm <远程路径>            删除文件（目录必须为空）
   --mkdir <远程路径>         新建目录
 
+终端（交互式；不开窗口、不收画面；客户端退出码 = 远端 shell 的退出码）：
+  --term                      在远端开一个 shell
+  --term-size <COLSxROWS>     行列数，例：--term-size 140x40（不写按本机终端大小）
+  --term-shell <path>         指定远端 shell，例：--term-shell /bin/bash
+
 端口映射（做完就退出，不开窗口、不收画面；可写多次）：
   --forward [绑定地址:]本地端口:目标主机:目标端口
                              例：--forward 2222:127.0.0.1:22
@@ -92,6 +103,9 @@ fn parse_args() -> Result<Args> {
         no_clipboard: false,
         fs_op: None,
         forward: Vec::new(),
+        term: false,
+        term_size: None,
+        term_shell: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -116,6 +130,12 @@ fn parse_args() -> Result<Args> {
                 let spec = it.next().context("--forward 需要 [绑定地址:]本地端口:目标主机:目标端口")?;
                 a.forward.push(uulan_client::ForwardSpec::parse(&spec)?);
             }
+            "--term" => a.term = true,
+            "--term-size" => {
+                let v = it.next().context("--term-size 需要 COLSxROWS，例：140x40")?;
+                a.term_size = Some(parse_size(&v)?);
+            }
+            "--term-shell" => a.term_shell = Some(it.next().context("--term-shell 需要一个路径")?),
             "--ls" => {
                 let p = it.next().context("--ls 需要一个远程路径")?;
                 a.fs_op = Some(uulan_client::fsx::Op::Ls(p));
@@ -155,6 +175,20 @@ fn parse_args() -> Result<Args> {
         bail!("必须给出 --password（被控端的访问密码或一次性临时码）");
     }
     Ok(a)
+}
+
+/// 解析 `COLSxROWS`（也收大写 `X` 和 `*`，省得为了一个分隔符去查文档）。
+fn parse_size(s: &str) -> Result<(u16, u16)> {
+    let norm = s.replace(['X', '*', '×'], "x");
+    let (c, r) = norm
+        .split_once('x')
+        .with_context(|| format!("--term-size 要 COLSxROWS，例：140x40，收到 {s:?}"))?;
+    let cols: u16 = c.trim().parse().with_context(|| format!("列数不对：{c:?}"))?;
+    let rows: u16 = r.trim().parse().with_context(|| format!("行数不对：{r:?}"))?;
+    if cols == 0 || rows == 0 {
+        bail!("--term-size 的列/行都必须大于 0");
+    }
+    Ok((cols, rows))
 }
 
 fn default_client_name() -> String {
@@ -198,6 +232,9 @@ async fn main() -> Result<()> {
         // 端口映射同样只声明、不实现就别声明：这里是真要用。
         caps.push(Cap::PortMap);
     }
+    if args.term {
+        caps.push(Cap::Terminal);
+    }
 
     info!(server = %args.server, device = %args.device, "正在连接");
     let c = match connect::connect(&args.server, &args.device, &args.password, &args.name, caps).await
@@ -225,6 +262,23 @@ async fn main() -> Result<()> {
         drop(c.video);
         uulan_client::fsx::run(c.control, c.bulk, op).await.context("文件操作失败")?;
         return Ok(());
+    }
+
+    // 终端：不开窗口、不收画面，把本机终端接到远端 PTY 上。
+    // 退出码原样传出去 —— 脚本里 `uulan-client --term` 的退出码就是远端 shell 的退出码。
+    if args.term {
+        drop(c.video);
+        if !c.host.caps.contains(&Cap::Terminal) {
+            eprintln!("被控端不支持终端（对面版本太旧，或没实现这项能力）");
+            std::process::exit(2);
+        }
+        let opts = uulan_client::termx::Options {
+            shell: args.term_shell.clone(),
+            cols: args.term_size.map(|s| s.0).unwrap_or(0),
+            rows: args.term_size.map(|s| s.1).unwrap_or(0),
+        };
+        let code = uulan_client::termx::run(c.control, opts).await?;
+        std::process::exit(code);
     }
 
     // 端口映射：同样不开窗口、不收画面 —— 只在本机起监听，把字节经被控端转出去。

@@ -1,0 +1,65 @@
+M4 · 终端（PTY）· 本机实测记录
+================================
+
+日期：2026-10-22（凌晨闲时批）
+工程：D:\default-workspace\uulan
+
+一、测了什么（本机：真 TCP + 真协议 + 真会话，PTY 后端换成内存假 shell）
+--------------------------------------------------------------------------
+
+cargo test -p uulan-host --lib term
+    15 passed / 0 failed
+    覆盖：开会话并回显、退出码上报、重复 id 拒绝、未知会话输入报错、
+          非法 base64 报错、关闭 → 129（128+SIGHUP）、resize 落到后端、
+          40000 字节切成 3+ 帧且单帧 ≤ 16 KiB、会话数上限、List、
+          「开出来立刻退出」仍能上报并释放 id、信号名→编号映射、
+          默认 shell 非空、行列夹到 1、后端起不来要报 TermError
+
+cargo test -p uulan-client --test term_path
+    4 passed / 0 failed
+    1) 回显逐字节一致（"echo hello-uulan" 经 base64 → 协议 → PTY → 回来还能对上）
+    2) 退出码 7 原样上报到控制端
+    3) 输出 10009 字节（16 KiB×2 + 777）切成 ≥3 帧，累计字节数一个不少，
+       单帧（解码后）不超过 uulan_host::term::OUT_CHUNK = 16384
+    4) resize 到 140x40 之后，shell 自己读到的窗口大小就是 140x40
+    5) 主动关闭 → TermExit code 129
+
+二、这一轮修掉的两个 bug（都是靠上面这些测试抓出来的）
+------------------------------------------------------
+
+1) 退出事件被吞：后端的输出通道先关（读线程收尾）不等于进程已退出。
+   旧写法在输出通道返回 None 时直接 break，TermExit 永远发不出去。
+   现在：拿到退出码 → 先给 200ms 刷完最后一批输出 → 再发 TermExit。
+
+2) Close 之后退出事件找不到会话：Close 必须把 id 从注册表摘掉，
+   而 TermExit 是进程真死之后才来的。加了 closing 集合，
+   live（活着）与 closing（已下关闭指令）分开记，两种来源都要上报。
+
+三、本机验不了的（必须上麒麟）
+------------------------------
+
+1) 真 PTY：/dev/ptmx、termios 回显、行缓冲 vs raw 模式
+   - 开一个会话，敲 ls、方向键上下翻历史、Ctrl-C 打断
+   - vim 打开一个文件，/ 搜索、:q 退出（验 resize 与转义序列）
+2) SIGHUP → 800ms → SIGKILL 对交互式 shell 是否收得干净
+   - 开一个正在跑 sleep 100 的会话，控制端 Ctrl-] 或断网
+   - 被控端上 `ps -ef | grep sleep` 必须看不到残留
+3) 麒麟自带的 bash/dash 启动文件、中文 locale 下的宽度
+4) Windows 控制端的 raw 模式（SetConsoleMode）尚未接 —— 目前方向键要等回车
+
+四、麒麟上的验证步骤（现场照做）
+--------------------------------
+
+# 被控端（麒麟）
+uulan-host            # 或按 DEPLOY-KYLIN.md 的自启方式
+
+# 控制端（麒麟或另一台机器）
+uulan-client --server <中继>:21116 --device <9位ID> --password <密码> --term
+# 进去之后：
+echo $SHELL ; tput cols ; ls -l / ; 
+# 大输出（验切帧不阻塞控制通道）：
+seq 1 200000
+# 中文与宽字符：
+echo "中文测试 abc"
+# 收尾：
+exit 3   → 控制端进程退出码必须是 3

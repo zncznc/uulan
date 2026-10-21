@@ -109,6 +109,7 @@ async fn spawn_host(
                     settings,
                     clipboard: Some(Box::new(uulan_clip::NoClipboard::new("分辨率测试"))),
                     screen_probe: Some(probe),
+                    pty: None,   // 终端后端：None = 生产用的 portable-pty
                     fs_roots: None,
                 };
                 let a = addr.clone();

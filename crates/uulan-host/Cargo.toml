@@ -23,11 +23,17 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rand = { workspace = true }
+base64 = { workspace = true }
 uulan-protocol = { workspace = true }
 uulan-media = { path = "../uulan-media" }
 uulan-clip = { path = "../uulan-clip" }
 uulan-fs = { path = "../uulan-fs" }
 uulan-bulk = { path = "../uulan-bulk" }
+portable-pty = "0.9"
+
+# 只有 unix 需要：`portable-pty` 的 kill() 是 SIGHUP，硬杀要自己发 SIGKILL。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true }

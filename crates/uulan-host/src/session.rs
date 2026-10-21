@@ -17,6 +17,7 @@
 //! 鉴权失败会累积到 [`AuthState`]，错够 [`AUTH_MAX_FAILURES`] 次开始锁并指数退避。
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -31,9 +32,11 @@ use uulan_media::VideoSource;
 use uulan_protocol::frame::{read_frame, write_frame, video, FrameKind};
 use uulan_protocol::msg::{
     quality_preset, AuthFailReason, C2H, Cap, FsOp, H2C, HostHelloOk, HostVideoCfg, PortMapOp,
-    Quality, Screen,
+    Quality, Screen, TermOp,
 };
 use uulan_protocol::rvclient::RelaySet;
+
+use crate::term::{self, PtyFactory};
 
 use uulan_bulk::{Mux, Stream};
 use uulan_clip::{poll_outbound, ClipSync, Clipboard, POLL_INTERVAL};
@@ -319,6 +322,11 @@ pub struct SessionParams {
     ///
     /// 同样是可注入的：端到端测试要在一个临时目录里传文件，不该碰真实家目录。
     pub fs_roots: Option<FsRoots>,
+    /// 终端（PTY）后端。`None` = 生产用的 `portable-pty`。
+    ///
+    /// 注入的唯一理由是测试：本机没有可用的 PTY 路径，要验「开→写→切帧→退出→收尾」
+    /// 这条链路只能塞一个内存假 shell（同 `clipboard` / `screen_probe` 的思路）。
+    pub pty: Option<Box<dyn PtyFactory>>,
 }
 
 #[derive(Debug)]
@@ -415,9 +423,11 @@ pub async fn run_with_sink(
     // （mpsc 的 recv/send 是 cancel-safe 的）。
     let (rd, wr) = control.into_split();
     let (out_tx, out_rx) = mpsc::unbounded_channel::<Out>();
+    // 终端输出的反压水位：它只关心「推出去多少、真写出去多少」的差。
+    let out_written = Arc::new(AtomicUsize::new(0));
     let (in_tx, mut in_rx) = mpsc::channel::<In>(64);
     let reader = tokio::spawn(read_loop(rd, in_tx));
-    let writer = tokio::spawn(write_loop(wr, out_rx));
+    let writer = tokio::spawn(write_loop(wr, out_rx, out_written.clone()));
 
     // 文件服务与端口映射共用 **一条多路复用的 bulk 连接**（M4 的改造）。
     //
@@ -448,6 +458,34 @@ pub async fn run_with_sink(
     let (pm_tx, pm_rx) = mpsc::channel::<PortMapOp>(8);
     let pm_task = tokio::spawn(portmap_loop(portmap.clone(), pm_rx, out_tx.clone()));
 
+    // 终端（PTY）：每条会话一个 shell 进程，走独立任务，别在 control_loop 里等 fork。
+    let (term_tx, term_rx) = mpsc::channel::<TermOp>(8);
+    let pty: Arc<dyn PtyFactory> = match params.pty.take() {
+        Some(f) => Arc::from(f),
+        None => Arc::new(term::NativePty),
+    };
+    let shell = cfg.term_shell.clone().unwrap_or_else(term::default_shell);
+    let term_out = out_tx.clone();
+    // 终端输出**不能丢字节**，所以这里给它一条反压路径：推出去太多、真写出去的太少，
+    // 就返回 false 让 term 任务等着（事件队列随之填满 → PTY 读线程阻塞 → shell 自己停），
+    // 而不是把内存吃光。差值用的是「终端已推条数 - 控制通道已写条数」：
+    // 后者还包含剪贴板/指标这些**小**消息，所以这个估算只会偏保守（水位略低于设定值）。
+    let pushed = Arc::new(AtomicUsize::new(0));
+    let written = out_written.clone();
+    let term_task = tokio::spawn(term::run(pty, shell, term_rx, move |m: &H2C| {
+        if pushed.load(Ordering::Relaxed).saturating_sub(written.load(Ordering::Relaxed))
+            > TERM_OUT_HIGH_WATER
+        {
+            return false;
+        }
+        if term_out.send(Out::Json(m.clone())).is_ok() {
+            pushed.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }));
+
     let mut clip_sync = ClipSync::new();
     let mut clip_stats = ClipStats::default();
 
@@ -461,6 +499,7 @@ pub async fn run_with_sink(
         &mut clip_stats,
         &fs_tx,
         &pm_tx,
+        &term_tx,
     )
     .await;
 
@@ -486,6 +525,12 @@ pub async fn run_with_sink(
     video_task.abort();
     fs_task.abort();
     pm_task.abort();
+    // 终端不能直接 abort：abort 会跳过「给每条会话发 SIGHUP」那一步，
+    // 在真机上就会留下几个没人管的 shell。先关队列让它自己收尾，收不完再 abort。
+    drop(term_tx);
+    if tokio::time::timeout(Duration::from_secs(2), term_task).await.is_err() {
+        warn!("终端任务 2 秒内没退出，强制结束（残留 shell 可能还在）");
+    }
     // 会话没了就绝不能留下还开着的内网连接（用户以为断了，其实通道还通着）。
     portmap.shutdown().await;
     mux.close();
@@ -506,6 +551,11 @@ enum Closed {
 }
 
 /// 握手 + 鉴权。返回 `Ok(None)` 表示鉴权未通过（已回复 AuthFail）。
+/// 控制写队列的「高水位」：超过这么多条消息就先不收终端输出。
+///
+/// 一条 `term_out` 最多约 22 KiB，所以 64 条 ≈ 1.4 MiB 在飞 —— 慢链路上够撑，又不至于吃内存。
+const TERM_OUT_HIGH_WATER: usize = 64;
+
 async fn handshake(
     control: &mut TcpStream,
     state: &HostState,
@@ -530,6 +580,9 @@ async fn handshake(
     }
     // 端口映射不依赖平台（就是 tokio 的 TcpStream），所以总是可用。
     caps.push(Cap::PortMap);
+    // 终端：`portable-pty` 两端都能编；起不来（比如配置里的 shell 不存在）会回 TermError，
+    // 所以能力位可以如实声明 —— 声明了却打不开和「假装没实现」是两回事。
+    caps.push(Cap::Terminal);
     send_h2c(
         control,
         &H2C::HelloOk(HostHelloOk {
@@ -734,6 +787,7 @@ async fn control_loop(
     clip_stats: &mut ClipStats,
     fs_tx: &mpsc::Sender<FsOp>,
     pm_tx: &mpsc::Sender<PortMapOp>,
+    term_tx: &mpsc::Sender<TermOp>,
 ) -> Result<Closed, String> {
     let mut tick = tokio::time::interval(POLL_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -837,6 +891,16 @@ async fn control_loop(
                                     debug!("端口映射任务已结束，PortMapOp 无法投递");
                                 }
                             }
+                            // ── 终端（M4）：开/写/改大小/关都交给 term 任务 ──
+                            C2H::Term(op) => {
+                                if term_tx.send(op).await.is_err() {
+                                    debug!("终端任务已结束，TermOp 无法投递");
+                                    let _ = out.send(Out::Json(H2C::TermError {
+                                        id: 0,
+                                        error: "终端服务不可用".into(),
+                                    }));
+                                }
+                            }
                             // ── 剪贴板 ──
                             C2H::Clip { text } => {
                                 if let Some(t) = clip_sync.inbound(&text) {
@@ -938,7 +1002,14 @@ async fn read_loop(mut rd: OwnedReadHalf, tx: mpsc::Sender<In>) {
 }
 
 /// 写任务：控制通道上**唯一**的写者。
-async fn write_loop(mut wr: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Out>) {
+///
+/// `written` 是「已经真正写到 socket 上的条数」，只给终端的反压用 ——
+/// 终端输出不能丢字节，唯一的办法是知道还有多少没写出去。
+async fn write_loop(
+    mut wr: OwnedWriteHalf,
+    mut rx: mpsc::UnboundedReceiver<Out>,
+    written: Arc<AtomicUsize>,
+) {
     while let Some(m) = rx.recv().await {
         let ok = match m {
             Out::Json(h) => send_h2c(&mut wr, &h).await.is_ok(),
@@ -948,6 +1019,7 @@ async fn write_loop(mut wr: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Out>
         if !ok {
             break;
         }
+        written.fetch_add(1, Ordering::Relaxed);
     }
     let _ = wr.shutdown().await;
 }

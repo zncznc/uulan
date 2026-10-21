@@ -283,6 +283,10 @@ pub enum H2C {
     TermOut { id: u32, data: String },
     TermExit { id: u32, code: i32 },
     TermSessions { sessions: Vec<TermSession> },
+    /// 终端请求失败：开不出 shell、id 不认识、输入不是合法 base64、会话数超上限…
+    ///
+    /// 不复用 `InputError`：终端要能说清是**哪条会话**出的错，否则多开几个窗口就没法定位。
+    TermError { id: u32, error: String },
 
     PortMapOk { id: u32 },
     PortMapErr { id: u32, error: String },
@@ -522,6 +526,7 @@ mod tests {
         rt_h2c(H2C::TermOut { id: 1, data: "bHMK".into() });
         rt_h2c(H2C::TermExit { id: 1, code: 130 });
         rt_h2c(H2C::TermSessions { sessions: vec![TermSession { id: 1, title: "bash".into() }] });
+        rt_h2c(H2C::TermError { id: 7, error: "没有这个会话".into() });
         rt_h2c(H2C::PortMapOk { id: 1 });
         rt_h2c(H2C::PortMapErr { id: 1, error: "refused".into() });
         rt_h2c(H2C::Pong { seq: 1, sent_ms: 5, host_ms: 8 });

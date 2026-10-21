@@ -109,6 +109,7 @@ async fn spawn_host(
                     // 端到端测试不碰系统剪贴板：给个明确不可用的后端。
                     clipboard: Some(Box::new(uulan_clip::NoClipboard::new("端到端测试"))),
                     screen_probe: None,
+                    pty: None,   // 终端后端：None = 生产用的 portable-pty
                     fs_roots: None,
                 };
                 let a = addr.clone();

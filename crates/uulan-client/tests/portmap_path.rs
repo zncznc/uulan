@@ -82,6 +82,7 @@ async fn spawn_host(server: &str, cfg: HostConfig) -> String {
                     clipboard: Some(Box::new(uulan_clip::NoClipboard::new("端口映射测试"))),
                     screen_probe: None,
                     fs_roots: None,
+                    pty: None,
                 };
                 let a = addr.clone();
                 tokio::spawn(async move {

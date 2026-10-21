@@ -195,7 +195,8 @@ C→H  {"type":"term","op":"input","id":1,"data":"ls\r"}     # 控制帧，base6
 C→H  {"type":"term","op":"resize","id":1,"cols":140,"rows":40}
 C→H  {"type":"term","op":"close","id":1}
 H→C  {"type":"term_out","id":1,"data":"<base64>"}          # 输出可能含任意字节 → base64
-H→C  {"type":"term_exit","id":1,"code":0}
+H→C  {"type":"term_exit","id":1,"code":0}                     # 被信号杀时按 128+signo 报（HUP→129、KILL→137）
+H→C  {"type":"term_error","id":1,"error":"..."}               # 开不出 shell / id 不认识 / 输入不是合法 base64
 ```
 PTY 用 `portable-pty`。关闭时先 SIGHUP 再 SIGKILL（参考项目踩过的坑）。
 
@@ -249,7 +250,7 @@ C→H  {"type":"power","action":"lock"|"reboot"|"shutdown"|"logout"}
 | 采集+编码 | FFmpeg CLI（`x11grab` → `libx264`） | 零编译依赖；麒麟源里就有 ffmpeg；内部已用 SHM |
 | 解码 | FFmpeg CLI（`-f h264 -i - -pix_fmt bgra -f rawvideo -`） | 跨平台一致，不用折腾 FFmpeg 开发库 |
 | 窗口 | winit + softbuffer | **纯 Rust，无 C 依赖**，Windows/Linux 通吃；软渲染对 1080p30 够用 |
-| PTY | portable-pty | 跨平台 PTY |
+| PTY | portable-pty 0.9 | 跨平台 PTY（unix `/dev/ptmx`、Windows ConPTY）；硬杀另用 libc（仅 unix） |
 | 加密（二期） | x25519-dalek + chacha20poly1305 + hkdf | 少而精 |
 | 目录监听（可选） | notify | 桌面环境自适应 |
 
@@ -295,7 +296,7 @@ uulan/
 | **M2 能看见** | ✅ | 被控端采集编码、控制端解码；端到端视频通路 | 进程内端到端测试全绿；**并在真麒麟 V10 SP1 上跑通**：Windows 控制端看到 1920x1080 真实桌面，首帧 216ms、零丢帧、画面与实机截图相关系数 0.9995 |
 | **M2.5 画好** | 🔄 | 窗口 ✅；**键鼠注入 ✅（两端已接，本机全链路验证）**；**实测帧率上报 ✅**；**剪贴板文本双向 ✅（本机全链路 + 真 Win32 剪贴板实测；X11 后端待真机验）**；**分辨率变化重建解码器 ✅（两端都做了，本机全链路实测）** | 能远程操作并双向粘文字、被控端换分辨率后画面自动跟上（键鼠/剪贴板/分辨率的真机行为待验；本机均已实测通过） |
 | **M3 能操作** | 🔄 | XTest 注入 + 按键连发处理**已实现**（Linux 目标编译通过，逻辑单测覆盖）；uinput 兜底未做 | 能在控制端敲命令、拖窗口 —— **必须在麒麟 X11 上实测**，本机无法验证 |
-| **M4 工具齐全** | 🔄 | **文件传输 ✅**（列/取/送/建/删/改名/哈希 + 路径沙箱 + sha256，真二进制实测 6 MiB 往返一致）；**端口映射 ✅**（bulk 多路复用 + `--forward`，真二进制实测 256 KiB 单流 + 两条并发流逐字节一致）；终端未做 | 文件传输与端口映射都用真 server + 真被控端 + 真客户端 CLI 跑过；两条并发转发同时成立（证明 bulk 按 id 分派）。终端（PTY）仍待做 |
+| **M4 工具齐全** | 🔄 | **文件传输 ✅**（列/取/送/建/删/改名/哈希 + 路径沙箱 + sha256，真二进制实测 6 MiB 往返一致）；**端口映射 ✅**（bulk 多路复用 + `--forward`，真二进制实测 256 KiB 单流 + 两条并发流逐字节一致）；**终端（PTY）✅ 本机全链路**（15 项状态机 + 4 项真 TCP 端到端，PTY 后端可注入） | 三项都用真 server + 真被控端 + 真客户端链路验过。终端唯一没验的是**真 PTY 本身**（termios / SIGHUP→SIGKILL / 真 shell 交互）—— 本机没有可用的 PTY 路径，必须上麒麟 |
 | **M5 麒麟落地** | ⬜ | 麒麟安装包 + systemd 开机自启 + 部署文档 | 在真麒麟 V10 SP1 上跑通 M2–M4 |
 | **M6 加固** | ⬜ | E2E 加密、临时验证码轮换、日志脱敏 | 中继抓包看不到明文内容 |
 
@@ -797,12 +798,51 @@ bash scripts/verify-window-e2e.sh    窗口呈现 506 帧 / 首帧 74ms         
 **没有假装验过的**：真麒麟所在的内网拓扑。本机跑的是 loopback，延迟 <0.1ms、无丢包；
 内网里 `--forward` 能不能顶住长连接（比如一路 SSH 挂几小时），只有真机能回答。
 
-### 下一步：终端（PTY）
+### M4 完成：终端（PTY）
 
-文件传输与端口映射都在 bulk 上跑通了，终端要的是另一套：`portable-pty` 起真 shell、
-输出走 `term_out`（base64，可能含半截 UTF-8）、输入走 `term_input`、窗口大小变化发 `term_resize`。
-现在缺的只有被控端 `term_loop` 与控制端 CLI —— **协议、控制通道的读写分离、bulk 的多路复用都就位了**，
-不需要再动骨架。注意 PTY 收尾要先 SIGHUP 再 SIGKILL（参考项目踩过的坑：交互式 shell 会忽略 SIGTERM）。
+协议（`term` / `term_out` / `term_exit` / `term_list`）早就定好了，这一轮把**两端接上**：
+
+- 被控端 `crates/uulan-host/src/term.rs`：`PtyFactory` / `PtyHandle` 是可注入的后端
+  （生产 `portable-pty`，测试用内存假 shell），`run()` 是纯逻辑 —— id 注册表、会话数上限（8）、
+  输出切帧（每帧 16 KiB 原始字节，base64 后约 21.8 KiB）、退出码映射（被信号杀 → `128+signo`）、
+  收尾（SIGHUP → 800ms → SIGKILL）。
+- 控制端 `crates/uulan-client/src/termx.rs`：`TermLink` 只做「字节 ↔ 协议消息」（所以能自动测），
+  `run()` 才把本机 stdin/stdout 接上去；unix 上进 raw 模式，客户端退出码 = 远端 shell 的退出码。
+- 协议补了一条 `H2C::TermError{id,error}`：开不出 shell / id 不认识 / 输入不是合法 base64
+  必须能说清是**哪条会话**出错 —— 静默丢弃会变成「按了键、屏幕没反应、日志也没有」。
+
+实测（本机：真 TCP、真协议、真 id 注册表，PTY 换成内存假 shell）：
+
+```text
+cargo test -p uulan-host --lib term              15 passed   （状态机：开/写/改大小/关/退出/上限/切帧）
+cargo test -p uulan-client --test term_path       4 passed   （真 TCP 端到端）
+  回显逐字节一致；退出码 7 原样上报；
+  40000 字节切成 3+ 帧且一个字节不少（单帧 ≤ 16 KiB）；
+  resize 到 140x40 后 shell 读到的窗口大小确实是 140x40；
+  主动关闭报 129（128+SIGHUP）
+```
+
+#### 这一轮踩到的两个坑（都已钉成测试）
+
+- **退出事件被静默丢掉**：后端的「输出通道」先关（读线程收尾）**不等于**进程已退出。
+  早期写法在输出通道关掉时直接 `break`，于是 `TermExit` 永远发不出去 —— 控制端的窗口会挂死。
+  现在分两步：拿到退出码后先给 200ms 把最后一批输出刷完，再发 `TermExit`
+  （顺序反了就是「命令失败但看不到任何报错」）。
+- **`Close` 之后退出事件找不到会话**：`Close` 必须把 id 从注册表摘掉（之后的输入不能进死进程），
+  但 `TermExit` 是进程真死之后才来的。少了 `closing` 集合，这次退出会被当成「未知会话」忽略。
+  现在 `live`（还活着）与 `closing`（已下关闭指令、等退出）分开记，两种来源都要上报。
+
+#### 已经验过 / 只能在真麒麟上验
+
+| 已经验（本机可复现） | 只能在真麒麟上验 |
+|---|---|
+| 开/写/改大小/关/退出整条状态机；id 复用、重复 id 拒绝、会话数上限 | 真 PTY：`/dev/ptmx`、termios 回显、行缓冲与 raw 模式的真实行为 |
+| 输出切帧与字节完整性；退出码（含被信号杀的 128+signo） | SIGHUP→SIGKILL 对**交互式** shell 是否真的收得干净（bash 忽略 SIGTERM 是已知行为） |
+| 协议与 base64；控制通道收尾时所有残留会话被收掉 | 麒麟自带 `bash/dash` 的启动文件、中文 locale 下的宽度/换行 |
+| 控制端 unix raw 模式（stdin 是管道时自动跳过） | 真终端上的方向键 / `vim` / `top`；**Windows 控制端的 raw 模式尚未接（`SetConsoleMode`）** |
+
+**没有假装验过的**：真 PTY 一行都没在本机跑过。`cargo check -p uulan-host --target x86_64-unknown-linux-gnu`
+只证明 `cfg(unix)` 那几行（`libc::kill(SIGKILL)`）类型上成立，不证明它在麒麟上行为正确。
 
 ### M2 实际验收方式（重要）
 

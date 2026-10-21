@@ -13,6 +13,7 @@ pub mod connect;
 pub mod control;
 pub mod forward;
 pub mod fsx;
+pub mod termx;
 pub mod input;
 pub mod watch;
 

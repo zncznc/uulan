@@ -83,6 +83,13 @@ pub struct HostConfig {
     /// 放开到网段就等于把这台机器变成内网跳板，只给信任的控制端开。
     #[serde(default)]
     pub portmap_allow: Vec<String>,
+
+    /// 终端（PTY）跑哪个 shell。不写 = 按环境决定（`$SHELL`，退回到 `/bin/bash`）。
+    ///
+    /// 想让人只拿到受限 shell 就写 `/bin/rbash` 之类；写成不存在的路径不会静默回退，
+    /// 控制端会收到 `TermError`（「声明了能力就必须给得出东西」）。
+    #[serde(default)]
+    pub term_shell: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -132,6 +139,7 @@ impl Default for HostConfig {
             screen_height: 0,
             fs_allow_absolute: true,
             portmap_allow: Vec::new(),
+            term_shell: None,
         }
     }
 }

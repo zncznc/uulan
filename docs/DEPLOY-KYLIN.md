@@ -335,3 +335,35 @@ RUST_LOG=info ./uulan-host --config host.json
 - 「清空剪贴板」不会传到对端。
 - 有些程序（少数 Electron 应用）只提供 `text/html` 不接受 `UTF8_STRING`，
   读出来是 `None`，表现是「复制了但对面没反应」——日志里是「剪贴板所有者拒绝提供 UTF8_STRING」。
+
+## 10. 终端（PTY）在麒麟上的验证
+
+终端只在**被控端**起进程（`portable-pty` → `/dev/ptmx` + fork），控制端只是把本机 stdin/stdout
+接上去。所以麒麟这边要确认的是「真 PTY 起得来、真 shell 收得干净」。
+
+```
+# 1) 被控端日志：这一轮起会有这两行（说明后端真的选上了 portable-pty）
+RUST_LOG=info ./uulan-host --config host.json
+#   → INFO uulan_host::term: 终端服务已就绪 backend="portable-pty" shell="/bin/bash"
+# 2) 控制端开一个终端：
+./uulan-client --server <中继>:21116 --device <9位ID> --password <密码> --term
+# 3) 进去之后依次做（每一步都要看结果，别只看「没报错」）：
+echo $SHELL; tput cols; tput lines     # PTY 的尺寸应当等于控制端窗口
+ls -l /                                 # 回显与颜色/转义序列正常
+seq 1 200000                            # 大输出：能滚完、控制端不卡、键鼠不受影响
+vim /tmp/t.txt                          # 打开、:q；屏幕上不能残留花屏
+# 4) Ctrl-C 打断一个前台命令：
+sleep 100                # 然后按 Ctrl-C —— 必须立刻回到提示符（raw 模式没接就会没反应）
+# 5) 退出码传递：
+exit 3                   # 控制端进程的退出码必须是 3（echo $? 看）
+# 6) 收尾检查：被控端上不能留下孤儿 shell
+ps -ef | grep -E "bash|sleep" | grep -v grep
+```
+
+几个已知的现场现象，别当成 bug：
+
+- **只有控制端（unix）才进 raw 模式**；Windows 控制端目前是行模式 —— 方向键、Ctrl-C 要等回车才发。
+- 我们**只透传字节、不做 VT100 仿真**，所以「显示错乱」先查客户端终端本身，不是协议问题。
+- 一次 `cat` 超大文件时控制通道会被**反压**（这是故意的：队列有界，宁可慢也不吃内存）。
+- 被控端 `term_shell` 配错（比如写成不存在的路径）不会静默回退，
+  控制端会收到 `term_error` —— 日志里是「终端会话开启失败」。
