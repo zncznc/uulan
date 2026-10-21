@@ -124,4 +124,8 @@ ffmpeg 4.2.2-1kylin1k23.8，glibc 2.31。
 
 ## 许可
 
-尚未选定许可证。在选定之前，默认保留所有权利。
+[GPL-3.0](LICENSE)（GNU General Public License v3.0）。
+
+选它的原因：设计阶段深读过 [`VallierDev/uu-remote-linux`](https://github.com/VallierDev/uu-remote-linux)
+（GPL-3.0）的代码与踩坑记录。虽然本项目是重写的、架构也完全不同（无 WebRTC、
+无 GTK、无 C 引擎），但用同一个许可证最没有争议。
