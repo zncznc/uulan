@@ -21,6 +21,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+sha2 = { workspace = true }
+bytes = { workspace = true }
 uulan-protocol = { workspace = true }
 uulan-media = { path = "../uulan-media" }
 uulan-clip = { path = "../uulan-clip" }
@@ -31,5 +33,6 @@ softbuffer = { version = "0.4", default-features = false }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
 uulan-server = { path = "../uulan-server" }
+uulan-fs = { path = "../uulan-fs" }
 uulan-host = { path = "../uulan-host" }
 uulan-media = { path = "../uulan-media" }

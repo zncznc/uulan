@@ -1,0 +1,59 @@
+uulan 里程碑 M4（文件传输）—— 已完成 ✅（本机全链路 + 真二进制实测；麒麟待验）
+
+【本轮做了什么】
+  新 crate crates/uulan-fs（路径解析 + 挂载点 + 文件服务）：
+    path.rs    :/ ~/ 绝对路径的解析；join_within 拒绝 .. 越出home；normalize_absolute 词法归一化
+               （不用 canonicalize：它跟随符号链接、对不存在的目标直接失败）
+    mounts.rs  /proc/self/mounts 解析（八进制转义、伪文件系统过滤、去重）+ Windows 盘符枚举
+    server.rs  7 种 FsOp 的实现；bulk 传输；上传先写 .uulan-part、校验后 rename；
+               删除目录不递归；改名拒绝覆盖；失败一律清临时文件
+    testutil.rs 可写性探测 + 临时目录（应对「工作区下 exe 写不了盘」的环境坑）
+  crates/uulan-protocol/src/bulk.rs：
+    bulk 帧头 u32 LE id | u8 flags | data；END=0x01；未知 flag / END 带数据一律报错
+  crates/uulan-host/src/session.rs：
+    控制通道重构成「一根读任务 + 一根写任务」（read_frame 不是 cancel-safe，
+    不能再和别的分支并列在 select! 里 —— 否则偶发吞半个帧头）
+    新增 Out/In 队列、fs_loop（独占 bulk，串行处理 FsOp）、op_id
+    SessionParams.fs_roots（可注入，测试用临时目录）、HostConfig.fs_allow_absolute（默认 true）
+  crates/uulan-client/src/fsx.rs（新）：
+    --ls / --get / --put / --rm / --mkdir；下载也写 .part，sha256 对上才 rename
+  crates/uulan-client/src/main.rs：文件操作模式（不开窗口、不收画面、视频通道直接丢掉）
+  scripts/verify-files-e2e.sh：真二进制跑 6 步（ls/mkdir/put/get/ls/rm），比 sha256
+
+【测试数字】
+  cargo test --workspace                256 passed / 0 failed（上一轮 206，新增 50）
+  cargo build --release                 0 警告
+  cargo check -p uulan-host -p uulan-fs --target x86_64-unknown-linux-gnu   0 警告
+  新增测试分布：uulan-fs 33 条（path 11 / mounts 6 / server 16）
+                uulan-protocol bulk 9 条
+                uulan-client fsx 单测 5 条 + tests/fs_path.rs 3 条（真 server + 真被控端会话）
+
+【真二进制实测（scripts/verify-files-e2e.sh）】
+  ① --ls :/            → 2 项（C:\ 、D:\）
+  ② --mkdir            → 被控端磁盘上真的建出来了
+  ③ --put 6 MiB        → real 0m0.267s；sha256 2fb40c0ef380… 一致；无 .uulan-part 残留
+  ④ --get              → real 0m0.219s；sha256 与源文件一致
+  ⑤ --ls 远端目录       → 列表里有 upload.bin
+  ⑥ --rm               → 远端文件已删除
+  OK：文件传输全链路通过（6 MiB，sha256 往返一致）
+
+【本机已验证】
+  - 路径：:/ ~/ 绝对路径；~/../.. 被拒；Windows 风格 ~\a\b 也认
+  - 上传/下载逐字节一致 + sha256 双向校验（含空文件、跨 chunk 的 300 KiB、8 MiB）
+  - 上传中断（bulk EOF）→ 目标文件与 .uulan-part 都不留
+  - 声明大小不符 / 超量 / 别的 id 混入 → 拒绝并清理
+  - 列目录：目录在前、名字不区分大小写、size/mtime 正确
+  - mkdir 重复报「已存在」；删除非空目录被拒；改名拒绝覆盖
+  - 「此电脑」列表非空（Windows 盘符 / Linux 挂载点两条分支都编过）
+
+【必须在真麒麟上验】
+  - /proc/self/mounts 的真实内容、外接 U 盘/E 盘是否出现在「此电脑」里
+  - 向 /home、U 盘（vfat/ntfs）、中文文件名真的读写（权限位、大小写敏感）
+  - SELinux/AppArmor 限制的路径报什么错
+  - UKUI 文件管理器与远端同时操作同一目录时会不会互相拆台
+
+【下一步】
+  - M4 第二项：终端（PTY）。portable-pty；关闭先 SIGHUP 再 SIGKILL；输出走 base64
+    的 TermOut（控制通道）；cols/rows 变更走 Resize
+  - M4 第三项：端口映射（bulk 的 id 多路复用已经就绪，只差 host 侧连出去 + 目标白名单）
+  - 真麒麟上验 M2.5/M3/M4 三轮的「待验」清单

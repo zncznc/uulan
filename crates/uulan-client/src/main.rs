@@ -35,6 +35,8 @@ struct Args {
     no_input: bool,
     /// 不参与剪贴板同步（排障 / 不希望本机剪贴板被对面改写时用）。
     no_clipboard: bool,
+    /// 文件操作（给了就只干这件事，不开窗口也不收画面）。
+    fs_op: Option<uulan_client::fsx::Op>,
 }
 
 const HELP: &str = "\
@@ -54,6 +56,13 @@ uulan-client —— uulan 内网远控的控制端
   --no-input          只读模式：不上报键鼠（排障、旁观时用）
   --no-clipboard      不同步剪贴板（不希望本机剪贴板被对面改写时用）
   --json              以 JSON 输出统计（仅 --headless 下生效）
+
+文件操作（做完就退出，不开窗口、不收画面）：
+  --ls <远程路径>            列目录（`:/` = 此电脑，`~/` = 家目录）
+  --get <远程路径> <本地路径>  下载
+  --put <本地路径> <远程路径>  上传
+  --rm <远程路径>            删除文件（目录必须为空）
+  --mkdir <远程路径>         新建目录
   -h, --help          显示本帮助
 
 退出码：0 正常；1 被控端拒绝（密码错/离线）；2 用法错。
@@ -73,6 +82,7 @@ fn parse_args() -> Result<Args> {
         headless: false,
         no_input: false,
         no_clipboard: false,
+        fs_op: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -93,6 +103,28 @@ fn parse_args() -> Result<Args> {
             "--headless" => a.headless = true,
             "--no-input" => a.no_input = true,
             "--no-clipboard" => a.no_clipboard = true,
+            "--ls" => {
+                let p = it.next().context("--ls 需要一个远程路径")?;
+                a.fs_op = Some(uulan_client::fsx::Op::Ls(p));
+            }
+            "--rm" => {
+                let p = it.next().context("--rm 需要一个远程路径")?;
+                a.fs_op = Some(uulan_client::fsx::Op::Rm(p));
+            }
+            "--mkdir" => {
+                let p = it.next().context("--mkdir 需要一个远程路径")?;
+                a.fs_op = Some(uulan_client::fsx::Op::Mkdir(p));
+            }
+            "--get" => {
+                let remote = it.next().context("--get 需要 <远程路径> <本地路径>")?;
+                let local = it.next().context("--get 需要 <远程路径> <本地路径>")?;
+                a.fs_op = Some(uulan_client::fsx::Op::Get { remote, local: PathBuf::from(local) });
+            }
+            "--put" => {
+                let local = it.next().context("--put 需要 <本地路径> <远程路径>")?;
+                let remote = it.next().context("--put 需要 <本地路径> <远程路径>")?;
+                a.fs_op = Some(uulan_client::fsx::Op::Put { local: PathBuf::from(local), remote });
+            }
             "-h" | "--help" => {
                 println!("{HELP}");
                 std::process::exit(0);
@@ -145,6 +177,10 @@ async fn main() -> Result<()> {
     if clip_ok {
         caps.push(Cap::Clipboard);
     }
+    if args.fs_op.is_some() {
+        // 只有真的要传文件才声明这个能力：声明了不实现，被控端会准备好通道而控制端不用。
+        caps.push(Cap::Files);
+    }
 
     info!(server = %args.server, device = %args.device, "正在连接");
     let c = match connect::connect(&args.server, &args.device, &args.password, &args.name, caps).await
@@ -165,6 +201,14 @@ async fn main() -> Result<()> {
         c.host.name, c.host.os, c.host.version, c.host.screen.w, c.host.screen.h, c.host.caps.len()
     );
     info!(session = %c.session, os = %c.host.os, "鉴权通过");
+
+    // 文件操作：不开窗口、不收画面，干完就退出。视频通道连上就丢掉（被控端看到 EOF
+    // 会自己停编码器），这样下载大文件时不会和视频抢带宽。
+    if let Some(op) = args.fs_op.clone() {
+        drop(c.video);
+        uulan_client::fsx::run(c.control, c.bulk, op).await.context("文件操作失败")?;
+        return Ok(());
+    }
 
     let started = Instant::now();
     let mut watcher = VideoWatcher::start(c.video, args.ffmpeg.clone())

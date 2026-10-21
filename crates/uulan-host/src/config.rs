@@ -69,6 +69,17 @@ pub struct HostConfig {
     /// 采集区域高度。`0` 表示启动时探测，探测不到就用 1080。
     #[serde(default)]
     pub screen_height: u32,
+
+    /// 文件传输是否允许客户端用**绝对路径**浏览整个磁盘（默认允许）。
+    ///
+    /// 远控产品（UU / 向日葵）的用户预期就是能翻全盘，所以默认开着；
+    /// 只想让人看家目录就设成 `false`。注意 `~/` 开头的路径任何时候都出不了家目录。
+    #[serde(default = "default_true")]
+    pub fs_allow_absolute: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_server() -> String {
@@ -112,6 +123,7 @@ impl Default for HostConfig {
             fps: default_fps(),
             screen_width: 0,
             screen_height: 0,
+            fs_allow_absolute: true,
         }
     }
 }

@@ -131,6 +131,7 @@ async fn spawn_host(server: &str, cfg: HostConfig, cell: Cell) -> String {
                     settings,
                     clipboard: Some(Box::new(FakeClipboard { cell: cell.clone() })),
                     screen_probe: None,
+                    fs_roots: None,
                 };
                 let a = addr.clone();
                 tokio::spawn(async move {

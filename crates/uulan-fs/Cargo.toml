@@ -1,0 +1,18 @@
+[package]
+name = "uulan-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "uulan 文件传输：路径解析 + 被控端文件服务（数据走 bulk 连接）"
+
+[lib]
+name = "uulan_fs"
+path = "src/lib.rs"
+
+[dependencies]
+bytes = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uulan-protocol = { workspace = true }

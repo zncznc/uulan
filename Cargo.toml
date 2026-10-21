@@ -4,6 +4,7 @@ members = [
     "crates/uulan-protocol",
     "crates/uulan-media",
     "crates/uulan-clip",
+    "crates/uulan-fs",
     "crates/uulan-server",
     "crates/uulan-host",
     "crates/uulan-client",
@@ -31,6 +32,7 @@ sha2 = "0.10"
 base64 = "0.22"
 
 uulan-protocol = { path = "crates/uulan-protocol" }
+uulan-fs = { path = "crates/uulan-fs" }
 
 [profile.release]
 lto = "thin"

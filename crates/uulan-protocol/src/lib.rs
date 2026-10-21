@@ -3,7 +3,9 @@
 //! 三条连接（control / video / bulk）共用同一套帧格式，见 [`frame`]。
 //! 控制类消息见 [`msg`]（被控端 ↔ 控制端），会合协议见 [`rv`]（端 ↔ 中继服务器），
 //! Windows VK → KeySym 的键位映射见 [`vk`]。
+//! bulk 连接上的多路复用（文件传输 / 端口映射的数据流）见 [`bulk`]。
 
+pub mod bulk;
 pub mod frame;
 pub mod msg;
 pub mod rv;

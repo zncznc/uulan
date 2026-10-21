@@ -21,19 +21,23 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWriteExt;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use uulan_media::ffmpeg::{CaptureOptions, Encoder};
 use uulan_media::VideoSource;
 use uulan_protocol::frame::{read_frame, write_frame, video, FrameKind};
 use uulan_protocol::msg::{
-    quality_preset, AuthFailReason, C2H, Cap, H2C, HostHelloOk, HostVideoCfg, Quality, Screen,
+    quality_preset, AuthFailReason, C2H, Cap, FsOp, H2C, HostHelloOk, HostVideoCfg, Quality, Screen,
 };
 use uulan_protocol::rvclient::RelaySet;
 
 use uulan_clip::{poll_outbound, ClipSync, Clipboard, POLL_INTERVAL};
+use uulan_fs::path::FsRoots;
+use uulan_fs::server::{self as fs_server, Bulk};
+use uulan_protocol::frame::FrameError;
 
 use crate::capture::CaptureInput;
 use crate::config::HostConfig;
@@ -307,6 +311,10 @@ pub struct SessionParams {
     /// 注入它的唯一理由是测试：本机没有 X11，要验「被控端换分辨率 → 控制端重建解码器」
     /// 只能让探针按剧本返回不同尺寸。
     pub screen_probe: Option<ScreenProbe>,
+    /// 文件服务的根：家目录 + 是否允许绝对路径。`None` = 当前用户家目录 + 配置里的开关。
+    ///
+    /// 同样是可注入的：端到端测试要在一个临时目录里传文件，不该碰真实家目录。
+    pub fs_roots: Option<FsRoots>,
 }
 
 #[derive(Debug)]
@@ -337,8 +345,6 @@ pub async fn run_with_sink(
 ) -> SessionOutcome {
     let RelaySet { control, video, bulk } = relays;
     let mut control = control;
-    // bulk 通道到 M4（文件传输 / 端口映射）才用得上；现在只保持连接不关。
-    let _bulk = bulk;
 
     // 剪贴板后端：抓的是哪个 X 显示，剪贴板就得是哪个 X 显示的。
     let mut params = params;
@@ -395,20 +401,41 @@ pub async fn run_with_sink(
     info!(sink = input.sink.name(), "键鼠注入后端");
     info!(backend = clip.name(), available = clip_available, "剪贴板后端");
 
-    // 收发分两半：控制通道现在**同时**要有「读一帧」和「每秒两次轮询剪贴板」
-    // 两条独立的时间线，共用一个 `&mut TcpStream` 是借不动的（也是会互相阻塞的）。
-    let (mut rd, mut wr) = control.into_split();
+    // 控制通道拆成「一根读任务 + 一根写任务」，主循环只跟两个队列打交道。
+    //
+    // 为什么不再把 `&mut rd / &mut wr` 直接递给主循环：M4 起文件传输的结果也要从控制
+    // 通道回给客户端，而一次传输可能跑几十秒。`read_frame()` **不是 cancel-safe** 的
+    // （内部是两次 `read_exact`），只要它和「写一条别人的消息」待在同一个 `select!` 里，
+    // 另一支被选中就会把半个帧头吞掉 —— 表现为「偶发协议解析错」，极难复现。
+    // 现在读帧只在读任务里、写帧只在写任务里，主循环两边都只排队列
+    // （mpsc 的 recv/send 是 cancel-safe 的）。
+    let (rd, wr) = control.into_split();
+    let (out_tx, out_rx) = mpsc::unbounded_channel::<Out>();
+    let (in_tx, mut in_rx) = mpsc::channel::<In>(64);
+    let reader = tokio::spawn(read_loop(rd, in_tx));
+    let writer = tokio::spawn(write_loop(wr, out_rx));
+
+    // 文件服务：独占 bulk 通道。请求从控制通道转过来，结果从 out_tx 回去。
+    let fs_roots = params
+        .fs_roots
+        .take()
+        .unwrap_or_else(|| FsRoots::new(uulan_fs::path::home_dir(), cfg.fs_allow_absolute));
+    info!(home = %fs_roots.home.display(), allow_absolute = fs_roots.allow_absolute, "文件服务已就绪");
+    let (fs_tx, fs_rx) = mpsc::channel::<FsOp>(4);
+    let fs_task = tokio::spawn(fs_loop(bulk, fs_roots, fs_rx, out_tx.clone()));
+
     let mut clip_sync = ClipSync::new();
     let mut clip_stats = ClipStats::default();
 
     let outcome = control_loop(
-        &mut rd,
-        &mut wr,
+        &mut in_rx,
+        &out_tx,
         &set_tx,
         &mut input,
         &mut clip,
         &mut clip_sync,
         &mut clip_stats,
+        &fs_tx,
     )
     .await;
 
@@ -432,7 +459,10 @@ pub async fn run_with_sink(
     );
 
     video_task.abort();
-    let _ = wr.shutdown().await;
+    fs_task.abort();
+    let _ = out_tx.send(Out::Shutdown);
+    let _ = tokio::time::timeout(Duration::from_millis(500), writer).await;
+    reader.abort();
 
     match outcome {
         Ok(Closed::Bye(reason)) => SessionOutcome::Closed(format!("对端道别: {reason}")),
@@ -619,10 +649,10 @@ impl InputLoop {
     ///
     /// **注入失败不终止会话**：远控里「鼠标点不动」比「直接断线」好 ——
     /// 但必须让人看得见，所以按 [`INPUT_ERROR_REPORT_EVERY`] 节流回一条 `InputError`。
-    async fn apply<W: tokio::io::AsyncWrite + Unpin>(
+    async fn apply(
         &mut self,
         batch: Vec<Inject>,
-        wr: &mut W,
+        out: &mpsc::UnboundedSender<Out>,
     ) -> Result<(), String> {
         if batch.is_empty() {
             return Ok(());
@@ -642,7 +672,7 @@ impl InputLoop {
         }
         self.last_report = Some(Instant::now());
         warn!(sink = self.sink.name(), error = %e, total = self.errors, "键鼠注入失败，已通知控制端");
-        send_h2c(wr, &H2C::InputError { message: e }).await
+        send_out(out, H2C::InputError { message: e })
     }
 
     /// 会话收尾：松开所有还按着的键/按钮，恢复 X 的全局状态（autorepeat、键盘映射）。
@@ -659,17 +689,19 @@ impl InputLoop {
 
 /// 控制通道循环。返回对端为何结束。
 ///
-/// 读、写两半是分开传进来的：剪贴板轮询要能在「没有输入消息」的时候也往对面发东西，
-/// 而读帧是长期挂起的 —— 同一个 `&mut TcpStream` 上做不到这两件事。
+/// 读、写都不在这里做：`in_rx` / `out` 是读任务与写任务的两端。
+/// 这样「等一帧」「写一条」「剪贴板轮询」「等文件操作结果」互不干扰，
+/// 也不必为一个 `select!` 的取消安全担心（见 [`read_loop`] 的说明）。
 #[allow(clippy::too_many_arguments)]
 async fn control_loop(
-    rd: &mut tokio::net::tcp::OwnedReadHalf,
-    wr: &mut tokio::net::tcp::OwnedWriteHalf,
+    in_rx: &mut mpsc::Receiver<In>,
+    out: &mpsc::UnboundedSender<Out>,
     set_tx: &watch::Sender<VideoSettings>,
     input: &mut InputLoop,
     clip: &mut Box<dyn Clipboard>,
     clip_sync: &mut ClipSync,
     clip_stats: &mut ClipStats,
+    fs_tx: &mpsc::Sender<FsOp>,
 ) -> Result<Closed, String> {
     let mut tick = tokio::time::interval(POLL_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -682,33 +714,23 @@ async fn control_loop(
     let _ = poll_outbound(clip_sync, baseline.as_deref(), &mut clip_armed);
 
     loop {
-        // 控制帧和心跳都可能从这条连接来，所以直接读帧再分类。
         tokio::select! {
-            frame = read_frame(rd) => {
-                let frame = match frame {
-                    Ok(f) => f,
-                    Err(uulan_protocol::frame::FrameError::Io(e))
-                        if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-                    {
-                        return Ok(Closed::Eof)
-                    }
-                    Err(e) => return Err(format!("读控制帧失败: {e}")),
+            inc = in_rx.recv() => {
+                let Some(inc) = inc else {
+                    // 读任务没了 = 对端关了连接。
+                    return Ok(Closed::Eof);
                 };
-
-                match frame.kind {
-                    FrameKind::Ping => {
-                        write_frame(wr, FrameKind::Pong, &frame.payload)
-                            .await
-                            .map_err(|e| e.to_string())?;
+                match inc {
+                    In::Eof => return Ok(Closed::Eof),
+                    In::Err(e) => return Err(e),
+                    In::Ping(payload) => {
+                        out.send(Out::Pong(payload)).map_err(|_| "控制通道已关闭".to_string())?;
                     }
-                    FrameKind::Json => {
-                        let msg: C2H = match frame.decode_json() {
-                            Ok(m) => m,
-                            Err(e) => {
-                                warn!(error = %e, "控制消息解析失败，已忽略");
-                                continue;
-                            }
-                        };
+                    In::Blob => {
+                        // bulk 通道才是数据通道，控制连接上不该出现 Blob。
+                        debug!("控制连接上收到意外的 Blob 帧，已忽略");
+                    }
+                    In::Msg(msg) => {
                         // 先同步屏幕尺寸，再换算坐标：换分辨率后的第一条消息也不会落偏。
                         input.sync_screen();
                         match msg {
@@ -743,28 +765,39 @@ async fn control_loop(
                             C2H::MouseMoveAbs { x, y } => {
                                 let batch: Vec<Inject> =
                                     input.mapper.mouse_abs(x, y).into_iter().collect();
-                                input.apply(batch, wr).await?;
+                                input.apply(batch, out).await?;
                             }
                             C2H::MouseMoveRel { dx, dy } => {
                                 let batch: Vec<Inject> =
                                     input.mapper.mouse_rel(dx, dy).into_iter().collect();
-                                input.apply(batch, wr).await?;
+                                input.apply(batch, out).await?;
                             }
                             C2H::MouseButton { button, down } => {
                                 let batch = input.mapper.button(button, down);
-                                input.apply(batch, wr).await?;
+                                input.apply(batch, out).await?;
                             }
                             C2H::MouseWheel { dx, dy } => {
                                 let batch = input.mapper.wheel(dx, dy);
-                                input.apply(batch, wr).await?;
+                                input.apply(batch, out).await?;
                             }
                             C2H::Key { vk, down, repeat } => {
                                 let batch = input.mapper.key(vk, down, repeat);
-                                input.apply(batch, wr).await?;
+                                input.apply(batch, out).await?;
                             }
                             C2H::KeyChar(k) => {
                                 let batch = input.mapper.key_char(&k.target, k.down);
-                                input.apply(batch, wr).await?;
+                                input.apply(batch, out).await?;
+                            }
+                            // ── 文件操作（M4）：交给文件服务，结果走同一条控制通道回来 ──
+                            C2H::Fs(op) => {
+                                // 队列满（上一次传输还没完）时**等**而不是丢：
+                                // 丢一条 FsOp 会让客户端永远等不到 FsResult。
+                                if fs_tx.send(op).await.is_err() {
+                                    debug!("文件服务已结束，FsOp 无法投递");
+                                    let _ = out.send(Out::Json(H2C::InputError {
+                                        message: "文件服务不可用（bulk 通道已断开）".into(),
+                                    }));
+                                }
                             }
                             // ── 剪贴板 ──
                             C2H::Clip { text } => {
@@ -793,11 +826,6 @@ async fn control_loop(
                             }
                         }
                     }
-                    FrameKind::Blob => {
-                        // bulk 通道才是数据通道，控制连接上不该出现 Blob。
-                        debug!("控制连接上收到意外的 Blob 帧，已忽略");
-                    }
-                    _ => {}
                 }
             }
             _ = tick.tick() => {
@@ -805,7 +833,7 @@ async fn control_loop(
                 // 那会在一次 X11 超时之后把对面的剪贴板擦掉。
                 let cur = clip.get_text();
                 if let Some(text) = poll_outbound(clip_sync, cur.as_deref(), &mut clip_armed) {
-                    if send_h2c(wr, &H2C::Clip { text: text.clone() }).await.is_err() {
+                    if send_out(out, H2C::Clip { text: text.clone() }).is_err() {
                         return Ok(Closed::Eof);
                     }
                     clip_stats.sent += 1;
@@ -813,6 +841,123 @@ async fn control_loop(
                 }
             }
         }
+    }
+}
+
+/// 控制通道的出站消息。
+enum Out {
+    Json(H2C),
+    /// 心跳回应（payload 原样回给对端）。
+    Pong(bytes::Bytes),
+    /// 收尾：写完就关连接。
+    Shutdown,
+}
+
+/// 控制通道的入站消息。
+enum In {
+    Msg(C2H),
+    Ping(bytes::Bytes),
+    /// 控制连接上出现了 Blob（不该有 —— 数据走 bulk）。
+    Blob,
+    Eof,
+    Err(String),
+}
+
+fn send_out(out: &mpsc::UnboundedSender<Out>, m: H2C) -> Result<(), String> {
+    out.send(Out::Json(m)).map_err(|_| "控制通道已关闭".to_string())
+}
+
+/// 读任务：只做「读帧 → 解析 → 排队列」。
+///
+/// **`read_frame()` 只能在这里被 await。** 它内部是两次 `read_exact`，
+/// 被 `select!` 取消就会丢掉半个帧头，之后整条连接的数据都对不上 ——
+/// 这类 bug 在真机上表现为「偶发卡死」，几乎没法复现。队列是有界的（64 条），
+/// 塞满时读任务会等，反压自然传到 TCP。
+async fn read_loop(mut rd: OwnedReadHalf, tx: mpsc::Sender<In>) {
+    loop {
+        let m = match read_frame(&mut rd).await {
+            Ok(f) => match f.kind {
+                FrameKind::Json => match f.decode_json::<C2H>() {
+                    Ok(m) => In::Msg(m),
+                    Err(e) => {
+                        warn!(error = %e, "控制消息解析失败，已忽略");
+                        continue;
+                    }
+                },
+                FrameKind::Ping => In::Ping(f.payload),
+                FrameKind::Blob => In::Blob,
+                FrameKind::Bye => In::Eof,
+                _ => continue,
+            },
+            Err(FrameError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => In::Eof,
+            Err(e) => In::Err(format!("读控制帧失败: {e}")),
+        };
+        let last = matches!(m, In::Eof | In::Err(_));
+        if tx.send(m).await.is_err() || last {
+            break;
+        }
+    }
+}
+
+/// 写任务：控制通道上**唯一**的写者。
+async fn write_loop(mut wr: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Out>) {
+    while let Some(m) = rx.recv().await {
+        let ok = match m {
+            Out::Json(h) => send_h2c(&mut wr, &h).await.is_ok(),
+            Out::Pong(p) => write_frame(&mut wr, FrameKind::Pong, &p).await.is_ok(),
+            Out::Shutdown => break,
+        };
+        if !ok {
+            break;
+        }
+    }
+    let _ = wr.shutdown().await;
+}
+
+/// 文件服务任务：独占 bulk 通道，**一次只处理一条 `FsOp`**。
+///
+/// 串行是有意的（第一版）：协议里按 id 多路复用的能力已经有了，但并发传输还要在
+/// `handle` 外面再做一层按 id 分派，而远控的文件操作本来就是用户一次点一个。
+/// 等端口映射需要长时间并存的流时再拆。
+async fn fs_loop(
+    bulk: TcpStream,
+    roots: FsRoots,
+    mut rx: mpsc::Receiver<FsOp>,
+    out: mpsc::UnboundedSender<Out>,
+) {
+    let (br, bw) = bulk.into_split();
+    let mut bulk = Bulk::new(br, bw);
+    while let Some(op) = rx.recv().await {
+        let started = Instant::now();
+        let id = op_id(&op);
+        let r = fs_server::handle(&op, &roots, &mut bulk, &mut |m| {
+            let _ = out.send(Out::Json(m));
+        })
+        .await;
+        let ms = started.elapsed().as_millis() as u64;
+        if let H2C::FsResult { ok, error, .. } = &r {
+            if *ok {
+                info!(id, ms, "文件操作完成");
+            } else {
+                warn!(id, ms, error = error.as_deref().unwrap_or(""), "文件操作失败");
+            }
+        }
+        if out.send(Out::Json(r)).is_err() {
+            break;
+        }
+    }
+    debug!("文件服务结束（bulk 通道关闭）");
+}
+
+fn op_id(op: &FsOp) -> u32 {
+    match op {
+        FsOp::List { id, .. }
+        | FsOp::Get { id, .. }
+        | FsOp::Put { id, .. }
+        | FsOp::Mkdir { id, .. }
+        | FsOp::Remove { id, .. }
+        | FsOp::Rename { id, .. }
+        | FsOp::Hash { id, .. } => *id,
     }
 }
 

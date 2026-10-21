@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+bytes = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -25,6 +26,7 @@ rand = { workspace = true }
 uulan-protocol = { workspace = true }
 uulan-media = { path = "../uulan-media" }
 uulan-clip = { path = "../uulan-clip" }
+uulan-fs = { path = "../uulan-fs" }
 
 [dev-dependencies]
 tokio = { workspace = true }
