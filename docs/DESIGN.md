@@ -666,6 +666,22 @@ OK：文件传输全链路通过（6 MiB，sha256 往返一致）
 **没有假装验过的**：麒麟上的真实文件系统语义。本机跑的是 NTFS，
 大小写不敏感、路径分隔符两套都在用，这些差异只有真机能暴露。
 
+#### 下一步（端口映射）要先改哪里，别重推一遍
+
+现在的 `fs_loop` **独占** bulk 通道、串行处理 `FsOp` —— 文件传输够用，端口映射不够
+（一条 SSH 连接会长时间占着 id，`fs_loop` 那种「一次处理一条」的结构会把它堵在队列里）。
+要做的是把 bulk 拆成三件事，协议不用改（`id|flags` 头已经支持多路复用）：
+
+```
+读任务   read_frame → BulkFrame.decode → HashMap<id, mpsc::Sender<BulkFrame>> 分派
+写任务   mpsc::Receiver<BulkFrame> → write_frame（唯一写者，天然有序）
+业务任务 每个流一个：文件传输 / 端口映射的 socket 桥，各自在 begin 时注册 id、结束时注销
+```
+
+`fs_loop` 改成「注册 id → 把收到的帧当请求体 → 注销」，端口映射则注册 id 后把
+「bulk 帧 ↔ TcpStream 字节」双向 copy。**注意 `FsStream`/`PortMapOk` 这类状态消息仍走
+control 通道**，bulk 只搬字节 —— 这条边界在 M4 文件传输里已经钉住了，别在端口映射上破例。
+
 ### M2 实际验收方式（重要）
 
 M2 分两层验收，**两层都做完了**。
