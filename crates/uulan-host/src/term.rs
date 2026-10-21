@@ -28,7 +28,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
@@ -51,6 +51,8 @@ const READ_BUF: usize = 8192;
 const FLUSH_GRACE: Duration = Duration::from_millis(200);
 /// 输出端先关时，再等退出码的时间。
 const EXIT_GRACE: Duration = Duration::from_secs(2);
+/// 一条消息最多为「控制通道腾地方」等多久（超过就放弃，避免收尾时死等）。
+const EMIT_GIVE_UP: Duration = Duration::from_secs(5);
 
 /// 开一条 PTY 需要的参数。后端据此起进程，**不需要知道会话 id**（id 归 [`run`] 管）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -477,12 +479,17 @@ where
         return;
     }
     // 5ms 一拍：够快（人感觉不到），又不至于空转烧 CPU。
-    loop {
+    //
+    // `notify` 返回 false 有两种原因：队列暂时积压（该等），或控制通道已经没了（等到天荒地老也没用）。
+    // 所以这里设上限：超时就记一笔放弃 —— 否则会话收尾时这个任务会永远转下去。
+    let deadline = Instant::now() + EMIT_GIVE_UP;
+    while Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(5)).await;
         if notify(&m) {
             return;
         }
     }
+    warn!("控制通道长时间收不下消息，丢弃一条终端消息（会话可能已断开）");
 }
 
 /// 把后端的两条原始通道（输出 / 退出码）并成带 id 的事件流。
