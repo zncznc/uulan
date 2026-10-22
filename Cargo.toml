@@ -31,6 +31,11 @@ rand = "0.8"
 hex = "0.4"
 sha2 = "0.10"
 base64 = "0.22"
+# M6 端到端加密：只用最少的一组（X25519 交换 + HKDF 派生 + ChaCha20-Poly1305 每帧认证加密）。
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
 
 uulan-protocol = { path = "crates/uulan-protocol" }
 uulan-fs = { path = "crates/uulan-fs" }

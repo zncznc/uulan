@@ -6,6 +6,7 @@
 //! bulk 连接上的多路复用（文件传输 / 端口映射的数据流）见 [`bulk`]。
 
 pub mod bulk;
+pub mod crypto;
 pub mod frame;
 pub mod msg;
 pub mod rv;
