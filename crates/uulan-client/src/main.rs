@@ -45,6 +45,9 @@ struct Args {
     term_size: Option<(u16, u16)>,
     /// 远端 shell（不给用被控端配置/环境里的）。
     term_shell: Option<String>,
+    /// 脚本化键鼠注入（`--inject`）：只发输入、不收画面，跑完就退出。
+    /// 存在的理由是「键鼠真的打进了被控端」必须能机器验证，不能靠人手点。
+    inject: Option<String>,
 }
 
 const HELP: &str = "\
@@ -77,6 +80,15 @@ uulan-client —— uulan 内网远控的控制端
   --term-size <COLSxROWS>     行列数，例：--term-size 140x40（不写按本机终端大小）
   --term-shell <path>         指定远端 shell，例：--term-shell /bin/bash
 
+键鼠注入（脚本化，做完就退出；不开窗口、不收画面）：
+  --inject \"<脚本>\"           沿真实链路把键鼠打进被控端，用来机器验证「真的打进去了」
+                             步骤用 ; 分隔：move:X,Y（屏幕像素）/ movn:X,Y（0..1）
+                             click:left|right|middle / down:left / up:left
+                             wheel:up|down|left|right[:N] / tap:VK / keydown:VK / keyup:VK
+                             type:文本 / wait:毫秒
+                             例：--inject \"move:960,540; click:left; type:hello\"
+                             退出码 0 = 全部注入成功；3 = 被控端报告注入失败
+
 端口映射（做完就退出，不开窗口、不收画面；可写多次）：
   --forward [绑定地址:]本地端口:目标主机:目标端口
                              例：--forward 2222:127.0.0.1:22
@@ -106,6 +118,7 @@ fn parse_args() -> Result<Args> {
         term: false,
         term_size: None,
         term_shell: None,
+        inject: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -136,6 +149,9 @@ fn parse_args() -> Result<Args> {
                 a.term_size = Some(parse_size(&v)?);
             }
             "--term-shell" => a.term_shell = Some(it.next().context("--term-shell 需要一个路径")?),
+            "--inject" => {
+                a.inject = Some(it.next().context("--inject 需要一个脚本，例如 \"click:left\"")?)
+            }
             "--ls" => {
                 let p = it.next().context("--ls 需要一个远程路径")?;
                 a.fs_op = Some(uulan_client::fsx::Op::Ls(p));
@@ -288,6 +304,23 @@ async fn main() -> Result<()> {
         };
         let code = uulan_client::termx::run(c.control, opts).await?;
         std::process::exit(code);
+    }
+
+    // 键鼠注入：只发输入，跑完就退。这是「XTest 真的把键鼠打进去了」的唯一机器可验路径 ——
+    // 窗口模式要人手点，验不出东西。见 crates/uulan-client/src/inject.rs。
+    if let Some(script) = args.inject.clone() {
+        drop(c.video);
+        if !c.host.has_desktop {
+            eprintln!("被控端没有图形会话，没有可注入的桌面（采集源是合成画面？）");
+            std::process::exit(2);
+        }
+        let steps = uulan_client::inject::parse(&script).context("--inject 脚本解析失败")?;
+        let errors =
+            uulan_client::inject::run(c.control, &steps, c.host.screen.w, c.host.screen.h)
+                .await
+                .context("键鼠注入失败")?;
+        // 退出码是给脚本看的：被控端报错（XTest 被拦、VK 没映射）不能伪装成成功。
+        std::process::exit(if errors == 0 { 0 } else { 3 });
     }
 
     // 端口映射：同样不开窗口、不收画面 —— 只在本机起监听，把字节经被控端转出去。

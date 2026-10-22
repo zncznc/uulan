@@ -1,0 +1,168 @@
+M3/M4 真机验收（键鼠注入 · X11 剪贴板 · Linux 终端）
+=====================================================
+
+日期：2026-10-23 01:00–03:30（夜间闲时批第二轮）
+工程：D:\default-workspace\uulan ｜ 真机：mis@mis-pc（银河麒麟 V10 SP1，海光 C86，X11 1920x1080）
+部署：从 HEAD 53cda8e 打包 → 真机换源码（保留 target/）→ 只编 `uulan-server` + `uulan-host`
+
+一、先做的事：本轮基线
+----------------------
+
+    cargo test --workspace      321 passed / 0 failed / 1 ignored（33 个测试套件，与本轮开工前一致）
+    真机编译                    uulan-server / uulan-host 均成功（30.5 s，带缓存）
+
+【画面通路（每轮必做）】HEAD 版本 + 真机 :0 实抓：
+
+    分辨率            1920x1080 h264（libx264 软件编码）
+    首帧延迟          246 ms
+    控制端解出帧率    28.8 fps（12.0 s）
+    被控端自报帧率    30.00 fps
+    平均码率          9787 kbps
+    解码器重建        0 次
+    与真机截图比对    相关系数 0.9965 / 平均绝对误差 0.73%（1.87/255）
+
+    ⚠ 与 2026-10-22 的 29.1fps / 146ms / 0.9982 相比在噪声范围内（单次采样），
+      没有回归。但这一轮的"真机截图"是**屏保界面**（见下），不是桌面——
+      桌面是否锁屏不影响画面通路，但影响键鼠验证，见第二节。
+
+二、真机 :0 处于锁屏状态（影响了键鼠验证的做法）
+----------------------------------------------
+
+    $ xdotool getwindowfocus   → 0xd000007
+    $ xwininfo -id 0xd000007   → "ukui-screensaver-dialog"，1920x1080 全屏
+    截图（vision 核对）：壁纸 + "您已休息 14:50:28"，**没有密码框**
+
+    结论：:0 被 UKUI 屏保锁着，键盘/鼠标事件全被屏保窗口抓走；解锁需要本机口令，
+    本轮没有、也不能要。所以「往真桌面里打字/点窗口」这件事本轮**验不了**，
+    改在真机上另起一个独立的 X 服务器做（下面第三节），并且**没有去动 :0 的锁屏状态**。
+
+三、M3 键鼠注入：真机实测（Xvfb :99 + xev/xdotool 当独立判据）
+-------------------------------------------------------------
+
+为什么用 Xvfb：它跑在同一台真机上，是**真的 X 服务器 + 真的 XTest 扩展**，
+但不需要解锁用户的桌面会话。（生产路径的 libX11/libXtst 调用与 :0 完全一样。）
+
+搭建（真机侧）：
+
+    setsid nohup Xvfb :99 -screen 0 1024x768x24 > /tmp/xvfb99.log 2>&1 &
+    DISPLAY=:99 setsid nohup xev -geometry 640x480+50+50 > /tmp/xev99.log 2>&1 &   # 独立观察者
+    ~/.local/uulan/src/target/release/uulan-host --config /tmp/host99.json \
+        --server 127.0.0.1:21116 --capture x11::99 --name xvfb99                    # 第二个被控端实例
+    → 设备 ID 505069400，屏 1024x768
+
+驱动（Windows 侧，本轮新加的 `--inject`，走**真实链路**：控制通道 → 中继 → 被控端 Mapper → XTest）：
+
+    uulan-client --server 192.168.223.15:21116 --device 505069400 --password *** \
+      --inject "move:300,200; click:left; type:hello; tap:0x41; wheel:down; move:400,300"
+
+    客户端输出：已发送 17 条输入帧（移动 2 / 按键 2 / 文本 10 / 点击 2 / 滚轮 1；
+                未送出 0；被控端拒绝 0），退出码 0
+
+独立判据（真机侧）：
+
+    $ xdotool getmouselocation          → x:400 y:300      ← 最后一条 move 精确落点
+    xev 事件计数：MotionNotify 2 / ButtonPress 2 / ButtonRelease 2 / KeyPress 6 / KeyRelease 6
+    xev 里的 keysym：h,e,l,o 各 1 次、l 2 次、a 1 次（tap:0x41 = VK 65 → keysym 0x61）
+    ButtonPress 明细：button 1 root:(300,200)      ← 左键点在注入的坐标上
+                      button 5 root:(300,200)      ← 滚轮一格（X11 里是按钮 4/5）
+    按键配对：KeyPress 6 / KeyRelease 6（没有卡住的键）
+
+被控端日志（同一次会话）：
+
+    XTest 注入后端已就绪 display=:99 xtest_major=2 xtest_minor=2 autorepeat_turned_off=true
+    已还原 X 的键盘映射与 autorepeat display=:99
+    $ xset q → auto repeat: on      ← 会话结束把全局状态还回去了
+
+⇒ **XTest 注入在真机上确实把键鼠打进了 X 服务器**：坐标精确、按键 keysym 正确、
+  滚轮是按钮 5、按下/松开配对、全局 autorepeat 已还原。
+  仍未验：在 :0 的**真实桌面/WM**上打字（需要解锁），以及拖拽这类跨窗口操作。
+
+四、M4 终端（Linux 侧）：真机实测
+--------------------------------
+
+    printf 'tty; echo "SHELL=$0"; stty -a | head -3; echo UULAN-TERM-$((6*7)); exit 7\n' \
+      | uulan-client ... --term --term-shell /bin/bash
+
+    tty            → /dev/pts/1                       ← 真 PTY（/dev/ptmx 路径）
+    $0            → /bin/bash；提示符 mis@mis-pc:~$    ← 麒麟 bash 启动文件生效
+    stty          → speed 38400 baud; rows 30; columns 120; line = 0
+                    intr=^C / erase=^? / kill=^U ……    ← termios 默认值齐、winsize 已按 --term-size 下发
+    输出          → UULAN-TERM-42
+    客户端退出码  → 7                                  ← 远端 shell 的退出码原样回来
+
+收尾（SIGHUP → SIGKILL 升级）：
+
+    交互式 bash 里 `bash -c 'trap "" HUP; sleep 300' &` 之后关会话：
+      host 日志：终端会话结束 id=1 code=129
+                 WARN 终端会话不响应 SIGHUP，补 SIGKILL      ← 升级路径真的走到了
+      结果：**忽略 SIGHUP 的那个进程活下来了**（pid 522630 / sleep 522631）
+    对照：普通后台作业 `sleep 300 &` 关会话后**被清掉**（bash 退出时 HUP 自己的作业）
+      → 残留 0
+
+    口径：普通作业会被收干净；显式 `trap '' HUP` 的进程会活下来 —— 这正是 nohup 语义，
+    不是缺陷，但**必须写进文档**（用户拿它当 nohup 用，别指望关会话就杀掉）。
+    已清理本轮留下的 522630/522631。
+
+五、X11 剪贴板：发现并修掉一个只在真机暴露的 ABI bug
+--------------------------------------------------
+
+现象（修前，真机 :0，对面是一个自己写的独立 Xlib 客户端 `/tmp/xclip-or`）：
+
+    我们的探针读对面 → "读剪贴板超时（所有者未响应）"，GET-BEFORE none
+    对面读我们的     → 对方永远等不到 SelectionNotify（卡住）
+    自己读自己       → 永远成功（走 own_text 缓存，根本不经过 X 协议）
+
+根因：`crates/uulan-clip/src/x11.rs` 用**一个**结构体同时表示
+`XSelectionRequestEvent`（有 owner 字段）和 `XSelectionEvent`（SelectionNotify，**没有** owner）。
+于是处理 notify 时所有字段整体错位一格：
+
+    se.requestor  ✓（都在 offset 32）
+    se.selection  读到的是 target
+    se.target     读到的是 property
+    se.property   读到的是 time     ← 于是"所有者拒绝"判断和"是不是 CLIPBOARD"判断全错
+    我们回给别人的 notify 里 selection 填的是窗口号 → 对方一律忽略
+
+修法：拆成三个结构体（request / notify / clear），各自按 Xlib ABI 声明；
+并加了布局断言（`selection_event_layouts_match_xlib`：64 位下 80/72/56 字节、
+关键字段 offset，以及与指针宽度无关的三条结构关系）——下次再有人"合并结构体"会立刻红。
+
+修后真机实测（同一个独立客户端当判据）：
+
+    GET-BEFORE len=17 <<<ORACLE-OWNED-7f3a>>>     ← 我们的 requestor 侧读到外部 owner 的内容
+    SET-OK <<<PROBE-WRITE-42>>>
+    外部客户端：OR-GET len=14 <<<PROBE-WRITE-42>>> ← 我们的 owner 侧能应答外部 requestor
+    客户端退出后：X11 剪贴板内容随所有者失效（X11 固有行为，文档已写明）
+
+整链（Windows ↔ 麒麟 :0，窗口模式 22 秒）本轮**只验到一半**：
+
+    被控端统计：sent=1（读到麒麟侧剪贴板并发出）、recv=0
+    控制端统计：clips_recv 失败 1 次 → "写本机剪贴板失败"
+
+    原因不在代码：本轮是 cron 上下文，Windows 这一侧**没有可用的交互式剪贴板** ——
+    同一个进程里 `Set-Clipboard 'ABC'` 之后 `Get-Clipboard` 读回空串（len=0），
+    PowerShell 的跨进程读写也是空。所以"Windows 剪贴板"这条路本轮无法驱动/观测。
+    ⇒ 未验：Windows↔麒麟 剪贴板整链（需要用户在桌面会话里跑
+      `bash scripts/verify-clipboard-e2e.sh`，或用窗口模式手动复制一次）。
+
+六、本轮代码改动
+----------------
+
+1. `crates/uulan-client/src/inject.rs`（新）+ main.rs 的 `--inject`
+   脚本化键鼠注入：move/movn/click/down/up/wheel/tap/keydown/keyup/type/wait。
+   纯函数 `parse`/`plan` + 10 项单测；`run` 才碰网络。被控端报注入错误 → 退出码 3。
+   存在的理由：GUI 键鼠"我点了一下好像动了"不算验收，这个模式让第三方观察者
+   （xev / xdotool / 真终端）能给出机器可查的证据。
+
+2. `crates/uulan-clip/src/x11.rs` 修 SelectionNotify 结构体错位（见第五节）+ 布局断言。
+
+3. `crates/uulan-clip/examples/x11_clip_probe.rs`（新）
+   真机剪贴板探针：跟外部 X 客户端双向换一次内容，写完后保持持有 N 秒。
+
+4. `crates/uulan-clip/Cargo.toml`：examples 需要 tracing-subscriber（dev-dependencies）。
+
+七、本轮没做 / 下一步
+--------------------
+
+- Windows↔麒麟 剪贴板整链（缺交互式剪贴板，见第五节）
+- :0 真实桌面上的键鼠注入（屏保锁着；解锁后才能验）
+- M5 麒麟落地（systemd 自启 + 安装包）、M6 剩余（临时码每小时轮换、日志脱敏全量过一遍）

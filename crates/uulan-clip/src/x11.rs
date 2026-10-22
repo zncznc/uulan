@@ -73,19 +73,54 @@ impl XEventBuf {
     }
 }
 
-/// `XSelectionRequestEvent` / `XSelectionEvent` 共有的尾部布局。
+/// `XSelectionRequestEvent` —— **服务端**（我们是所有者）收到的事件。
+///
+/// 比 `SelectionNotify` 多一个 `owner` 字段（在 `display` 之后）。
 #[repr(C)]
-struct SelectionEvent {
+struct SelectionRequestEvent {
     type_: c_int,
     serial: c_ulong,
     send_event: c_int,
     display: *mut Display,
-    /// request 里是 owner，notify 里是 requestor。
-    owner_or_requestor: Window,
+    owner: Window,
     requestor: Window,
     selection: Atom,
     target: Atom,
     property: Atom,
+    time: c_ulong,
+}
+
+/// `XSelectionEvent`（`SelectionNotify`）—— **请求端**（我们去要数据）收到的事件。
+///
+/// ⚠ 这个结构体**没有** `owner` 字段。以前它和上面那个共用一个"owner_or_requestor"
+/// 的坑位，结果在 notify 上所有字段整体错位一格：`selection` 读到的其实是 `target`、
+/// `property` 读到的其实是 `time`。表现是**两头都像卡死**：
+/// 读别人剪贴板永远超时（把 target 当 selection 一比就不等）、
+/// 别人读我们的永远等不到回音（我们发出去的 notify 里 selection 是窗口号）。
+/// 这个 bug 只有在真机上、且对面是**别的程序**时才会暴露 —— 自己读自己走的是
+/// `own_text` 缓存，根本不经过 X 协议。
+#[repr(C)]
+struct SelectionNotifyEvent {
+    type_: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: *mut Display,
+    requestor: Window,
+    selection: Atom,
+    target: Atom,
+    property: Atom,
+    time: c_ulong,
+}
+
+/// `XSelectionClearEvent` —— 别人把 selection 抢走了。
+#[repr(C)]
+struct SelectionClearEvent {
+    type_: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: *mut Display,
+    window: Window,
+    selection: Atom,
     time: c_ulong,
 }
 
@@ -442,7 +477,8 @@ impl Clipboard for X11Clipboard {
             if ev.kind() != EV_SELECTION_NOTIFY {
                 continue;
             }
-            let se = unsafe { &*(ev.0.as_ptr() as *const SelectionEvent) };
+            let se = unsafe { &*(ev.0.as_ptr() as *const SelectionNotifyEvent) };
+            // 不是我们要的那次转换（可能是 PRIMARY 或别的 target）就继续等。
             if se.selection != self.atoms.clipboard {
                 continue;
             }
@@ -553,15 +589,16 @@ fn service_thread(
             }
             match ev.kind() {
                 EV_SELECTION_REQUEST => {
-                    let req = unsafe { &*(ev.0.as_ptr() as *const SelectionEvent) };
+                    let req = unsafe { &*(ev.0.as_ptr() as *const SelectionRequestEvent) };
                     let text = own_text.lock().unwrap().clone().unwrap_or_default();
                     serve_request(dpy, &atoms, req, &text);
                 }
                 EV_SELECTION_CLEAR => {
                     // 别的程序把剪贴板抢走了：我们手上的 own_text 已经过期，
                     // 必须清掉，否则 get_text 会永远返回旧内容（而且还会把它再发一遍）。
-                    let se = unsafe { &*(ev.0.as_ptr() as *const SelectionEvent) };
-                    if se.selection == atoms.clipboard {
+                    let se = unsafe { &*(ev.0.as_ptr() as *const SelectionClearEvent) };
+                    // CLIPBOARD 和 PRIMARY 我们是一起拿的，哪个被抢都要让位。
+                    if se.selection == atoms.clipboard || se.selection == atoms.primary {
                         *own_text.lock().unwrap() = None;
                         owner_win.store(0, Ordering::Relaxed);
                         debug!("剪贴板 selection 被其他程序接管");
@@ -581,15 +618,17 @@ fn service_thread(
 }
 
 /// 回答一次 `SelectionRequest`。
-fn serve_request(dpy: *mut Display, atoms: &Atoms, req: &SelectionEvent, text: &str) {
+fn serve_request(dpy: *mut Display, atoms: &Atoms, req: &SelectionRequestEvent, text: &str) {
     // 老客户端可能不发 property，那就按 target 的名字写。
     let prop = if req.property != 0 { req.property } else { req.target };
-    let mut reply = SelectionEvent {
+    // 注意这里是 SelectionNotifyEvent（**没有 owner 字段**）：
+    // 以前用带 owner 的那个结构体填，发出去的 notify 里 selection 是窗口号，
+    // 对方一概不理 —— 表现是「对面读我们的剪贴板永远卡住」。
+    let mut reply = SelectionNotifyEvent {
         type_: EV_SELECTION_NOTIFY,
         serial: 0,
         send_event: 1,
         display: dpy,
-        owner_or_requestor: req.requestor,
         requestor: req.requestor,
         selection: req.selection,
         target: req.target,
@@ -636,7 +675,58 @@ fn serve_request(dpy: *mut Display, atoms: &Atoms, req: &SelectionEvent, text: &
     }
 
     unsafe {
-        XSendEvent(dpy, req.requestor, 0, 0, &mut reply as *mut SelectionEvent as *mut c_void);
+        XSendEvent(
+            dpy,
+            req.requestor,
+            0,
+            0,
+            &mut reply as *mut SelectionNotifyEvent as *mut c_void,
+        );
         XFlush(dpy);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 这三个结构体必须和 Xlib 的 ABI 逐字节对齐 —— 真实教训：
+    /// 曾经用「一个结构体塞下 request / notify 两种事件」（多一个 `owner` 字段靠命名兼容），
+    /// 结果 notify 事件里 `requestor` 之后的字段整体错位一格，真机上表现为
+    /// 「读别人剪贴板永远超时 + 别人读我们的永远没回音」两面夹死。
+    /// 只靠真机才发现太贵了，这里用布局断言钉住。
+    #[test]
+    fn selection_event_layouts_match_xlib() {
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(std::mem::size_of::<SelectionNotifyEvent>(), 72);
+            assert_eq!(std::mem::size_of::<SelectionRequestEvent>(), 80);
+            assert_eq!(std::mem::size_of::<SelectionClearEvent>(), 56);
+            assert_eq!(std::mem::offset_of!(SelectionNotifyEvent, requestor), 32);
+            assert_eq!(std::mem::offset_of!(SelectionNotifyEvent, selection), 40);
+            assert_eq!(std::mem::offset_of!(SelectionNotifyEvent, target), 48);
+            assert_eq!(std::mem::offset_of!(SelectionNotifyEvent, property), 56);
+            assert_eq!(std::mem::offset_of!(SelectionNotifyEvent, time), 64);
+            assert_eq!(std::mem::offset_of!(SelectionRequestEvent, owner), 32);
+            assert_eq!(std::mem::offset_of!(SelectionRequestEvent, requestor), 40);
+            assert_eq!(std::mem::offset_of!(SelectionClearEvent, selection), 40);
+            assert_eq!(std::mem::offset_of!(SelectionClearEvent, time), 48);
+        }
+
+        // 与指针宽度无关的结构性约束：notify 比 request 少一个字段，
+        // 所以 request 的 owner/requestor 正好落在 notify 的 requestor/selection 上。
+        // 这条断言正是「混用结构体」会破的那条。
+        assert_eq!(
+            std::mem::offset_of!(SelectionNotifyEvent, requestor),
+            std::mem::offset_of!(SelectionRequestEvent, owner)
+        );
+        assert_eq!(
+            std::mem::offset_of!(SelectionNotifyEvent, selection),
+            std::mem::offset_of!(SelectionRequestEvent, requestor)
+        );
+        assert_eq!(
+            std::mem::size_of::<SelectionRequestEvent>(),
+            std::mem::size_of::<SelectionNotifyEvent>() + std::mem::size_of::<usize>()
+        );
     }
 }

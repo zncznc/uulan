@@ -311,9 +311,9 @@ uulan/
 |---|---|---|---|
 | **M1 骨架** | ✅ | workspace 能编译；protocol 单测过；server 能注册设备并配对转发 | `cargo test` 全绿；本机起 server，两端能配对三条通道并盲转发 |
 | **M2 能看见** | ✅ | 被控端采集编码、控制端解码；端到端视频通路 | 进程内端到端测试全绿；**并在真麒麟 V10 SP1 上跑通**：Windows 控制端看到 1920x1080 真实桌面，首帧 216ms、零丢帧、画面与实机截图相关系数 0.9995 |
-| **M2.5 画好** | 🔄 | 窗口 ✅；**键鼠注入 ✅（两端已接，本机全链路验证）**；**实测帧率上报 ✅**；**剪贴板文本双向 ✅（本机全链路 + 真 Win32 剪贴板实测；X11 后端待真机验）**；**分辨率变化重建解码器 ✅（两端都做了，本机全链路实测）** | 能远程操作并双向粘文字、被控端换分辨率后画面自动跟上（键鼠/剪贴板/分辨率的真机行为待验；本机均已实测通过） |
-| **M3 能操作** | 🔄 | XTest 注入 + 按键连发处理**已实现**（Linux 目标编译通过，逻辑单测覆盖）；uinput 兜底未做 | 能在控制端敲命令、拖窗口 —— **必须在麒麟 X11 上实测**，本机无法验证 |
-| **M4 工具齐全** | 🔄 | **文件传输 ✅**（列/取/送/建/删/改名/哈希 + 路径沙箱 + sha256，真二进制实测 6 MiB 往返一致）；**端口映射 ✅**（bulk 多路复用 + `--forward`，真二进制实测 256 KiB 单流 + 两条并发流逐字节一致）；**终端（PTY）✅ 本机全链路**（16 项状态机 + 4 项真 TCP 端到端 + 真 PTY 脚本 4 项断言） | 三项都用真 server + 真被控端 + 真客户端链路验过。终端在本机连**真 PTY** 都验了（Windows ConPTY + 真 cmd.exe 进程）；只剩 Linux 独有的 termios / SIGHUP→SIGKILL / 麒麟 bash 交互要上真机 |
+| **M2.5 画好** | ✅ | 窗口 ✅；**键鼠注入 ✅（两端已接，本机全链路 + 真机 XTest 实测）**；**实测帧率上报 ✅**；**剪贴板文本双向 ✅（本机全链路 + 真 Win32；X11 后端已在真机与外部 X 客户端双向验过）**；**分辨率变化重建解码器 ✅（两端都做了，本机全链路实测）** | 能远程操作并双向粘文字、被控端换分辨率后画面自动跟上。真机实测见 `docs/milestones/M3-M4-真机-2026-10-23.txt`（XTest 注入：指针落点精确、keysym 正确、滚轮=按钮5、autorepeat 已还原；X11 剪贴板：与独立 X 客户端双向互通） |
+| **M3 能操作** | ✅ | XTest 注入 + 按键连发处理；`--inject` 脚本化注入（可无人值守验）；uinput 兜底仍未做 | **真机已验**（2026-10-23）：`--inject` 走真链路 → 被控端 XTest → 真 X 服务器；用 `xev`/`xdotool` 当独立判据，坐标/键位/按钮号/配对全对。限制：验在真机另起的 `Xvfb :99` 上（`:0` 当时被 UKUI 屏保锁着），`:0` 真实桌面上的打字/拖拽未验 |
+| **M4 工具齐全** | 🔄 | **文件传输 ✅**（列/取/送/建/删/改名/哈希 + 路径沙箱 + sha256，真二进制实测 6 MiB 往返一致）；**端口映射 ✅**（bulk 多路复用 + `--forward`，真二进制实测 256 KiB 单流 + 两条并发流逐字节一致）；**终端（PTY）✅ 本机全链路 + 真机 Linux 侧**（真 `/dev/pts`、termios 默认、winsize 下发、退出码 7 原样回来、SIGHUP→SIGKILL 升级日志） | 三项都用真 server + 真被控端 + 真客户端链路验过。终端已上真麒麟验 Linux 独有部分；剪贴板整链（Windows↔麒麟）本轮**未验**（cron 上下文没有交互式剪贴板） |
 | **M5 麒麟落地** | ⬜ | 麒麟安装包 + systemd 开机自启 + 部署文档 | 在真麒麟 V10 SP1 上跑通 M2–M4 |
 | **M6 加固** | 🔄 | **E2E 加密 ✅（本机全链路 + 中继抓包实测）**；临时验证码「用一次即失效」✅（每小时自动轮换 ⬜）；日志脱敏 🔄（口令/证明从不打印，其余待过一遍） | 中继抓包看不到明文内容 —— **已用「记录字节的代理」实测**：clipboard 两个方向共 10978 字节，找不到任何明文；其余验收见 `docs/milestones/M6-crypto.txt` |
 
@@ -438,6 +438,31 @@ unknown_vk_and_sub_notch_wheel_inject_nothing
 **没有假装验过的**：XTest 的每一个 syscall 在本机一行都没执行过。上面「已验」的
 是「被控端打算注入什么」，不是「X 真的照做了」。
 
+#### 真机验收（2026-10-23）：XTest 真的把键鼠打进了 X 服务器
+
+两种验法以前都没有：窗口模式要人手点，命令行没有注入开关。这一轮补的是
+**`uulan-client --inject`**（`crates/uulan-client/src/inject.rs`）—— 把一串动作写成脚本，
+沿真实链路发出去（控制通道 → 中继 → 被控端 `Mapper` → XTest），再由**第三方观察者**
+给结论：
+
+```
+--inject "move:300,200; click:left; type:hello; tap:0x41; wheel:down; move:400,300"
+```
+
+判据用的是真机上的 `xev`（一个独立的 X 客户端，逐条打印它收到的事件）与 `xdotool`：
+
+```
+xdotool getmouselocation  → x:400 y:300              ← 最后一条 move 精确落点
+xev: MotionNotify 2 / ButtonPress 2 / ButtonRelease 2 / KeyPress 6 / KeyRelease 6
+     keysym: h,e,l,l,o,a（tap:0x41 = VK 65 → 0x61）
+     ButtonPress: button 1 root:(300,200) / button 5 root:(300,200)   ← 左键 + 滚轮一格
+xset q → auto repeat: on                              ← 会话结束还原了全局 autorepeat
+```
+
+注入点用的是真机上另起的 `Xvfb :99`（同一台机器、真 X 服务器 + 真 XTest），
+因为当时 `:0` 被 `ukui-screensaver-dialog` 全屏锁着 —— 往锁屏里打字验不出东西，
+也不该去动用户的锁屏状态。**仍未验**：`:0` 真实桌面/WM 上的打字与拖拽（要解锁）。
+
 ### M2.5 进行中：剪贴板双向（文本已完成）
 
 独立 crate `crates/uulan-clip`，沿用键鼠那套分层：
@@ -518,8 +543,32 @@ session_start_does_not_push_pre_existing_clipboard
 | Win32 后端真实读写（UTF-16、中文、emoji、写后还原） | `PRIMARY` 中键粘贴在 UKUI 下的实际行为 |
 | 两端全链路两个方向（真 wire） | 所有者进程退出后剪贴板内容失效，用户观感如何 |
 
-**没有假装验过的**：`x11.rs` 里每一个 Xlib 调用在本机一行都没执行过 ——
-它只被 `cargo check --target x86_64-unknown-linux-gnu` 类型检查过。
+#### 真机验收（2026-10-23）：X11 后端在真机上跟**外部程序**互通，并修掉一个 ABI 错位 bug
+
+之前这里是「`x11.rs` 里每一个 Xlib 调用在本机一行都没执行过」—— 现在已经上过真机，
+而且第一次上就抓到一个只有对面是别的程序才会暴露的 bug：
+
+- **一个结构体干了两件事**：`XSelectionRequestEvent`（有 `owner`）和 `XSelectionEvent`
+  `SelectionNotify`（**没有** `owner`）被合并成同一个 `#[repr(C)]` 结构，靠
+  `owner_or_requestor` 兼容。于是处理 notify 时字段整体错位一格：
+  `selection` 读到的是 `target`、`property` 读到的是 `time`。
+  表现是两头都像卡死 —— **读别人的剪贴板永远超时，别人读我们的永远等不到回音**；
+  自己读自己反而永远成功（走 `own_text` 缓存，根本不经过 X 协议），所以本机测不出来。
+- 修法：拆成 `SelectionRequestEvent` / `SelectionNotifyEvent` / `SelectionClearEvent`
+  三个结构体，并加**布局断言**（64 位下 80/72/56 字节 + 关键 offset + 两条与指针宽度
+  无关的结构关系）。以后谁再"合并一下省点代码"，`cargo test` 立刻红。
+
+真机实测（判据是一个独立写的 Xlib 客户端 `tools/xclip-or.c`，不是我们自己的代码）：
+
+```
+GET-BEFORE len=17 <<<ORACLE-OWNED-7f3a>>>      我们的 requestor 侧读到外部 owner 的内容
+SET-OK <<<PROBE-WRITE-42>>>
+外部客户端：OR-GET len=14 <<<PROBE-WRITE-42>>>  我们的 owner 侧能应答外部 requestor
+```
+
+`crates/uulan-clip/examples/x11_clip_probe.rs` 就是这条验收的探针（写完保持持有 N 秒，
+好让外部客户端在这期间读回）。**仍未验**：Windows ↔ 麒麟的整链（需要一边有交互式剪贴板；
+cron 上下文里 `Set-Clipboard` 之后 `Get-Clipboard` 读回空串，驱动不了）。
 
 #### 本机开发环境的两个坑（会重复踩）
 
@@ -845,6 +894,30 @@ bash scripts/verify-term-e2e.sh
   → 远端 cmd.exe 真的执行了 echo uulan-term-ok
   → 客户端退出码 = 远端 shell 的退出码（7）
 ```
+
+#### 真机验收（2026-10-23）：麒麟上的 /dev/ptmx + termios + SIGHUP→SIGKILL
+
+```text
+printf 'tty; echo "SHELL=$0"; stty -a | head -3; echo UULAN-TERM-$((6*7)); exit 7\n' \
+  | uulan-client ... --term --term-shell /bin/bash
+
+tty   → /dev/pts/1                                 真 PTY（/dev/ptmx），不是管道
+$0   → /bin/bash                                   麒麟 bash 启动文件生效（提示符 mis@mis-pc:~$）
+stty  → rows 30; columns 120; intr=^C; erase=^? …   termios 默认齐全、winsize 按 --term-size 下发
+输出 → UULAN-TERM-42；客户端退出码 → 7             退出码原样回来
+```
+
+收尾（这轮真正想验的一步）—— 交互式 bash 里 `bash -c 'trap "" HUP; sleep 300' &` 之后关会话：
+
+```text
+host: 终端会话结束 id=1 code=129
+      WARN 终端会话不响应 SIGHUP，补 SIGKILL         ← 升级路径真的走到了
+结果: 忽略 SIGHUP 的那个进程活下来了（pid 522630 / sleep 522631）
+对照: 普通后台作业 `sleep 300 &` 关会话后被清掉（bash 退出时 HUP 自己的作业）→ 残留 0
+```
+
+口径：**普通作业会被收干净；显式 `trap '' HUP` 的进程会活下来** —— 这正是 nohup 语义，
+不是缺陷。但文档必须写明，否则用户会以为「关掉会话就等于杀掉远端进程」。
 
 第二层在 Windows 上走的是 **ConPTY**（`portable-pty` 的 native 后端），所以
 「起 shell → 读输出 → 写输入 → 传退出码 → 会话收尾」这套管线对**真进程**是成立的，

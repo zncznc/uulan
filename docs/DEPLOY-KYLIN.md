@@ -377,3 +377,95 @@ ps -ef | grep -E "bash|sleep" | grep -v grep
 - 一次 `cat` 超大文件时控制通道会被**反压**（这是故意的：队列有界，宁可慢也不吃内存）。
 - 被控端 `term_shell` 配错（比如写成不存在的路径）不会静默回退，
   控制端会收到 `term_error` —— 日志里是「终端会话开启失败」。
+---
+
+## 12. 键鼠注入 / 剪贴板 / 终端 的真机验收配方（2026-10-23 实测跑通）
+
+### 12.1 先看 :0 是不是锁着
+
+```bash
+DISPLAY=:0 XAUTHORITY=$HOME/.Xauthority xdotool getwindowfocus
+DISPLAY=:0 XAUTHORITY=$HOME/.Xauthority xwininfo -id <上一步的窗口号> | head -2
+```
+
+如果打出来是 `ukui-screensaver-dialog`（全屏 1920x1080），说明桌面**被屏保锁着**：
+
+- 画面通路仍然可以验（抓到的就是屏保界面，与截图逐像素比对照样成立）；
+- **键鼠注入验不了**（事件全被屏保窗口抓走），也**不要**去点它 —— 解锁要本机口令。
+
+### 12.2 键鼠注入：另起一个 X 服务器当注入点（不打扰 :0）
+
+```bash
+# ① 真机上的第二个 X 服务器（真 XTest，1024x768）
+setsid nohup Xvfb :99 -screen 0 1024x768x24 > /tmp/xvfb99.log 2>&1 &
+
+# ② 独立观察者：xev 窗口（逐条打印它收到的事件）
+DISPLAY=:99 setsid nohup xev -geometry 640x480+50+50 > /tmp/xev99.log 2>&1 &
+DISPLAY=:99 xdotool search --name "Event Tester" | head -1        # 记下窗口号
+DISPLAY=:99 xdotool windowfocus <窗口号>
+
+# ③ 第二个被控端实例，采集/注入都指向 :99（配置另放，别动 805747189 那个）
+setsid nohup ~/.local/uulan/src/target/release/uulan-host \
+  --config /tmp/host99.json --server 127.0.0.1:21116 \
+  --capture x11::99 --name xvfb99 > /tmp/host99.log 2>&1 &
+grep -E "设备 ID" /tmp/host99.log                                # 拿 ID
+python3 -c 'import json;print(json.load(open("/tmp/host99.json"))["password"])'
+```
+
+控制端（Windows 或任意机器）：
+
+```bash
+uulan-client --server 192.168.223.15:21116 --device <ID> --password <口令> \
+  --inject "move:300,200; click:left; type:hello; tap:0x41; wheel:down; move:400,300"
+# 退出码 0 = 全部注入成功；3 = 被控端报了注入错误
+```
+
+判据（真机侧，都是独立程序，不看我们自己的日志）：
+
+```bash
+DISPLAY=:99 xdotool getmouselocation                      # 应当等于最后一条 move 的坐标
+grep -cE "^KeyPress" /tmp/xev99.log                       # 期望 6（hello 5 + tap 1）
+grep -oE "keysym 0x[0-9a-f]+, [A-Za-z0-9_]+" /tmp/xev99.log | sort | uniq -c
+grep -A3 "^ButtonPress" /tmp/xev99.log | grep -E "button|root"
+DISPLAY=:99 xset q | grep -i "auto repeat"                # 会话结束后必须是 on
+```
+
+### 12.3 X11 剪贴板：跟"别的程序"换一次内容
+
+自己读自己不算验（走的是 `own_text` 缓存，不经过 X 协议）。需要一个独立客户端当判据：
+`tools/xclip-or.c`（自带 extern 声明，**不需要 libx11-dev**，`gcc -o xclip-or tools/xclip-or.c -lX11`）。
+
+```bash
+export DISPLAY=:0 XAUTHORITY=$HOME/.Xauthority
+timeout 30 ./xclip-or set "ORACLE-OWNED-7f3a" &        # 外部程序持有 CLIPBOARD
+sleep 1
+./x11_clip_probe PROBE-WRITE-42 8                      # 我们的探针：先读、再写、保持 8 秒
+./xclip-or get                                         # 这期间外部程序读回 PROBE-WRITE-42
+```
+
+期望：探针打出 `GET-BEFORE len=17 <<<ORACLE-OWNED-7f3a>>>`，
+外部客户端读回 `PROBE-WRITE-42`。**两边都通才算过** —— 只通一边就是 selection 事件结构体错位
+（本项目 2026-10-23 就踩过这个坑，见 DESIGN.md 的剪贴板一节）。
+
+### 12.4 终端（Linux 侧）
+
+```bash
+printf 'tty; echo "SHELL=$0"; stty -a | head -3; echo OK-$((6*7)); exit 7\n' \
+  | uulan-client --server ... --term --term-shell /bin/bash ; echo "client exit=$?"
+# 期望：/dev/pts/N、/bin/bash、rows/columns 与 --term-size 一致、OK-42、client exit=7
+```
+
+收尾要连着测一次「忽略 SIGHUP 的进程」：
+
+```bash
+printf 'bash -c "trap \\"\\" HUP; sleep 300" &\n' | uulan-client ... --term   # 关会话后
+pgrep -af "sleep 300"     # 会活下来 —— nohup 语义，不是 bug；用完自己 kill
+pgrep -af "^sleep 300"    # 对照：普通 `sleep 300 &` 关会话后应当被清干净
+```
+
+### 12.5 清理
+
+```bash
+pkill -x xev; pkill -x Xvfb
+pkill -x uulan-host   # 会连 :0 那个一起停；之后 bash ~/.local/uulan/run.sh host 拉起来
+```
