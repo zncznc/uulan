@@ -28,11 +28,20 @@ uulan-protocol = { workspace = true }
 uulan-media = { path = "../uulan-media" }
 uulan-clip = { path = "../uulan-clip" }
 uulan-bulk = { path = "../uulan-bulk" }
+
+# 窗口后端要**按平台**开特性，不能一刀切 default-features = false：
+# - Windows：win32 后端是无条件的，只要有 rwh_06 即可。
+# - Linux：winit 必须显式开 `x11`；softbuffer 0.4 必须选一个后端特性（x11/wayland/kms），
+#   否则它的 `make_dispatch!` 宏一个分支都不生成，直接 E0004「非穷尽匹配」编译不过。
+#   这个坑只有在真麒麟上编才会暴露（本机 Windows 编得好好的）。
+[target.'cfg(windows)'.dependencies]
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 softbuffer = { version = "0.4", default-features = false }
 
-# 只有 unix 需要：终端 raw 模式 / 问窗口大小。
+# unix 侧：窗口后端要 x11 特性；libc 供终端 raw 模式 / 问窗口大小用。
 [target.'cfg(unix)'.dependencies]
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11"] }
+softbuffer = { version = "0.4", default-features = false, features = ["x11"] }
 libc = "0.2"
 
 [dev-dependencies]
