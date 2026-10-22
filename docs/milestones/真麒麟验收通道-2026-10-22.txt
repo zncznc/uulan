@@ -1,0 +1,40 @@
+真麒麟验收通道（2026-10-22 打通）—— 从此真机验收是每轮必做项
+
+【真机】
+192.168.223.15  mis@mis-pc  银河麒麟 V10 SP1  内核 5.4.18-116-generic
+海光 Hygon C86 3250（8核16线程）  X11 + UKUI  1920x1080@60  ffmpeg 自带 libx264
+源码 ~/.local/uulan/src（非 git 仓库）  二进制同目录 target/release  配置 ~/.config/uulan/host.json
+启停 bash ~/.local/uulan/run.sh stop|server|host|status
+登录方式：**已装公钥，ssh kylin 直连**（不要再调密码，不要往任何文件里写口令）。
+
+【本次真机端到端实测（M6 版本：协议层 X25519 + HKDF + ChaCha20-Poly1305 每记录 AEAD）】
+  分辨率/编码    1920x1080 h264 30fps（libx264 软件编码）
+  首帧延迟       146 ms
+  控制端实测帧率 29.1 fps（12 秒解出 333 帧，收到 AU 354，关键帧 24，丢帧 8）
+  被控端自报帧率 30.40 fps（FpsMeter 实测上报在真机生效）
+  平均码率       10.3 Mbps
+  解码器重建     0 次
+  画面正确性     与真机 X11 截图逐像素比对：相关系数 0.9982 / 平均绝对误差 0.71%（1.82/255）
+  ⇒ 画面确实是那台机器的真实桌面，不是合成源。
+
+【部署通道（已验证）】
+  开发机：git archive HEAD → tar → scp → 真机换源码（**保留 target/ 缓存**，旧源码留底 src.old.<ts>）
+  真机： export PATH=$HOME/.cargo/bin:$PATH; cargo build --release -p uulan-server -p uulan-host
+  ⚠ 只编 server + host。客户端在真机上编不了：winit/softbuffer 的 X11 后端要 x11.pc，
+     而 libx11-dev 在麒麟源里装不上（源里 libx11-dev 依赖 libx11-6 = 2:1.6.9-2kylin1.2，
+     系统装的是 2:1.6.9-2kylin1.6，dev 包落后于运行时包）。
+
+【本次为让真机编得过所做的两处改动】
+  1) crates/uulan-client/Cargo.toml：winit/softbuffer 的平台特性分开写。
+     cfg(windows) 只需 rwh_06；cfg(unix) 必须显式开 x11（softbuffer 还要 features=["x11"]），
+     否则它的 make_dispatch! 宏不生成任何分支 → E0004 非穷尽匹配，编译直接失败。
+     这个错只有真机上才编得出来（本机 Windows 一路编得过）。
+  2) 真机侧补了链接器 dev 软链（可用 `rm` 撤销）：
+     /usr/lib/x86_64-linux-gnu/libX11.so  -> libX11.so.6
+     /usr/lib/x86_64-linux-gnu/libXtst.so -> libXtst.so.6
+     少了它编 host 会报 unable to find library -lX11 / -lXtst（XTest 注入需要）。
+
+【尚未在真机验的】
+  - 键鼠注入的实际效果（XTest 真的把键鼠打进 X 服务器）——需要 GUI 控制端，命令行没有注入开关
+  - X11 剪贴板后端、uinput 兜底
+  - 终端在 Linux 侧的 termios / SIGHUP→SIGKILL 收尾 / 麒麟 bash 启动文件
