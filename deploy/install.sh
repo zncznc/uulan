@@ -105,7 +105,14 @@ install -m 0755 "$BIN_DIR/uulan-host" "$PREFIX/bin/uulan-host"
 if [ "$DO_SERVER" = 1 ]; then
     install -m 0755 "$BIN_DIR/uulan-server" "$PREFIX/bin/uulan-server"
 fi
-install -m 0755 "$HERE/uulan-wait-x.sh" "$PREFIX/bin/uulan-wait-x"
+# 等 X 的小脚本：源码树里叫 deploy/uulan-wait-x.sh，离线包里被放到 bin/uulan-wait-x。
+# 两种布局都要认，否则「打包能打、装包就断」——真机上第一次装就踩到了。
+WAIT_X=""
+for c in "$HERE/uulan-wait-x.sh" "$HERE/bin/uulan-wait-x" "$HERE/bin/uulan-wait-x.sh"; do
+    if [ -f "$c" ]; then WAIT_X="$c"; break; fi
+done
+[ -n "$WAIT_X" ] || die "找不到 uulan-wait-x（源码树应在 deploy/，安装包应在 bin/）"
+install -m 0755 "$WAIT_X" "$PREFIX/bin/uulan-wait-x"
 if [ -d "$HERE/doc" ]; then
     cp -f "$HERE/doc/"*.md "$PREFIX/doc/" 2>/dev/null || true
 fi
