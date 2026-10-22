@@ -1,0 +1,30 @@
+[Unit]
+Description=uulan 中继/信令服务（字节级盲转发）
+Documentation=file:@UULAN_PREFIX@/doc/DESIGN.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@UULAN_USER@
+Group=@UULAN_GROUP@
+ExecStart=@UULAN_PREFIX@/bin/uulan-server --bind @UULAN_BIND@ --state @UULAN_PREFIX@/state/devices.json
+Environment=RUST_LOG=info
+Environment=NO_COLOR=1
+# 中继挂了以后被控端会不停重连，必须自己爬起来。
+Restart=always
+RestartSec=2
+
+# 中继只搬运字节，不需要任何特权，也读不到用户家目录（拿不到被控端口令）。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=@UULAN_PREFIX@/state
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

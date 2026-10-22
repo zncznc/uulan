@@ -8,6 +8,7 @@
 //!   uulan-host --new-temp-code               # 换一个一次性临时验证码
 //!   uulan-host --encoder nvenc|vaapi|x264
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,6 +26,9 @@ use uulan_protocol::rvclient::{RelaySet, RvConn};
 
 /// 向中继发心跳的间隔。远小于服务端的设备超时，避免被误判离线。
 const PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// 一次性临时码的轮换周期（DESIGN 里定的是「每小时」）。
+const TEMP_CODE_ROTATE: Duration = Duration::from_secs(3600);
 
 struct Args {
     config: Option<PathBuf>,
@@ -47,7 +51,7 @@ uulan-host —— uulan 内网远控的被控端
   --ffmpeg <path>     ffmpeg 可执行文件（默认走 PATH）
   --encoder <name>    x264（默认）/ nvenc / vaapi
   --name <name>       本机显示名
-  --show              打印设备 ID、密码、临时码后退出
+  --show              打印设备 ID、密码、临时码后退出（唯一会打印口令的入口）
   --new-temp-code     生成新的一次性临时验证码，落盘后退出
   --once              收到一次会话并结束后就退出（自测用）
   -h, --help          显示本帮助
@@ -148,7 +152,7 @@ async fn main() -> Result<()> {
     }
 
     if args.show {
-        print_credentials(&cfg, &cfg_path);
+        print_credentials(&cfg, &cfg_path, true);
         return Ok(());
     }
 
@@ -157,7 +161,7 @@ async fn main() -> Result<()> {
     })?;
     let encoder = args.encoder.unwrap_or(Encoder::X264);
 
-    print_credentials(&cfg, &cfg_path);
+    print_credentials(&cfg, &cfg_path, false);
     info!(
         capture = %cfg.capture.describe(),
         encoder = encoder.label(),
@@ -171,15 +175,32 @@ async fn main() -> Result<()> {
     run_forever(state, ffmpeg, cfg, screen, encoder, args.once).await
 }
 
-fn print_credentials(cfg: &HostConfig, cfg_path: &std::path::Path) {
+/// 口令能不能落到 stdout？
+///
+/// 只有「stdout 是终端」或用户显式 `--show` 才打印。systemd 的 journal、
+/// 重定向到文件、管道都算「会被人拿走的地方」，一律打占位符。
+/// 这不是洁癖：`journalctl --user -u uulan-host` 是现场第一个会被贴进工单的东西。
+fn secrets_allowed(explicit: bool) -> bool {
+    explicit || std::io::stdout().is_terminal()
+}
+
+fn print_credentials(cfg: &HostConfig, cfg_path: &std::path::Path, explicit: bool) {
+    let reveal = secrets_allowed(explicit);
     println!("──────────────────────────────────────────────");
     match &cfg.device_id {
         Some(id) => println!("  设备 ID : {id}"),
         None => println!("  设备 ID : （首次连上中继后分配）"),
     }
-    println!("  访问密码: {}", cfg.password);
-    if let Some(t) = &cfg.temp_code {
-        println!("  临时验证码: {t}   （用掉一次即失效）");
+    if reveal {
+        println!("  访问密码: {}", cfg.password);
+        if let Some(t) = &cfg.temp_code {
+            println!("  临时验证码: {t}   （用掉一次即失效）");
+        }
+    } else {
+        println!("  访问密码: （已隐藏 —— 输出不是终端；在终端里跑 `uulan-host --show` 查看）");
+        if cfg.temp_code.is_some() {
+            println!("  临时验证码: （已隐藏，同上）");
+        }
     }
     println!("  中继地址: {}", cfg.server);
     println!("  采集源  : {}", cfg.capture.describe());
@@ -216,7 +237,11 @@ async fn run_forever(
     println!("──────────────────────────────────────────────");
     println!("  已上线，等待控制端连接");
     println!("  设备 ID : {device_id}");
-    println!("  访问密码: {}", state.snapshot().password);
+    if secrets_allowed(false) {
+        println!("  访问密码: {}", state.snapshot().password);
+    } else {
+        println!("  访问密码: （已隐藏 —— 输出不是终端；在终端里跑 `uulan-host --show` 查看）");
+    }
     println!("──────────────────────────────────────────────");
 
     // Ctrl-C 单独一个任务：不能用 select! 和读端一起等，否则读端会被反复取消。
@@ -250,6 +275,21 @@ async fn run_forever(
         }
     });
 
+    // M6：一次性临时码按小时轮换。没有临时码时什么都不做 ——
+    // 绝不能因为「定时器到了」就凭空给这台机器造一个可连入的码。
+    let rotate_state = state.clone();
+    let rotator = tokio::spawn(async move {
+        let mut iv = tokio::time::interval(TEMP_CODE_ROTATE);
+        iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        iv.tick().await; // 第一拍立即返回，跳过（否则一启动就换码）
+        loop {
+            iv.tick().await;
+            if rotate_state.rotate_temp_code().is_some() {
+                info!("一次性临时验证码已按小时轮换（新码不写日志，用 uulan-host --show 查看）");
+            }
+        }
+    });
+
     loop {
         // 唯一的读者。这里不套 select!、不套 timeout ——
         // 读帧不是取消安全的，一旦被砍断就会丢字节。
@@ -258,6 +298,7 @@ async fn run_forever(
             Err(e) => {
                 warn!(error = %e, "与中继的连接断了");
                 heartbeat.abort();
+                rotator.abort();
                 return Err(e.into());
             }
         };

@@ -1,0 +1,23 @@
+[Unit]
+Description=uulan 中继/信令服务（用户态安装：全部在 ~/.local/uulan）
+Documentation=file:@UULAN_PREFIX@/doc/DESIGN.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=@UULAN_PREFIX@/bin/uulan-server --bind @UULAN_BIND@ --state @UULAN_PREFIX@/state/devices.json
+Environment=RUST_LOG=info
+Environment=NO_COLOR=1
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+# 用户态安装的配置与台账都在家目录，**不能**开 ProtectHome/ProtectSystem，
+# 否则中继自己都读不到 ~/.local/uulan/state。
+ProtectKernelTunables=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=default.target

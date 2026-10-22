@@ -278,6 +278,24 @@ impl HostState {
             warn!(path = %p.display(), error = %e, "被控端配置落盘失败");
         }
     }
+
+    /// 按小时轮换**已存在**的一次性临时码，并落盘。
+    ///
+    /// 返回新码（调用方要打印就自己打印），没有临时码时返回 `None` 且什么都不做 ——
+    /// 用户没开「临时协助」时，后台绝不能凭空造一个能连上这台机器的码。
+    ///
+    /// 为什么按小时换：临时码是给人临时协助用的，长期不变就等于一个第二密码；
+    /// 换掉的旧码立刻失效（`temp_code` 被整体替换）。已经用掉（`None`）的码也不会复活。
+    pub fn rotate_temp_code(&self) -> Option<String> {
+        let mut g = self.cfg.lock().unwrap();
+        if g.temp_code.is_none() {
+            return None;
+        }
+        let fresh = g.refresh_temp_code();
+        drop(g);
+        self.persist();
+        Some(fresh)
+    }
 }
 
 /// 视频参数的可变部分。改动它会触发编码器重启。
@@ -1653,6 +1671,27 @@ mod tests {
         let saved = HostConfig::load(&p).unwrap();
         assert_eq!(saved.device_id.as_deref(), Some("123456789"));
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// 临时码轮换：只轮换「已经存在」的码。
+    ///
+    /// 两条考生律：
+    /// 1. 没有临时码时什么都不做 —— 后台定时器绝不能凭空造出一个能连入的码；
+    /// 2. 已经用掉（`None`）的码不会复活。
+    #[test]
+    fn rotate_temp_code_only_rotates_an_existing_code() {
+        // 没有临时码：不变、不写盘
+        let s = HostState::new(HostConfig::default(), None);
+        assert!(s.rotate_temp_code().is_none(), "没有临时码时不能造一个");
+        assert!(s.snapshot().temp_code.is_none(), "不能凭空写入临时码");
+
+        // 有临时码：换成新的，且旧码立刻失效
+        let mut cfg = HostConfig::default();
+        let old = cfg.refresh_temp_code();
+        let s = HostState::new(cfg, None);
+        let fresh = s.rotate_temp_code().expect("已有临时码时应该轮换");
+        assert_ne!(fresh, old, "轮换必须换成不同的码");
+        assert_eq!(s.snapshot().temp_code.as_deref(), Some(fresh.as_str()));
     }
 
     #[test]

@@ -1,0 +1,30 @@
+[Unit]
+Description=uulan 被控端（X11 采集 + XTest 注入 + 文件/终端/端口映射）
+Documentation=file:@UULAN_PREFIX@/doc/DESIGN.md
+# 这是 **用户** 单元：被控端要访问当前登录会话的 X 显示与 ~/.Xauthority，
+# 用系统单元跑会拿不到 X 授权（x11grab 直接黑屏/报错）。
+#
+# 不写 After=graphical-session.target：UKUI 会话不一定拉起这个 target，
+# 写了反而可能永远不启动。改成自己等 X 就绪（uulan-wait-x），
+# 开机顺序无论怎么变都能起来。
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=%h/.Xauthority
+Environment=RUST_LOG=info
+Environment=NO_COLOR=1
+# 等 X 可用再启动；超时退出 → Restart 再等，所以「先开机后登录」也能自己追上。
+ExecStartPre=@UULAN_PREFIX@/bin/uulan-wait-x 300
+ExecStart=@UULAN_PREFIX@/bin/uulan-host --server @UULAN_SERVER@
+Restart=always
+RestartSec=5
+# 会话崩溃要留证据，但**不能留口令**：uulan-host 在 stdout 不是终端时
+# 不打印访问密码（只有显式 --show 才打）。
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=uulan-host
+
+[Install]
+WantedBy=default.target
