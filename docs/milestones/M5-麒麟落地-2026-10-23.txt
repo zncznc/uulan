@@ -1,0 +1,127 @@
+M5 麒麟落地（systemd 自启 · 离线安装包 · 部署文档）真机实测
+==========================================================
+
+日期：2026-10-23 05:00–06:10（夜间闲时批第三轮）
+工程：D:\default-workspace\uulan ｜ 真机：mis@mis-pc（银河麒麟 V10 SP1，海光 C86，X11 1920x1080）
+部署：从 HEAD 打包 → 真机换源码（保留 target/）→ 只编 uulan-server + uulan-host → 用部署脚本装成 systemd 单元
+
+一、本轮基线（开工）
+--------------------
+
+    cargo test --workspace      331 passed / 0 failed / 1 ignored（33 套件，零警告）
+    真机编译（server+host）      31.01 s（带 cargo 缓存）
+
+二、做了什么
+------------
+
+1. `deploy/`（新目录，进仓库）
+   - install.sh：两种装法 —— 系统装（root，/opt/uulan + 中继系统单元）
+     与 `--userland`（普通用户，~/.local/uulan + 双用户单元）。
+   - uninstall.sh：两种装法对称，`--purge` 连配置一起删。
+   - make-package.sh：原生编译 → `uulan-<ver>-x86_64-linux.tar.gz`（离线安装包，带 sha256）。
+   - systemd/uulan-server.service（系统单元，带 ProtectHome/ProtectSystem 沙箱）、
+     systemd/uulan-server.user.service（用户态版，不能 hide 家目录）、
+     systemd/uulan-host.service（**用户单元**，DISPLAY=:0 + XAUTHORITY）。
+   - uulan-wait-x.sh：等 X 就绪再启动；超时退出 1 交给 `Restart=always` 再等，
+     于是「先开机、后登录」也能自己追上，不需要 autologin。
+
+2. M6 两项收尾（本机可测，已真机复核其中一项）
+   - 一次性临时码按小时轮换：只轮换**已存在**的码，没有临时码时什么都不做
+     （后台定时器绝不能凭空造出一个能连入的码）。
+   - 日志脱敏：`uulan-host` 的访问密码只在 stdout 是终端、或显式 `--show` 时才打印。
+
+三、真机实测
+------------
+
+【安装：用户态模式（本机 sudo 需要口令，不能做 root 装）】
+
+    $ cd ~/pkgtest/uulan-0.3.0-x86_64-linux && bash install.sh --userland --server 192.168.223.15:21116
+    ==> 安装到 /home/mis/.local/uulan（用户态，运行身份 mis，中继 192.168.223.15:21116）
+    ==> 安装 uulan-server.service（用户单元）   ← enabled + active
+    ==> 中继已启动，监听 0.0.0.0:21116
+    ==> 安装 uulan-host.service（用户单元）     ← enabled + active
+    ==> 被控端已启动
+    设备 ID : 805747189                       ← 沿用旧 ID（新中继台账为空，按「给来的合法且未占用」接受）
+
+    $ systemctl --user is-enabled uulan-server uulan-host   → enabled / enabled
+    $ systemctl --user is-active  uulan-server uulan-host   → active  / active
+    $ loginctl show-user mis | grep Linger                  → Linger=yes
+    $ pgrep -a uulan
+      602308 /home/mis/.local/uulan/bin/uulan-server --bind 0.0.0.0:21116 --state ~/.local/uulan/state/devices.json
+      602447 /home/mis/.local/uulan/bin/uulan-host --server 192.168.223.15:21116
+
+【自启的两根支柱都验到了】
+
+    enable            → ~/.config/systemd/user/default.target.wants/{uulan-server,uulan-host}.service 软链已建
+    linger            → Linger=yes（开机不等登录就起用户管理器）
+    wait-x            → journal: "X :0 已就绪（等了 0s）"（ExecStartPre 真的跑了）
+    崩溃自愈          → $ systemctl --user kill -s KILL uulan-host
+                        MainPID 602447 → 603430，NRestarts=1，is-active=active
+                        journal: 重新 "已用原有设备 ID 上线 device_id=805747189"
+    未验：整机重启后的自启（要 sudo reboot，本轮没有 root；也没有去动用户的桌面会话）
+
+【口令不进日志（M6 脱敏，真机硬证据）】
+
+    $ PW=$(uulan-host --show | sed -n 's/.*访问密码: //p'); journalctl --user -u uulan-host | grep -cF "$PW"
+      0                                  ← journal 里一次都没有
+    $ uulan-host --show | grep -cF "$PW"
+      1                                  ← 显式 --show 仍然会打印（唯一入口）
+    journal 里的横幅：访问密码: （已隐藏 —— 输出不是终端；在终端里跑 `uulan-host --show` 查看）
+
+【画面通路（每轮必做；这次两端是 systemd 起的、二进制来自离线安装包）】
+
+    命令：uulan-client --server 192.168.223.15:21116 --device 805747189 --headless --seconds 12 --save-frame
+
+    分辨率            1920x1080 h264（libx264 软件编码）
+    首帧延迟          229 ms
+    控制端解出帧率    29.6 fps（12.0 s，解出 355 帧）
+    被控端自报帧率    29.90 fps
+    解码丢帧          0
+    平均码率          9799 kbps
+    解码器重建        0 次
+    与真机截图比对    相关系数 0.9969 / 平均绝对误差 0.73%（1.85/255）
+
+    对照（同日基线 2026-10-22：29.1fps / 146ms / 0.9982 / 0.71%；上一轮 28.8fps / 246ms / 0.9965 / 0.73%）：
+    在单次采样噪声范围内，没有回归。
+
+【离线安装包】
+
+    $ bash deploy/make-package.sh --version 0.3.0
+      /tmp/uulan-0.3.0-x86_64-linux.tar.gz   2.2 MB
+      sha256 f080bf335b6335ff424e88fcebe023ff6336ac450552aeaa8bd14581fdb38157
+    包内：bin/{uulan-host,uulan-server,uulan-wait-x} + systemd/{3 个单元} +
+          install.sh + uninstall.sh + README.md + doc/{DESIGN,DEPLOY-KYLIN}.md
+    从包里 `bash install.sh --userland` 全流程装通（就是上面第三节那次安装）。
+
+【单元文件语法】
+
+    $ systemd-analyze verify ~/.config/systemd/user/{uulan-host,uulan-server}.service   → rc=0
+      （输出里只有麒麟自带 CloseApp.service / kyfs-fuse.service 的可执行位告警，与本项目无关）
+    $ systemd-analyze verify /tmp/uulan-server.subst.service（系统单元模板替换占位符后）
+      → 唯一报错：Command /opt/uulan/bin/uulan-server is not executable（这台机器上没做 root 装，所以文件不存在）
+      ⇒ 系统装（root）路径本轮**未验**，只验了模板能被 systemd 解析。
+
+四、真机暴露的一个打包 bug（已修，HEAD 61a5452）
+------------------------------------------------
+
+从离线包装的时候 install.sh 直接中止：
+
+    install: 无法获取'.../uulan-wait-x.sh' 的文件状态: 没有那个文件或目录
+
+根因：源码树里这个脚本叫 `deploy/uulan-wait-x.sh`，而离线包把它打进 `bin/uulan-wait-x`；
+install.sh 只认前者，`set -e` 下一个 `install` 失败就把整个安装打断，
+留下一个只有 `uulan-host` 的**半装前缀**（最坏的中间态：看起来装过、其实没装完）。
+
+修法：按 `$HERE/uulan-wait-x.sh` → `$HERE/bin/uulan-wait-x` → `$HERE/bin/uulan-wait-x.sh`
+顺序找，找不到就明确报错退出。
+教训：**「打包能打」不等于「装包能装」**，打包脚本与安装脚本的路径约定必须由「从包里装一遍」来证。
+
+五、未验 / 下一步
+------------------
+
+- 整机重启后的自启（要 root reboot；本轮没有 sudo 口令，也没有动用户的桌面会话）
+- 系统装（root，/opt/uulan + 中继系统单元）路径：只做了模板 verify
+- 一次性临时码「跑满一小时自动换码」：只有单测（rotate_temp_code_only_rotates_an_existing_code），
+  真机没等一小时
+- 下一步：M6 日志脱敏全量过一遍（其余模块的 tracing 字段）；M5 收尾（root 装一跳、
+  真机重启一跳）；`--userland` 装法要写进 DEPLOY-KYLIN.md 的升级流程

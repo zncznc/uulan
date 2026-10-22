@@ -295,6 +295,13 @@ uulan/
 │  ├─ uulan-clip/              # 剪贴板：平台无关的去重状态机 + Win32/X11 后端
 │  ├─ uulan-bulk/              # bulk 连接的多路复用（读分派 / 写串行 / 每流一个任务）
 │  └─ uulan-x11/               # X11 采集参数、输入注入、剪贴板（host 专用，隔离平台代码）
+├─ deploy/                     # M5：现场部署（离线包 + systemd 单元 + 安装/卸载脚本）
+   ├─ install.sh               # 系统装（root，/opt/uulan）或 --userland（无 root，~/.local/uulan）
+   ├─ uninstall.sh             # 对称；--purge 连配置一起删
+   ├─ make-package.sh          # 原生编译 → uulan-<ver>-x86_64-linux.tar.gz
+   ├─ uulan-wait-x.sh          # 等 :0 就绪（ExecStartPre），超时交给 Restart 再等
+   ├─ README.md                # 现场三步装 + 验收 + 已知限制
+   └─ systemd/                 # uulan-server（系统）/ uulan-server.user / uulan-host（用户）
 └─ tools/
    ├─ xvfb-test.sh             # 在无头 Linux 上用 Xvfb 起一个假的麒麟桌面来测
    └─ smoke-local.sh           # 本机冒烟（含 CLI、配置落盘）
@@ -314,8 +321,35 @@ uulan/
 | **M2.5 画好** | ✅ | 窗口 ✅；**键鼠注入 ✅（两端已接，本机全链路 + 真机 XTest 实测）**；**实测帧率上报 ✅**；**剪贴板文本双向 ✅（本机全链路 + 真 Win32；X11 后端已在真机与外部 X 客户端双向验过）**；**分辨率变化重建解码器 ✅（两端都做了，本机全链路实测）** | 能远程操作并双向粘文字、被控端换分辨率后画面自动跟上。真机实测见 `docs/milestones/M3-M4-真机-2026-10-23.txt`（XTest 注入：指针落点精确、keysym 正确、滚轮=按钮5、autorepeat 已还原；X11 剪贴板：与独立 X 客户端双向互通） |
 | **M3 能操作** | ✅ | XTest 注入 + 按键连发处理；`--inject` 脚本化注入（可无人值守验）；uinput 兜底仍未做 | **真机已验**（2026-10-23）：`--inject` 走真链路 → 被控端 XTest → 真 X 服务器；用 `xev`/`xdotool` 当独立判据，坐标/键位/按钮号/配对全对。限制：验在真机另起的 `Xvfb :99` 上（`:0` 当时被 UKUI 屏保锁着），`:0` 真实桌面上的打字/拖拽未验 |
 | **M4 工具齐全** | 🔄 | **文件传输 ✅**（列/取/送/建/删/改名/哈希 + 路径沙箱 + sha256，真二进制实测 6 MiB 往返一致）；**端口映射 ✅**（bulk 多路复用 + `--forward`，真二进制实测 256 KiB 单流 + 两条并发流逐字节一致）；**终端（PTY）✅ 本机全链路 + 真机 Linux 侧**（真 `/dev/pts`、termios 默认、winsize 下发、退出码 7 原样回来、SIGHUP→SIGKILL 升级日志） | 三项都用真 server + 真被控端 + 真客户端链路验过。终端已上真麒麟验 Linux 独有部分；剪贴板整链（Windows↔麒麟）本轮**未验**（cron 上下文没有交互式剪贴板） |
-| **M5 麒麟落地** | ⬜ | 麒麟安装包 + systemd 开机自启 + 部署文档 | 在真麒麟 V10 SP1 上跑通 M2–M4 |
-| **M6 加固** | 🔄 | **E2E 加密 ✅（本机全链路 + 中继抓包实测）**；临时验证码「用一次即失效」✅（每小时自动轮换 ⬜）；日志脱敏 🔄（口令/证明从不打印，其余待过一遍） | 中继抓包看不到明文内容 —— **已用「记录字节的代理」实测**：clipboard 两个方向共 10978 字节，找不到任何明文；其余验收见 `docs/milestones/M6-crypto.txt` |
+| **M5 麒麟落地** | 🔄 | 离线安装包（tar.gz + install.sh + 3 个 systemd 单元）✅、systemd 开机自启 ✅（用户态装实测）、部署文档 ✅（`deploy/README.md` + `docs/DEPLOY-KYLIN.md` 第 13 节） | 真机上 `bash install.sh --userland` 一次装通：中继+被控端都是 `enabled`+`active`、`Linger=yes`、`ExecStartPre` 的 uulan-wait-x 真的等到 `:0`；`systemctl --user kill -s KILL` 后 `NRestarts=1` 自动拉起并重新上线；包内二进制取帧 29.6fps、相关系数 0.9969。见 `docs/milestones/M5-麒麟落地-2026-10-23.txt`。**未验**：整机重启后的自启、系统装（root，/opt/uulan）路径（本机 sudo 要口令） |
+| **M6 加固** | 🔄 | **E2E 加密 ✅（本机全链路 + 中继抓包实测）**；临时验证码「用一次即失效」✅ + **每小时自动轮换 ✅（只轮换已存在的码）**；**日志脱敏 ✅ 口令侧**（`uulan-host` 的密码只在终端/`--show` 时打印；真机 `journalctl` 里 grep 口令 0 次命中），其余模块的 tracing 字段仍待全量过一遍 | 中继抓包看不到明文内容 —— **已用「记录字节的代理」实测**：clipboard 两个方向共 10978 字节，找不到任何明文；其余验收见 `docs/milestones/M6-crypto.txt` |
+
+### M5 落地：部署形态（systemd + 离线安装包）
+
+内网没有公网、没有 apt 源，所以**没有 deb/rpm 仓库**：安装包就是
+`uulan-<ver>-x86_64-linux.tar.gz`（三个二进制 + 三个 systemd 单元 + `install.sh` + 文档），
+两条安装路径：`sudo bash install.sh`（root，`/opt/uulan`）或 `bash install.sh --userland`
+（普通用户，`~/.local/uulan`，现场拿不到 sudo 口令时用）。
+
+几个决定不是风格问题，是「起不起来」的问题：
+
+- **被控端永远是 systemd 用户单元。** 它要 x11grab 抓 `:0`、要 XTest 注入、要读
+  `~/.Xauthority`；系统单元跑在 root 下没有会话，X11 授权直接拦住 → 黑屏。
+- **开机顺序不靠 autologin**：用户单元挂 `default.target`，`ExecStartPre=uulan-wait-x 300`
+  先等 `xdpyinfo` 能打开 `:0`，超时以 1 退出 → `Restart=always` 再等一轮。
+  于是「先开机、后登录」也能在登录后自己追上。
+- **口令不进 journal**：`uulan-host` 的访问密码只在 stdout 是终端、或显式 `--show` 时才打印
+  （`journalctl --user -u uulan-host` 现场最容易被贴进工单）。
+- **中继要两份模板**：系统装带 `ProtectHome/ProtectSystem` 沙箱；用户态装**不能** hide 家目录
+  （台账 `state/devices.json` 就写在那里），所以单独一份 `uulan-server.user.service`。
+- **打包与安装的路径约定，必须由「从包里装一遍」来证**：第一次从离线包装就断在
+  `uulan-wait-x` 的位置差异上（源码树在 `deploy/`，包里在 `bin/`），`set -e` 把安装打断，
+  留下一个只有 `uulan-host` 的半装前缀。
+
+实测（2026-10-23 真麒麟，用户态装）：`enabled`+`active`、`Linger=yes`、
+`systemctl --user kill -s KILL` 后 `NRestarts=1` 自动拉起并重新上线（同一设备 ID）、
+包内二进制取帧 29.6 fps、与真机截图相关系数 0.9969。
+**未验**：整机重启后的自启、root 系统装路径。详见 `docs/milestones/M5-麒麟落地-2026-10-23.txt`。
 
 ### M2.5 进行中：控制端窗口（已完成）
 

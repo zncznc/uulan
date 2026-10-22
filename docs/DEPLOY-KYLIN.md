@@ -469,3 +469,105 @@ pgrep -af "^sleep 300"    # 对照：普通 `sleep 300 &` 关会话后应当被�
 pkill -x xev; pkill -x Xvfb
 pkill -x uulan-host   # 会连 :0 那个一起停；之后 bash ~/.local/uulan/run.sh host 拉起来
 ```
+---
+
+## 13. systemd 自启与离线安装包（M5，2026-10-23 真机实测）
+
+这一节是**现场部署**该照着做的那套：不再手工 `setsid nohup`，改成 systemd 单元；
+安装包是离线 tar.gz。
+
+### 13.1 打离线包（在麒麟上原生编译）
+
+```bash
+export PATH=$HOME/.cargo/bin:$PATH
+cd ~/.local/uulan/src
+bash deploy/make-package.sh --version 0.3.0
+# → /tmp/uulan-0.3.0-x86_64-linux.tar.gz   2.2 MB（sha256 会打出来）
+# 包内：bin/{uulan-host,uulan-server,uulan-wait-x}  systemd/{3 个 .service}
+#       install.sh  uninstall.sh  README.md  doc/{DESIGN,DEPLOY-KYLIN}.md
+```
+
+### 13.2 装（两种，按有没有 root 选）
+
+```bash
+tar xzf uulan-0.3.0-x86_64-linux.tar.gz && cd uulan-0.3.0-x86_64-linux
+
+# A. 有 root：/opt/uulan + 中继系统单元 + 被控端用户单元
+sudo bash install.sh --user mis --server 192.168.223.15:21116
+
+# B. 没有 root（本机 sudo 是要口令的，真机验收走的就是这条）：
+bash install.sh --userland --server 192.168.223.15:21116
+#    → 全部在 ~/.local/uulan，中继与被控端都是 systemd **用户**单元
+```
+
+装完的状态（2026-10-23 实测）：
+
+```
+systemctl --user is-enabled uulan-server uulan-host     → enabled / enabled
+systemctl --user is-active  uulan-server uulan-host     → active  / active
+loginctl show-user mis | grep Linger                    → Linger=yes
+pgrep -a uulan
+  ~/.local/uulan/bin/uulan-server --bind 0.0.0.0:21116 --state ~/.local/uulan/state/devices.json
+  ~/.local/uulan/bin/uulan-host --server 192.168.223.15:21116
+journalctl --user -u uulan-host
+  "X :0 已就绪（等了 0s）"            ← ExecStartPre=uulan-wait-x 真的等到显示就绪
+```
+
+崩溃自愈（真测，不是推断）：
+
+```bash
+systemctl --user kill -s KILL uulan-host
+# MainPID 602447 → 603430，NRestarts=1，is-active=active
+# journal 里重新出现「已用原有设备 ID 上线 device_id=805747189」
+```
+
+**未验**：整机重启后的自启（要 `sudo reboot`，本机 sudo 要口令，也没有去动用户的桌面会话）。
+
+### 13.3 为什么被控端必须是用户单元
+
+被控端要 `x11grab` 抓 `:0`、要 XTest 注入、要读 `~/.Xauthority`。
+系统单元跑在 root 下、没有会话 → X11 授权拦住，抓出来是黑屏。
+用户单元天然在会话里，`loginctl enable-linger mis` 又保证**开机不等登录**就把用户管理器拉起来。
+
+开机顺序由 `ExecStartPre=.../uulan-wait-x 300` 兜住：等 `xdpyinfo` 能打开 `:0`，
+超时以 1 退出 → `Restart=always` 再等一轮。所以「先开机、后登录」也能在登录后自己追上，
+**不需要 autologin**。
+
+### 13.4 口令不进 journal（M6 脱敏，真机硬证据）
+
+```bash
+PW=$(~/.local/uulan/bin/uulan-host --show | sed -n 's/.*访问密码: //p')
+journalctl --user -u uulan-host --no-pager | grep -cF "$PW"    # → 0
+~/.local/uulan/bin/uulan-host --show | grep -cF "$PW"          # → 1（显式 --show 才打）
+```
+
+journal 里的横幅是：`访问密码: （已隐藏 —— 输出不是终端；在终端里跑 uulan-host --show 查看）`。
+
+### 13.5 这一节踩到的坑
+
+1. **`rm -rf` 在无人值守 cron 里会被审批拦下**（`BLOCKED: Command flagged as dangerous`）。
+   换源码时别用 `rm -rf src.new`，改成「每次用带时间戳的新目录」：
+
+   ```bash
+   TS=$(date +%Y%m%d_%H%M%S); NEW=src.in.$TS
+   mkdir -p "$NEW"; tar xf ~/uulan-src-head.tar -C "$NEW"
+   [ -d src/target ] && mv src/target "$NEW/target"
+   mv src "src.old.$TS"; mv "$NEW" src
+   ```
+
+   同理 `kill -9 $(pgrep ...)` 也会被拦；要验自动重启用 `systemctl --user kill -s KILL uulan-host`。
+
+2. **打包能打 ≠ 装包能装。** 第一次从离线包装的时候：
+
+   ```
+   install: 无法获取'.../uulan-wait-x.sh' 的文件状态: 没有那个文件或目录
+   ```
+
+   源码树里这个脚本叫 `deploy/uulan-wait-x.sh`，包里是 `bin/uulan-wait-x`；
+   `set -e` 下一个 `install` 失败就把安装打断，留下**只有 uulan-host 的半装前缀**。
+   已修（HEAD 61a5452：两种布局都认，找不到就明确报错）。以后再改打包布局，
+   必须**从包里装一遍**才算验证。
+
+3. **系统单元模板 verify 会报「执行文件不存在」**：`systemd-analyze verify` 对
+   `/opt/uulan/bin/uulan-server` 找不到就 rc=1。没做 root 装时这是预期结果，
+   不代表模板有语法问题（其余告警是麒麟自带 CloseApp/kyfs-fuse 的，与本项目无关）。
