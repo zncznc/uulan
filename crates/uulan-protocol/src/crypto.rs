@@ -679,6 +679,42 @@ impl<R: AsyncRead + Unpin> AsyncRead for SecReader<R> {
     }
 }
 
+/// 加密连接的读半端（`TcpStream::into_split()` 的读半 + 解密）。
+pub type SecReadHalf = SecReader<OwnedReadHalf>;
+/// 加密连接的写半端（`TcpStream::into_split()` 的写半 + 加密）。
+pub type SecWriteHalf = SecWriter<OwnedWriteHalf>;
+
+/// 已经握过手（且计数器已经前进过）的控制通道。
+///
+/// 为什么不能当整连接再包一次：加密层的计数器在 Hello/Auth 期间已经走过几步，
+/// 重新构造 [`SecConn`] 会让计数器回到 0 —— 那是 nonce 重用，等于把明文交出去。
+/// 所以这里只交出「两半」本身。
+pub struct SecControl {
+    pub rd: SecReadHalf,
+    pub wr: SecWriteHalf,
+}
+
+impl std::fmt::Debug for SecControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecControl(<已加密>)")
+    }
+}
+
+impl SecControl {
+    pub fn new(stream: TcpStream, keys: &ChannelKeys, role: Role) -> Self {
+        let (rd, wr) = stream.into_split();
+        Self {
+            rd: SecReader::new(rd, keys, role, Channel::Control),
+            wr: SecWriter::new(wr, keys, role, Channel::Control),
+        }
+    }
+
+    /// 交给下一层（控制循环 / 文件 / 终端 / 转发都用同一对半端）。
+    pub fn into_split(self) -> (SecReadHalf, SecWriteHalf) {
+        (self.rd, self.wr)
+    }
+}
+
 /// 一条已加密的会话连接（生产路径用：底下的东西就是 `TcpStream`）。
 ///
 /// `into_split()` 的签名刻意跟 `TcpStream::into_split()` 一样，
@@ -699,6 +735,13 @@ impl std::fmt::Debug for SecConn {
 impl SecConn {
     pub fn new(stream: TcpStream, keys: &ChannelKeys, role: Role, ch: Channel) -> Self {
         Self { stream, keys: keys.clone(), role, ch }
+    }
+
+    /// 只要写半端（视频通道在被控端是单向的：只推流，不读）。
+    ///
+    /// 丢掉读半端不会关掉连接 —— 写半端还持有底层 socket。
+    pub fn into_write_half(self) -> SecWriter<OwnedWriteHalf> {
+        self.into_split().1
     }
 
     /// 拆成加密的两半（读、写各自一个方向密钥，互不干扰）。

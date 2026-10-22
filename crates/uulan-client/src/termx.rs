@@ -24,13 +24,13 @@
 //! 否则方向键、Ctrl-C、`vim` 全都动不了（行缓冲会把它们吃掉，等到回车才发）。
 //! unix 上用 `cfmakeraw`；**Windows 控制端暂未接**（要 `SetConsoleMode`，见 DESIGN 的已知限制）。
 
+use uulan_protocol::crypto::SecControl;
 use std::io::{Read, Write};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
@@ -88,7 +88,7 @@ impl TermLink {
     ///
     /// 会话 id 固定为 1：`--term` 是独立会话（跟 `--forward`/`--ls` 一样），一条连接上只有一个终端，
     /// 不需要协商编号。
-    pub async fn open(control: TcpStream, opts: Options) -> Result<Self> {
+    pub async fn open(control: SecControl, opts: Options) -> Result<Self> {
         let opts = opts.resolved();
         let (rd, mut wr) = control.into_split();
         let (tx, mut rx) = mpsc::channel::<ToHost>(32);
@@ -231,7 +231,7 @@ impl CloseHandle {
 const EOF_GRACE: Duration = Duration::from_secs(3);
 
 /// 交互式终端：把本机 stdin/stdout 接到远端 PTY 上，返回远端 shell 的退出码。
-pub async fn run(control: TcpStream, opts: Options) -> Result<i32> {
+pub async fn run(control: SecControl, opts: Options) -> Result<i32> {
     let mut link = TermLink::open(control, opts).await?;
 
     // raw 模式必须在**本函数作用域**里进出：Drop 时还原，否则崩溃留下一个不回显的终端。

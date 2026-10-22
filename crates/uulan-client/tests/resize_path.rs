@@ -17,7 +17,9 @@ use tokio::time::timeout;
 use uulan_client::watch::VideoWatcher;
 use uulan_media::ffmpeg;
 use uulan_protocol::frame::{write_frame, FrameKind};
+use uulan_protocol::crypto::{client_handshake, host_handshake, SecConn};
 use uulan_protocol::msg::{H2C, HostVideoCfg};
+use uulan_protocol::rv::{Channel, Role};
 
 const FRAMES: u32 = 6;
 
@@ -77,12 +79,12 @@ fn cfg(w: u32, h: u32, fps: f32) -> HostVideoCfg {
     }
 }
 
-async fn send_cfg(s: &mut TcpStream, c: HostVideoCfg) {
+async fn send_cfg<W: tokio::io::AsyncWrite + Unpin>(s: &mut W, c: HostVideoCfg) {
     let bytes = serde_json::to_vec(&H2C::VideoCfg(c)).unwrap();
     write_frame(s, FrameKind::Json, &bytes).await.unwrap();
 }
 
-async fn send_au(s: &mut TcpStream, ts: u64, data: &[u8]) {
+async fn send_au<W: tokio::io::AsyncWrite + Unpin>(s: &mut W, ts: u64, data: &[u8]) {
     let packed = uulan_protocol::frame::video::pack_au(ts, data);
     write_frame(s, FrameKind::VideoAu, &packed).await.unwrap();
 }
@@ -98,7 +100,13 @@ async fn decoder_is_rebuilt_when_host_resolution_changes() {
 
     // 假被控端：320x240 → 只报帧率的 VideoCfg（不该触发重建）→ 480x360
     let server = tokio::spawn(async move {
-        let (mut s, _) = listener.accept().await.unwrap();
+        let (mut raw, _) = listener.accept().await.unwrap();
+        // M6：控制端/被控端之间每条连接都先握手，之后每个帧都是密文。
+        // 这里扮演被控端，所以握手顺序也得是「先收后发」。
+        let keys = host_handshake(&mut raw).await.expect("假被控端握手失败");
+        let mut s = SecConn::new(raw, &keys.channel(Channel::Video), Role::Host, Channel::Video)
+            .into_split()
+            .1;
         send_cfg(&mut s, cfg(320, 240, 0.0)).await;
         send_au(&mut s, 1_000, &small).await;
         // 给控制端时间把这一代解出来，否则重建会把还没解完的帧一起丢掉
@@ -112,7 +120,9 @@ async fn decoder_is_rebuilt_when_host_resolution_changes() {
         let _ = s.shutdown().await;
     });
 
-    let stream = TcpStream::connect(addr).await.unwrap();
+    let mut raw = TcpStream::connect(addr).await.unwrap();
+    let keys = client_handshake(&mut raw).await.expect("控制端握手失败");
+    let stream = SecConn::new(raw, &keys.channel(Channel::Video), Role::Client, Channel::Video);
     let mut watcher = VideoWatcher::start(stream, Some(ff.clone()))
         .await
         .expect("启动解码失败");

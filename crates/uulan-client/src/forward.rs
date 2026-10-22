@@ -25,6 +25,7 @@
 //! （失败会回 `PortMapErr`），所以我们注册流之后收到的一定是真实业务字节，
 //! 不会出现「本地应用已经发了一堆、对端还不知道要往哪儿送」。
 
+use uulan_protocol::crypto::{SecConn, SecControl};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -138,7 +139,7 @@ struct Inner {
 
 impl Forwarder {
     /// 接管已鉴权的控制连接与 bulk 连接。
-    pub fn start(control: TcpStream, bulk: TcpStream) -> Self {
+    pub fn start(control: SecControl, bulk: SecConn) -> Self {
         let (cr, mut cw) = control.into_split();
         let (br, bw) = bulk.into_split();
         let (tx, mut rx) = mpsc::channel::<Out>(64);

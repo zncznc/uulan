@@ -11,11 +11,11 @@
 //! 用**无界**队列是有意的：输入事件很小、频率有限（鼠标 100+ 次/秒也就几 KB/s），
 //! 而**丢一个松开事件就会让被控端的键卡住**。宁可多占几十 KB，也不能丢。
 
+use uulan_protocol::crypto::SecControl;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -126,7 +126,7 @@ pub struct ControlLink {
 
 impl ControlLink {
     /// 接管已鉴权的控制连接（不启用剪贴板同步）。
-    pub fn start(control: TcpStream) -> Self {
+    pub fn start(control: SecControl) -> Self {
         Self::start_with_clipboard(control, None)
     }
 
@@ -135,7 +135,7 @@ impl ControlLink {
     /// 剪贴板轮询和键鼠上报**共用这一条控制连接、这一个任务**：
     /// 三件事（等上报 → 读回报 → 定时轮询剪贴板）都是「有就干、没有就等」，
     /// 拆成多个任务反而要额外加锁去抢同一个写半边。
-    pub fn start_with_clipboard(control: TcpStream, clipboard: Option<Box<dyn Clipboard>>) -> Self {
+    pub fn start_with_clipboard(control: SecControl, clipboard: Option<Box<dyn Clipboard>>) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<C2H>();
         let stats = Arc::new(InputStats::default());
         let st = stats.clone();

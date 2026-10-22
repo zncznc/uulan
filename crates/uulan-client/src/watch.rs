@@ -17,13 +17,12 @@
 //! 这套结构 headless 也能跑 —— 所以整条控制端链路在没有显示器、没有窗口系统的机器上
 //! 依然可以端到端验证。
 
+use uulan_protocol::crypto::{SecConn, SecReadHalf, SecWriteHalf};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
@@ -182,13 +181,17 @@ impl VideoWatcher {
     ///
     /// `ffmpeg` 为 `None` 时走 PATH。
     pub async fn start(
-        mut video: TcpStream,
+        video: SecConn,
         ffmpeg: Option<PathBuf>,
     ) -> Result<Self, WatchError> {
+        // 先拆两半：等画面参数这一步可能要往视频通道回心跳（Pong），
+        // 而 `read_frame` 不能和写共用同一个对象（它不是 cancel-safe 的，
+        // 且加密层的读写状态本来就必须分开持有）。
+        let (mut read_half, mut write_half) = video.into_split();
         // 先同步等到 VideoCfg —— 没有它就不知道解码输出的帧尺寸。
         let mut pending: Vec<(u64, Vec<u8>)> = Vec::new();
         let info = loop {
-            let f = read_frame(&mut video).await?;
+            let f = read_frame(&mut read_half).await?;
             debug!(kind = ?f.kind, len = f.payload.len(), "视频通道收到帧（等画面参数）");
             match f.kind {
                 // 画面参数是以 Json 帧发过来的（payload 里的 type 是 video_cfg）。
@@ -214,7 +217,7 @@ impl VideoWatcher {
                     }
                 }
                 FrameKind::Ping => {
-                    let _ = write_frame(&mut video, FrameKind::Pong, &f.payload).await;
+                    let _ = write_frame(&mut write_half, FrameKind::Pong, &f.payload).await;
                 }
                 FrameKind::Bye => {
                     // 把被控端给的原因原样带出去。这样用户看到的是
@@ -252,7 +255,6 @@ impl VideoWatcher {
         let (latest_tx, latest_rx) = watch::channel::<Option<Frame>>(None);
         let started = Instant::now();
 
-        let (read_half, write_half) = video.into_split();
         let sup = tokio::spawn(supervise(
             read_half,
             write_half,
@@ -345,8 +347,8 @@ enum PumpEnd {
 /// 就定死了（`-video_size` + 每帧字节数），被控端换了分辨率之后继续喂，读出来的
 /// 就是错位的字节流 —— 画出来是一堆斜条纹，而且永远不会自愈。
 async fn supervise(
-    r: OwnedReadHalf,
-    w: OwnedWriteHalf,
+    r: SecReadHalf,
+    w: SecWriteHalf,
     mut info: HostVideoCfg,
     mut pending: Vec<(u64, Vec<u8>)>,
     ffmpeg: PathBuf,
@@ -492,18 +494,24 @@ async fn supervise(
     }
 }
 
-/// 收一代的帧：socket 读半 → 有界队列。满了就丢 —— 宁可丢帧也不要拖延迟。
+/// 队列满时给解码任务多久的追赶时间。超过就丢这一帧。
+///
+/// 20ms 是「一次 30fps 帧间隔的三分之二」：足以吸收解码器启动/瞬间抖动，
+/// 又不至于让延迟累积到用户能察觉。
+const DROP_GRACE: Duration = Duration::from_millis(20);
+
+/// 收一代的帧：socket 读半 → 有界队列。真的跟不上就丢 —— 宁可丢帧也不要拖延迟。
 ///
 /// **返回值把 socket 的两个半端原样交回去**：换分辨率要重建解码器，但 TCP 连接
 /// 不能断，所以读半端必须能从一个 pump 交到下一个 pump（`JoinHandle` 的返回值
 /// 正好就是这条交接通道；用 `Arc<Mutex<TcpStream>>` 反而会把并发读写成串行）。
 async fn pump_generation(
-    mut r: OwnedReadHalf,
-    mut w: OwnedWriteHalf,
+    mut r: SecReadHalf,
+    mut w: SecWriteHalf,
     tx: mpsc::Sender<(u64, Vec<u8>)>,
     stats: Arc<WatchStats>,
     size: (u32, u32),
-) -> (OwnedReadHalf, OwnedWriteHalf, PumpEnd) {
+) -> (SecReadHalf, SecWriteHalf, PumpEnd) {
     let end = loop {
         let f = match read_frame(&mut r).await {
             Ok(f) => f,
@@ -533,10 +541,17 @@ async fn pump_generation(
                 stats.last_ts_us.store(ts, Ordering::Relaxed);
                 match tx.try_send((ts, au.to_vec())) {
                     Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        // 解码跟不上：丢掉这一帧。远程桌面画面上「跳一帧」无感，
-                        // 但排队会让延迟一路涨上去，那才是致命的。
-                        stats.dropped.fetch_add(1, Ordering::Relaxed);
+                    Err(mpsc::error::TrySendError::Full(item)) => {
+                        // 队列满：先给解码任务一小段时间（[`DROP_GRACE`]）。
+                        //
+                        // 为什么不是「立刻丢」：M6 起视频帧是**整条记录一次性解出来**的，
+                        // 收帧任务一个 poll 里就能连读几十帧，于是「解码器刚启动、队列
+                        // 还没被消费过」这种瞬时拥塞会把它本该解得了的帧全丢掉。
+                        // 也不能改成无限等：排队会把延迟一路涨上去，那才是远程桌面的致命伤。
+                        // 所以是「等一个很短的上限，真跟不上才丢」。
+                        if tokio::time::timeout(DROP_GRACE, tx.send(item)).await.is_err() {
+                            stats.dropped.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => break PumpEnd::Closed,
                 }

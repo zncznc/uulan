@@ -21,9 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::io::AsyncWriteExt;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
@@ -34,6 +32,8 @@ use uulan_protocol::msg::{
     quality_preset, AuthFailReason, C2H, Cap, FsOp, H2C, HostHelloOk, HostVideoCfg, PortMapOp,
     Quality, Screen, TermOp,
 };
+use uulan_protocol::crypto::{self, SecConn, SecReadHalf, SecWriteHalf, SessionKeys};
+use uulan_protocol::rv::{Channel, Role};
 use uulan_protocol::rvclient::RelaySet;
 
 use crate::term::{self, PtyFactory};
@@ -113,6 +113,10 @@ impl FpsMeter {
     }
 }
 
+/// 端到端握手的时限。正常是一次往返（内网 <1ms），给 10 秒是给「对端在跑但很忙」留余量；
+/// 超过就当作坏连接收尾，别让一个卡住的会话把被控端的会话位占着。
+const CRYPTO_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// 连续失败多少次开始锁定。
 pub const AUTH_MAX_FAILURES: u32 = 5;
 /// 首次锁定时长；之后每多错一次翻倍，封顶 [`AUTH_LOCK_CAP`]。
@@ -120,6 +124,7 @@ pub const AUTH_LOCK_BASE: Duration = Duration::from_secs(60);
 pub const AUTH_LOCK_CAP: Duration = Duration::from_secs(300);
 
 /// 密码比较。用常量时间比较，避免通过响应时间猜密码。
+#[cfg(test)]
 fn ct_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     // 长度不同也要走完整轮循环，别提前返回。
@@ -196,7 +201,11 @@ pub struct HostState {
 
 pub enum AuthResult {
     /// 通过。`used_temp_code` 为真表示吃掉了一次性临时验证码，调用方该去落盘。
-    Ok { used_temp_code: bool },
+    ///
+    /// `host_proof` 是被控端自己的口令证明（`HMAC(K,"uulan-auth-h1"||…||口令)`），
+    /// 由这里算好交给调用方发出去 —— **口令明文不离开这个函数**。
+    /// 控制端拿到它会校验；不校验的话中继可以冒充被控端收走输入。
+    Ok { used_temp_code: bool, host_proof: String },
     /// 密码不对。
     Bad,
 }
@@ -227,32 +236,38 @@ impl HostState {
         self.cfg.lock().unwrap().name.clone()
     }
 
-    /// 校验访问密码，一次性临时码用掉即失效。
+    /// 校验口令证明，一次性临时码用掉即失效。
     ///
     /// 顺序上先比永久密码再比临时码 —— 临时码是给「临时协助」场景的，
     /// 用它连接不应打断主人自己用永久密码。
-    pub fn authenticate(&self, given: &str) -> AuthResult {
-        let mut used_temp = false;
-        {
+    ///
+    /// 为什么不再收口令明文：M6 起通道虽然已加密，但中继是**主动 MITM 时**唯一能
+    /// 看到解密前内容的一方；把口令换成「用会话密钥算的证明」，中继拿到的就只是一个
+    /// 认不出来的十六进制串。证明每次会话都不同（临时密钥对每次新生成），不能重放。
+    pub fn authenticate_proof(&self, keys: &SessionKeys, proof: &str) -> AuthResult {
+        let (used_temp, password) = {
             let mut g = self.cfg.lock().unwrap();
-            let permanent_ok = ct_eq(given, &g.password);
-            if permanent_ok {
-                // 永久密码命中，临时码不动
+            if keys.verify_client_proof(&g.password, proof) {
+                (false, g.password.clone())
             } else if let Some(t) = g.temp_code.clone() {
-                if ct_eq(given, &t) {
+                if keys.verify_client_proof(&t, proof) {
+                    // 临时码用掉即失效：在同一把锁里摘掉，避免并发会话各用一次。
                     g.temp_code = None;
-                    used_temp = true;
+                    (true, t)
                 } else {
                     return AuthResult::Bad;
                 }
             } else {
                 return AuthResult::Bad;
             }
-        }
+        };
         if used_temp {
             self.persist();
         }
-        AuthResult::Ok { used_temp_code: used_temp }
+        AuthResult::Ok {
+            used_temp_code: used_temp,
+            host_proof: keys.host_proof(&password),
+        }
     }
 
     fn persist(&self) {
@@ -358,6 +373,32 @@ pub async fn run_with_sink(
     let RelaySet { control, video, bulk } = relays;
     let mut control = control;
 
+    // ── M6：端到端握手 ──
+    // 放在最前面（Hello 之前）：之后的每个帧都是密文，连口令证明也不会明文上线。
+    // 这一步本身是明文的（两帧临时公钥），但拿不到它就没法解密后续任何一个字节。
+    let keys = match tokio::time::timeout(
+        CRYPTO_HANDSHAKE_TIMEOUT,
+        crypto::host_handshake(&mut control),
+    )
+    .await
+    {
+        Ok(Ok(k)) => k,
+        Ok(Err(e)) => {
+            warn!(%peer, error = %e, "端到端握手失败");
+            return SessionOutcome::Error(format!("端到端握手失败: {e}"));
+        }
+        Err(_) => {
+            warn!(%peer, "端到端握手超时（对端没在期限内回 CryptoHello）");
+            return SessionOutcome::Error("端到端握手超时".into());
+        }
+    };
+    // 三条连接各用自己通道的子密钥：换个通道、换个方向都换密钥，
+    // 所以各方向的计数器可以各自从 0 开始而不会撞 nonce。
+    let control = SecConn::new(control, &keys.channel(Channel::Control), Role::Host, Channel::Control);
+    let video = SecConn::new(video, &keys.channel(Channel::Video), Role::Host, Channel::Video);
+    let bulk = SecConn::new(bulk, &keys.channel(Channel::Bulk), Role::Host, Channel::Bulk);
+    let (mut control_rd, mut control_wr) = control.into_split();
+
     // 剪贴板后端：抓的是哪个 X 显示，剪贴板就得是哪个 X 显示的。
     let mut params = params;
     let mut clip: Box<dyn Clipboard> = params
@@ -367,7 +408,17 @@ pub async fn run_with_sink(
     let clip_available = clip.available();
 
     let cfg = params.state.snapshot();
-    let client = match handshake(&mut control, &params.state, params.screen, &peer, clip_available).await {
+    let client = match handshake(
+        &mut control_rd,
+        &mut control_wr,
+        &keys,
+        &params.state,
+        params.screen,
+        &peer,
+        clip_available,
+    )
+    .await
+    {
         Ok(Some(c)) => c,
         // 鉴权没过：已经回过 AuthFail 了
         Ok(None) => return SessionOutcome::Unauthenticated(peer.clone()),
@@ -421,7 +472,7 @@ pub async fn run_with_sink(
     // 另一支被选中就会把半个帧头吞掉 —— 表现为「偶发协议解析错」，极难复现。
     // 现在读帧只在读任务里、写帧只在写任务里，主循环两边都只排队列
     // （mpsc 的 recv/send 是 cancel-safe 的）。
-    let (rd, wr) = control.into_split();
+    let (rd, wr) = (control_rd, control_wr);
     let (out_tx, out_rx) = mpsc::unbounded_channel::<Out>();
     // 终端输出的反压水位：它只关心「推出去多少、真写出去多少」的差。
     let out_written = Arc::new(AtomicUsize::new(0));
@@ -556,17 +607,23 @@ enum Closed {
 /// 一条 `term_out` 最多约 22 KiB，所以 64 条 ≈ 1.4 MiB 在飞 —— 慢链路上够撑，又不至于吃内存。
 const TERM_OUT_HIGH_WATER: usize = 64;
 
-async fn handshake(
-    control: &mut TcpStream,
+async fn handshake<R, W>(
+    rd: &mut R,
+    wr: &mut W,
+    keys: &SessionKeys,
     state: &HostState,
     screen: Screen,
     peer: &str,
     clip_available: bool,
-) -> Result<Option<uulan_protocol::msg::ClientHello>, String> {
+) -> Result<Option<uulan_protocol::msg::ClientHello>, String>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let cfg = state.snapshot();
 
     // 1) 等 Hello
-    let client = match read_c2h(control).await? {
+    let client = match read_c2h(rd).await? {
         Some(C2H::Hello(c)) => c,
         Some(other) => return Err(format!("握手时期望 Hello，收到 {other:?}")),
         None => return Err("对端在握手前就断开了".into()),
@@ -584,7 +641,7 @@ async fn handshake(
     // 所以能力位可以如实声明 —— 声明了却打不开和「假装没实现」是两回事。
     caps.push(Cap::Terminal);
     send_h2c(
-        control,
+        wr,
         &H2C::HelloOk(HostHelloOk {
             device_id: cfg.device_id.clone().unwrap_or_default(),
             os: std::env::consts::OS.to_string(),
@@ -597,9 +654,9 @@ async fn handshake(
     )
     .await?;
 
-    // 3) 等 Auth
-    let given = match read_c2h(control).await? {
-        Some(C2H::Auth { password }) => password,
+    // 3) 等 Auth（口令证明，不是口令本身）
+    let proof = match read_c2h(rd).await? {
+        Some(C2H::Auth { proof }) => proof,
         Some(other) => return Err(format!("握手时期望 Auth，收到 {other:?}")),
         None => return Err("对端在鉴权前就断开了".into()),
     };
@@ -609,7 +666,7 @@ async fn handshake(
     if let Some(left) = state.auth.locked_for(now) {
         warn!(%peer, remaining_ms = left.as_millis() as u64, "鉴权处于锁定期，拒绝");
         send_h2c(
-            control,
+            wr,
             &H2C::AuthFail {
                 reason: AuthFailReason::Locked,
                 retry_after_ms: left.as_millis() as u64,
@@ -619,16 +676,16 @@ async fn handshake(
         return Ok(None);
     }
 
-    // 5) 校验
-    match state.authenticate(&given) {
-        AuthResult::Ok { used_temp_code } => {
+    // 5) 校验：证明对着会话密钥算，所以中继重放/伪造都过不了
+    match state.authenticate_proof(keys, &proof) {
+        AuthResult::Ok { used_temp_code, host_proof: proof } => {
             state.auth.record_success();
             info!(
                 %peer,
                 used_temp_code,
                 "鉴权通过"
             );
-            send_h2c(control, &H2C::AuthOk).await?;
+            send_h2c(wr, &H2C::AuthOk { proof }).await?;
             Ok(Some(client))
         }
         AuthResult::Bad => {
@@ -636,7 +693,7 @@ async fn handshake(
             // 绝不打印密码本身，只记次数。
             warn!(%peer, failures = n, locked_ms = lock.as_millis() as u64, "鉴权失败");
             send_h2c(
-                control,
+                wr,
                 &H2C::AuthFail {
                     reason: AuthFailReason::BadPassword,
                     retry_after_ms: if lock.is_zero() { 0 } else { lock.as_millis() as u64 },
@@ -975,7 +1032,7 @@ fn send_out(out: &mpsc::UnboundedSender<Out>, m: H2C) -> Result<(), String> {
 /// 被 `select!` 取消就会丢掉半个帧头，之后整条连接的数据都对不上 ——
 /// 这类 bug 在真机上表现为「偶发卡死」，几乎没法复现。队列是有界的（64 条），
 /// 塞满时读任务会等，反压自然传到 TCP。
-async fn read_loop(mut rd: OwnedReadHalf, tx: mpsc::Sender<In>) {
+async fn read_loop(mut rd: SecReadHalf, tx: mpsc::Sender<In>) {
     loop {
         let m = match read_frame(&mut rd).await {
             Ok(f) => match f.kind {
@@ -1006,7 +1063,7 @@ async fn read_loop(mut rd: OwnedReadHalf, tx: mpsc::Sender<In>) {
 /// `written` 是「已经真正写到 socket 上的条数」，只给终端的反压用 ——
 /// 终端输出不能丢字节，唯一的办法是知道还有多少没写出去。
 async fn write_loop(
-    mut wr: OwnedWriteHalf,
+    mut wr: SecWriteHalf,
     mut rx: mpsc::UnboundedReceiver<Out>,
     written: Arc<AtomicUsize>,
 ) {
@@ -1180,8 +1237,11 @@ async fn video_loop(
     mut set_rx: watch::Receiver<VideoSettings>,
     probe: Option<ScreenProbe>,
     size_tx: watch::Sender<Screen>,
-    mut video: TcpStream,
+    video: SecConn,
 ) {
+    // 视频通道在被控端是单向的（只写）：拿写半端就够，读半端直接丢掉。
+    // 丢掉读半端不会关掉 socket —— 写半端还持有底层句柄。
+    let mut video = video.into_write_half();
     let mut cur = *set_rx.borrow();
     // 分辨率探针：只在「没在配置里钉死尺寸」时才存在。1 秒一次，成本是一条 xdpyinfo。
     let mut screen_tick = tokio::time::interval(SCREEN_POLL_INTERVAL);
@@ -1334,7 +1394,7 @@ fn make_capture_options(
     o
 }
 
-async fn read_c2h(s: &mut TcpStream) -> Result<Option<C2H>, String> {
+async fn read_c2h<R: AsyncRead + Unpin>(s: &mut R) -> Result<Option<C2H>, String> {
     let f = match read_frame(s).await {
         Ok(f) => f,
         Err(uulan_protocol::frame::FrameError::Io(e))
@@ -1481,6 +1541,18 @@ mod tests {
         assert!(a.locked_for(t0).is_some(), "clone 必须共享同一份计数");
     }
 
+    /// 造一对真会话密钥（跑一遍真握手，不造假密钥）。
+    ///
+    /// 键方向：返回 `(控制端, 被控端)`；用控制端那份算证明，被控端那份校验。
+    async fn keys_pair() -> (SessionKeys, SessionKeys) {
+        let (mut a, mut b) = tokio::io::duplex(8192);
+        let (c, h) = tokio::join!(
+            uulan_protocol::crypto::client_handshake(&mut a),
+            uulan_protocol::crypto::host_handshake(&mut b)
+        );
+        (c.expect("控制端握手"), h.expect("被控端握手"))
+    }
+
     fn state_with(temp: Option<&str>) -> HostState {
         let mut cfg = HostConfig::default();
         cfg.password = "aB3dE5fG".into();
@@ -1488,44 +1560,83 @@ mod tests {
         HostState::new(cfg, None)
     }
 
-    #[test]
-    fn permanent_password_does_not_consume_the_temp_code() {
+    #[tokio::test]
+    async fn permanent_password_does_not_consume_the_temp_code() {
+        let (c, h) = keys_pair().await;
         let s = state_with(Some("tE9mP2cO"));
-        match s.authenticate("aB3dE5fG") {
-            AuthResult::Ok { used_temp_code } => assert!(!used_temp_code),
+        match s.authenticate_proof(&h, &c.client_proof("aB3dE5fG")) {
+            AuthResult::Ok { used_temp_code, .. } => assert!(!used_temp_code),
             AuthResult::Bad => panic!("永久密码被拒"),
         }
         assert!(s.snapshot().temp_code.is_some(), "用永久密码登录不该消耗临时码");
         // 临时码仍然可用
-        match s.authenticate("tE9mP2cO") {
-            AuthResult::Ok { used_temp_code } => assert!(used_temp_code),
+        match s.authenticate_proof(&h, &c.client_proof("tE9mP2cO")) {
+            AuthResult::Ok { used_temp_code, .. } => assert!(used_temp_code),
             AuthResult::Bad => panic!("临时码被拒"),
         }
     }
 
-    #[test]
-    fn temp_code_is_single_use() {
+    #[tokio::test]
+    async fn temp_code_is_single_use() {
+        let (c, h) = keys_pair().await;
         let s = state_with(Some("tE9mP2cO"));
-        assert!(matches!(s.authenticate("tE9mP2cO"), AuthResult::Ok { used_temp_code: true }));
+        let proof = c.client_proof("tE9mP2cO");
+        assert!(matches!(
+            s.authenticate_proof(&h, &proof),
+            AuthResult::Ok { used_temp_code: true, .. }
+        ));
         assert!(s.snapshot().temp_code.is_none(), "用过的临时码必须被清掉");
         // 第二次用同一个码必须失败
-        assert!(matches!(s.authenticate("tE9mP2cO"), AuthResult::Bad));
+        assert!(matches!(s.authenticate_proof(&h, &proof), AuthResult::Bad));
         // 永久密码不受影响
-        assert!(matches!(s.authenticate("aB3dE5fG"), AuthResult::Ok { .. }));
+        let perm = c.client_proof("aB3dE5fG");
+        assert!(matches!(s.authenticate_proof(&h, &perm), AuthResult::Ok { .. }));
     }
 
-    #[test]
-    fn wrong_password_is_rejected_and_nothing_is_consumed() {
+    #[tokio::test]
+    async fn wrong_password_is_rejected_and_nothing_is_consumed() {
+        let (c, h) = keys_pair().await;
         let s = state_with(Some("tE9mP2cO"));
-        assert!(matches!(s.authenticate("wrongPass9"), AuthResult::Bad));
+        assert!(matches!(s.authenticate_proof(&h, &c.client_proof("wrongPass9")), AuthResult::Bad));
         assert!(s.snapshot().temp_code.is_some());
     }
 
-    #[test]
-    fn no_temp_code_means_only_the_permanent_password_works() {
+    #[tokio::test]
+    async fn no_temp_code_means_only_the_permanent_password_works() {
+        let (c, h) = keys_pair().await;
         let s = state_with(None);
-        assert!(matches!(s.authenticate("aB3dE5fG"), AuthResult::Ok { .. }));
-        assert!(matches!(s.authenticate("anything1"), AuthResult::Bad));
+        assert!(matches!(
+            s.authenticate_proof(&h, &c.client_proof("aB3dE5fG")),
+            AuthResult::Ok { .. }
+        ));
+        assert!(matches!(s.authenticate_proof(&h, &c.client_proof("anything1")), AuthResult::Bad));
+    }
+
+    /// 证明是**跟会话密钥绑死**的：别的会话（别的密钥）算出来的证明必须被拒，
+    /// 否则中继把一次会话的 Auth 帧搬到另一次会话上就能冒充。
+    #[tokio::test]
+    async fn proof_from_another_session_is_rejected() {
+        let (c1, _h1) = keys_pair().await;
+        let (_c2, h2) = keys_pair().await;
+        let s = state_with(None);
+        assert!(matches!(
+            s.authenticate_proof(&h2, &c1.client_proof("aB3dE5fG")),
+            AuthResult::Bad
+        ));
+    }
+
+    /// 被控端返回的证明必须是**控制端能验的**那份（双向鉴权的另一半）。
+    #[tokio::test]
+    async fn host_proof_can_be_verified_by_the_client() {
+        let (c, h) = keys_pair().await;
+        let s = state_with(None);
+        match s.authenticate_proof(&h, &c.client_proof("aB3dE5fG")) {
+            AuthResult::Ok { host_proof, .. } => {
+                assert!(c.verify_host_proof("aB3dE5fG", &host_proof), "控制端应认被控端的证明");
+                assert!(!c.verify_host_proof("wrongPass9", &host_proof));
+            }
+            AuthResult::Bad => panic!("永久密码被拒"),
+        }
     }
 
     #[test]

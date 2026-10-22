@@ -19,7 +19,11 @@ pub use frame::{
 pub use rvclient::{RelaySet, RvConn, RvError};
 
 /// 协议版本。不兼容变更必须递增；服务端/两端在握手时用它拒绝过旧的另一端。
-pub const PROTO_VERSION: u32 = 1;
+///
+/// v2（M6）：三条会话连接上强制端到端加密，`Auth` 改成口令证明、`AuthOk` 带被控端证明。
+/// 旧端（v1）不会做加密握手，被控端等不到 `CryptoHello` 就会超时收尾 ——
+/// 这正是我们要的：宁可连不上，也不要悄悄退回明文。
+pub const PROTO_VERSION: u32 = 2;
 
 /// 默认中继端口。
 pub const DEFAULT_PORT: u16 = 21116;

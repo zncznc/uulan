@@ -1,0 +1,114 @@
+M6 · 端到端加密 · 本机实测记录
+================================
+
+日期：2026-10-22（夜间闲时批，第二轮之前完成第一块）
+工程：D:\default-workspace\uulan
+范围：M6 的第一项「E2E 加密」（临时码每小时轮换、日志全量脱敏仍未做）
+
+一、改了什么
+------------
+
+新增 crates/uulan-protocol/src/crypto.rs（约 700 行含单测）：
+
+  1) 握手（只在 control 通道，Hello 之前）
+     C→H CryptoHello{v, eph(hex 32B), nonce(hex 16B)}
+     H→C CryptoHello{...}
+     K = HKDF-SHA256(salt = nonce_c||nonce_h, ikm = X25519(eph_c, eph_h),
+                     info = "uulan-session-v1")  → 32 字节主密钥
+     转录哈希 = SHA256("uulan-hs-v1" || eph_c || eph_h || nonce_c || nonce_h)
+     低阶点（共享密钥全零）直接拒绝，返回 WeakPeerKey。
+
+  2) 子密钥（video / bulk 不重复握手）
+     key = HKDF-Expand(K, "uulan-ch-v1" || 通道号 || 方向号)
+     通道号 Control=1 Video=2 Bulk=3 Audio=4；方向 0x01=c→h 0x02=h→c
+     → 收发密钥不同，两个方向的记录计数器各自从 0 起也不会撞 nonce。
+
+  3) 记录层（每帧一个记录）
+     线上：u32 BE 长度 || (密文 || 16 字节 tag)
+     明文：整个帧（4 字节长度 + kind 字节 + payload，与 frame.rs 逐字节一致）
+     nonce：12 字节 = 4 个 0 字节 || 连接内 64 位计数器（大端）
+     AAD  ："uulan-rec-v1" || 通道号
+
+     SecReader<R> / SecWriter<W> 实现 AsyncRead / AsyncWrite →
+     read_frame / write_frame 的调用点一字未改；uulan-bulk、uulan-fs、
+     终端、剪贴板、视频泵的业务代码零改动。
+
+  4) 双向口令证明（Auth 不再发明文口令）
+     控制端：HMAC-SHA256(K, "uulan-auth-v1" || "uulan-auth-c1" || 转录哈希 || 口令)
+     被控端：HMAC-SHA256(K, "uulan-auth-v1" || "uulan-auth-h1" || 转录哈希 || 口令)
+     被控端在 authenticate_proof() 里对「永久密码」「一次性临时码」各算一次再常数时间比较；
+     命中哪个就回哪个的证明 —— 口令明文不离开这个函数。
+     控制端校验被告知 AuthOk{proof}：不通过就断开（防中继冒充被控端）。
+
+  5) 类型上防错误用法
+     SecConn（整连接，可从 TcpStream 造）vs SecControl（已经走过 Hello/Auth 的两半）。
+     控制通道不能在握手中途再包一次 —— 那会让计数器归零＝nonce 重用。这条写成了类型。
+
+  6) 协议版本升到 2
+     旧端（v1，明文）被服务端以 proto_mismatch 拒绝；被控端等不到 CryptoHello 10 秒收尾。
+     刻意不做「自动退回明文」。
+
+二、实测数字
+------------
+
+cargo test --workspace
+    321 passed / 0 failed / 1 ignored（33 个测试套件；上一轮 302）
+    其中 crypto 单测 16 项：
+      两端派生出同一份密钥            handshake_derives_same_keys_on_both_sides
+      通道/方向密钥互不相同            channels_and_directions_have_distinct_keys
+      跨会话密钥不同                  different_sessions_get_different_keys
+      证明方向不可冒用/口令绑定        proofs_are_directional_and_password_bound
+      证明跨会话不同                  proofs_differ_across_sessions
+      拒绝错误版本                    handshake_rejects_wrong_version
+      拒绝低阶点/坏公钥                handshake_rejects_junk_public_key
+      记录往返逐字节一致              record_roundtrip_preserves_bytes
+      密文里搜不到明文                plaintext_is_not_on_the_wire
+      翻一个 bit 必须失败             tampered_ciphertext_is_rejected
+      重放上一条记录必须失败          replayed_record_is_rejected
+      换方向密钥读不了                wrong_direction_key_cannot_read
+      记录截断报 UnexpectedEof        truncated_record_mid_body_errors
+      2 MiB 大帧往返                  large_frame_roundtrip
+      200 条小记录按序                many_small_records_stream_fine
+      帧辅助函数拒绝坏数据            frame_helpers_roundtrip_and_reject_junk
+
+新增 crates/uulan-client/tests/crypto_mitm.rs（**中继抓包验收**）
+    拓扑：控制端 → 记录字节的代理（扮演中继）→ 真 server → 真被控端
+    链路：真 TCP + 真协议 + 真会话（只有剪贴板后端是内存替身）
+    结果：代理记录 10978 字节；两个方向都**找不到** canary 明文
+          （"M6-CANARY-中继不许看到这段明文-9f3a7c" 与 "…BACK…-41d2"）；
+          同一时刻被控端假剪贴板确实收到了那段文字（写入 1 次）—— 证明不是「没发」；
+          记录里仍能看到会合阶段的明文 JSON（relay_open / client_connect），
+          证明记录本身有效，不是空跑。
+
+回归（都是加密链路下的真二进制，由 verify-*.sh 驱动）
+    verify-window-e2e.sh / verify-files-e2e.sh / verify-portmap-e2e.sh /
+    verify-term-e2e.sh / verify-clipboard-e2e.sh —— 结果见下方「三」补充记录。
+
+三、这一轮修掉的一个真问题（调度公平性）
+--------------------------------------
+
+症状：cargo test -p uulan-client --test end_to_end 里
+      "收到 AU 20 / 喂入 10 / 解出 10 / 丢弃 10"，断言「环回不该丢帧」变红。
+
+原因：不是加密算错，是**批量到达**。加密层把整条记录一次性解出来，收帧任务一个 poll
+      里能连读几十帧，于是 8 格解码队列被瞬间冲满 —— 解码器刚启动那一下就被判成
+      「跟不上」，本来解得过来的帧被丢掉。
+
+修法：队列满时先给解码任务 DROP_GRACE = 20ms 的追赶时间（约 30fps 一帧间隔的 2/3），
+      真跟不上才丢。丢帧策略不变（仍然不排队、不涨延迟）。
+      修完：20/20 帧全解出，dropped = 0，连跑 3 次稳定。
+
+四、本机验不了的（必须上麒麟）
+------------------------------
+
+1) getrandom 在麒麟 V10 SP1 上取熵（X25519 需要）—— 正常发行版没问题，但要真跑一次
+   `uulan-host` 看有没有 "端到端握手失败: io: …" 之类。
+2) 1080p 下的加解密开销与端到端延迟（本机只是微秒级，但要以真机数字为准）。
+3) 与旧版本不互通：现场升级时**两端 + 服务端要同时换**（PROTO_VERSION=2）。
+
+五、下一步（M6 剩余）
+--------------------
+
+1) 临时验证码「按配置每小时自动轮换」（现在只有「用一次即失效」）。
+2) 日志脱敏过一遍：把所有可能出现路径/设备名/口令的位置核一遍（口令与证明目前已不打印）。
+3) M5 麒麟落地（安装包 + systemd 自启）仍留在真机阶段。

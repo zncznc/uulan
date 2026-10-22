@@ -19,12 +19,12 @@
 //! 所以两边都写临时文件，**sha256 对上之后**才 rename 到目标。
 //! 这样「文件存在」就等于「内容完整」，是远控里最省心的一个保证。
 
+use uulan_protocol::crypto::{SecConn, SecControl, SecReadHalf, SecWriteHalf};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 use uulan_protocol::bulk::{BulkFrame, BulkKind, CHUNK};
 use uulan_protocol::frame::{read_frame, write_frame, FrameKind};
@@ -91,11 +91,11 @@ enum Step {
 }
 
 /// 生产环境里 bulk 连接的两个半端。
-type Conn = Peer<tokio::net::tcp::OwnedReadHalf, tokio::net::tcp::OwnedWriteHalf>;
+type Conn = Peer<SecReadHalf, SecWriteHalf>;
 
 struct Ctl {
-    rd: tokio::net::tcp::OwnedReadHalf,
-    wr: tokio::net::tcp::OwnedWriteHalf,
+    rd: SecReadHalf,
+    wr: SecWriteHalf,
 }
 
 impl Ctl {
@@ -159,7 +159,7 @@ fn short_hash(h: &str) -> &str {
 }
 
 /// 执行一次文件操作。`control` / `bulk` 来自 `connect::Connected`。
-pub async fn run(control: TcpStream, bulk: TcpStream, op: Op) -> Result<()> {
+pub async fn run(control: SecControl, bulk: SecConn, op: Op) -> Result<()> {
     let (cr, cw) = control.into_split();
     let (br, bw) = bulk.into_split();
     let mut ctl = Ctl { rd: cr, wr: cw };

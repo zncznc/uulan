@@ -58,8 +58,12 @@ pub struct HostHelloOk {
 pub enum C2H {
     Hello(ClientHello),
 
-    /// 密码校验。走到这一步之前，被控端不应处理任何输入消息。
-    Auth { password: String },
+    /// 口令证明。走到这一步之前，被控端不应处理任何输入消息。
+    ///
+    /// **不是密码明文**：`HMAC-SHA256(K, "uulan-auth-v1"||"uulan-auth-c1"||转录哈希||口令)`。
+    /// K 是端到端握手派生出来的会话密钥（见 [`crate::crypto`]），所以中继拿到的只是一个
+    /// 认不出来的十六进制串 —— 更不能靠它重放（每次都换临时密钥）。
+    Auth { proof: String },
 
     // ── 输入 ──
     MouseMoveAbs { x: f32, y: f32 },
@@ -236,7 +240,10 @@ pub enum PortMapOp {
 pub enum H2C {
     HelloOk(HostHelloOk),
 
-    AuthOk,
+    /// 鉴权成功。`proof` 是被控端的口令证明（标签 `uulan-auth-h1`）。
+    ///
+    /// 控制端**必须**校验它：不校验的话，中继可以冒充被控端，把用户的键盘与文件收走。
+    AuthOk { proof: String },
     AuthFail { reason: AuthFailReason, retry_after_ms: u64 },
 
     /// 编码器已（重）启动，参数以此为准。
@@ -464,7 +471,7 @@ mod tests {
             name: "ZNC-7G4D".into(),
             caps: vec![Cap::Clipboard, Cap::Files, Cap::Terminal],
         }));
-        rt_c2h(C2H::Auth { password: "aB3dE5fG".into() });
+        rt_c2h(C2H::Auth { proof: "ab12".into() });
         rt_c2h(C2H::MouseMoveAbs { x: 1.0, y: 0.0 });
         rt_c2h(C2H::MouseMoveRel { dx: -5, dy: 7 });
         rt_c2h(C2H::MouseButton { button: MouseButton::X2, down: true });
@@ -496,7 +503,7 @@ mod tests {
             caps: vec![Cap::Clipboard, Cap::Metrics],
             has_desktop: true,
         }));
-        rt_h2c(H2C::AuthOk);
+        rt_h2c(H2C::AuthOk { proof: "cd34".into() });
         rt_h2c(H2C::AuthFail { reason: AuthFailReason::Busy, retry_after_ms: 60000 });
         rt_h2c(H2C::VideoCfg(HostVideoCfg {
             w: 1920,

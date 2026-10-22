@@ -30,6 +30,7 @@ use uulan_media::ffmpeg::{self, Encoder};
 use uulan_protocol::bulk::{BulkFrame, BulkKind, CHUNK};
 use uulan_protocol::frame::{read_frame, write_frame, FrameKind};
 use uulan_protocol::msg::{C2H, Cap, FsEntry, FsOp, FsStreamStage, H2C};
+use uulan_protocol::crypto::{SecReadHalf, SecWriteHalf};
 use uulan_protocol::rv::{Role, ToEndpoint};
 use uulan_protocol::rvclient::RvConn;
 
@@ -101,11 +102,12 @@ async fn spawn_host(server: &str, cfg: HostConfig, home: PathBuf) -> String {
 
 /// 一条测试用的控制端会话：控制通道 + bulk 通道。
 struct Cli {
-    ctl_rd: tokio::net::tcp::OwnedReadHalf,
-    ctl_wr: tokio::net::tcp::OwnedWriteHalf,
+    // M6 起这两对是**已加密**的半端（SecReader/SecWriter），读写用法不变。
+    ctl_rd: SecReadHalf,
+    ctl_wr: SecWriteHalf,
     // Option 只是为了「测中断上传」时能把两半取走丢掉（不留半个连接挂着）。
-    bulk_rd: Option<tokio::net::tcp::OwnedReadHalf>,
-    bulk_wr: Option<tokio::net::tcp::OwnedWriteHalf>,
+    bulk_rd: Option<SecReadHalf>,
+    bulk_wr: Option<SecWriteHalf>,
 }
 
 impl Cli {
