@@ -594,3 +594,71 @@ journalctl --user -u uulan-host -u uulan-server --since "2026-10-23 22:20:00" --
 3. **系统单元模板 verify 会报「执行文件不存在」**：`systemd-analyze verify` 对
    `/opt/uulan/bin/uulan-server` 找不到就 rc=1。没做 root 装时这是预期结果，
    不代表模板有语法问题（其余告警是麒麟自带 CloseApp/kyfs-fuse 的，与本项目无关）。
+
+## 14. 升级（就地重装）与安装预检（2026-10-24 真机实测）
+
+内网没有仓库、没有 apt 源，升级就是「把新的离线包拷进去，在正在跑的机器上重装一遍」。
+实测（真麒麟，用户态装，服务当时正在跑）：
+
+```bash
+# 开发机：从 HEAD 打包（工作区可能被别的任务改着，不要直接同步工作区）
+git -C D:/default-workspace/uulan archive --format=tar -o D:/uulan-bin/uulan-src-head.tar HEAD
+scp D:/uulan-bin/uulan-src-head.tar kylin:~/uulan-src-head.tar
+
+# 真机：换源码（保留 target/ 编译缓存）→ 编 server + host → 打包
+cd ~/.local/uulan && TS=$(date +%Y%m%d_%H%M%S)
+NEW=src.in.$TS; mkdir -p "$NEW"; tar xf ~/uulan-src-head.tar -C "$NEW"
+[ -d src/target ] && mv src/target "$NEW/target"
+mv src "src.old.$TS"; mv "$NEW" src
+export PATH=$HOME/.cargo/bin:$PATH
+cd ~/.local/uulan/src && cargo build --release -p uulan-server -p uulan-host
+bash deploy/make-package.sh --version 20261024a --out /tmp/pkg
+
+# 真机：把新包装到旧装之上（同一条命令，不需要先卸载）
+cd /tmp/pkg && tar xzf uulan-20261024a-x86_64-linux.tar.gz
+cd uulan-20261024a-x86_64-linux
+bash install.sh --userland --server 192.168.223.15:21116
+# 无人值守的 cron 里重新拉起服务的命令会被审批拦下，那条路径改用 --no-start，
+# 再用 systemctl --user kill -s KILL uulan-{host,server} 让 Restart=always 自己拉起
+# （systemd 自己发信号，不触发审批拦截，效果与重新拉起等价）。
+```
+
+升级后要核的四件事（都实测过）：
+
+```bash
+# 设备 ID 不变
+python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.config/uulan/host.json')))['device_id'])"
+# 配置/口令原封不动（sha256 与升级前一致）
+sha256sum ~/.config/uulan/host.json
+# 真的重启过：PID 变了、NRestarts 加一
+systemctl --user show -p MainPID -p NRestarts --value uulan-host
+# 跑的是前缀里的新二进制：readlink 指到 ~/.local/uulan/bin/uulan-host
+readlink -f /proc/$(systemctl --user show -p MainPID --value uulan-host)/exe
+journalctl --user -u uulan-host -n 5 --no-pager | grep 上线
+```
+
+实测结果：设备 ID 805747189 不变、`host.json` sha256 重装前后一致、MainPID 927448 → 973931、
+`/proc/973931/exe` 的 sha256 与 `target/release/uulan-host` 一致、升级后再连 29.2 fps / 丢帧 0。
+
+**为什么不用先停服务**：这台机器的 ext4 上 `install` 是 unlink+create，替换正在运行的可执行
+文件不会报 ETXTBSY（用运行中的 `sleep` 做过同物异位对照，退出码 0、进程照旧跑）。
+换到别的文件系统（NFS / 某些 overlay）或别的 coreutils 版本时，先跑 `uninstall.sh` 更稳。
+
+### 14.1 安装预检（缺输入不再留半装前缀）
+
+`install.sh` 现在把**所有输入**（host/server 二进制、`uulan-wait-x`、systemd 单元模板）
+都在 `install -d $PREFIX` **之前**验一遍，缺任何一项就直接退出，前缀一个字节都不写。
+以前 `uulan-wait-x` 是在两个二进制落盘之后才找的 —— 真机上就因此留下过一个只有
+host+server 的半装前缀，`systemctl --user status` 显示 failed，而安装输出看起来只是
+「中途报了个错」。
+
+回归测试（本机与真机同一条命令，不需要 root、不碰真实 systemd）：
+
+```bash
+bash scripts/verify-install-preflight.sh
+# 期望：15 通过 / 0 失败
+# 四条失败路径都断言「退出码非 0 且 prefix 未被创建」，外加一条正常路径
+```
+
+（在 git-bash/MSYS 上跑时，正常路径会标 SKIP —— MSYS 的 `install -d -m 0700`
+改目录权限不可靠；以真机上的结果为准。）

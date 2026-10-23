@@ -1,0 +1,151 @@
+M5 收尾（一）：安装预检前移 + 就地重装（升级）真机验收
+验收日期：2026-10-24 凌晨（夜间闲时批，真麒麟 + 本机）
+提交：3a3b01e（install.sh 预检 + 新验收脚本）；本文件随 docs 提交
+
+============================================================
+一、这一轮改了什么
+============================================================
+
+`deploy/install.sh` 的「预检」原来不完整：`uulan-wait-x` 的查找发生在
+`install -d $PREFIX`、`$PREFIX/bin/uulan-host`、`$PREFIX/bin/uulan-server` **之后**。
+也就是说，这是最后一个「先落盘、后失败」的输入 —— 真机上第一次从离线包装就断在这里，
+留下一个只有 host+server 的半装前缀：`systemctl --user status` 显示 failed，而安装输出
+看起来只是「中途报了个错」。
+
+本轮把 WAIT_X 的查找（三种布局：`deploy/uulan-wait-x.sh`、`bin/uulan-wait-x`、
+`bin/uulan-wait-x.sh`）移进预检段，紧跟「单元模板存在」那条检查，缺它就 `die`，
+prefix 一个字节都不写。规矩写进脚本注释：**所有输入先验完，再动磁盘**。
+
+新增 `scripts/verify-install-preflight.sh`：把这条规矩变成可重复的断言。
+做法是「假 getent + 假 systemctl + 假 loginctl + 沙箱家目录 + 假二进制」，
+于是整个安装脚本可以在临时目录里跑，不碰真实 systemd 用户单元、不碰真实安装。
+四条失败路径都断言「退出码非 0 **且 prefix 目录未被创建**」：
+缺 `uulan-host` / 缺 `uulan-server` / 缺 `uulan-wait-x` / 缺单元模板；
+再跑一条正常路径，断言三个二进制落盘、中继单元写进了「目标用户」的家目录、摘要里写出 prefix。
+
+============================================================
+二、本机数字
+============================================================
+
+cargo test --workspace       342 passed / 0 failed / 1 ignored，0 警告
+cargo build --release        通过，0 警告
+（上一轮归档写的是 341；多出来的 1 条是 0b5d06f 那个抓屏源 EOF 修复带的测试，不是本轮加的。）
+
+bash scripts/verify-install-preflight.sh
+  15 通过 / 0 失败
+  ✓ 缺 uulan-host      → 退出码 1，prefix 未创建
+  ✓ 缺 uulan-server    → 退出码 1，prefix 未创建
+  ✓ 缺 uulan-wait-x    → 报错「找不到 uulan-wait-x」，退出码 1，prefix 未创建
+  ✓ 缺单元模板         → 退出码 1，prefix 未创建
+  ✓ 正常路径：三个二进制落盘、单元写进沙箱家目录、摘要写出 prefix
+  ⚠ 本机是 MSYS（git-bash）：`install -d -m 0700` 改目录权限会报
+    `cannot change permissions`，所以**正常路径在本机标 SKIP**，只有真机那条算数。
+
+============================================================
+三、真麒麟实测（192.168.223.15 / mis-pc / V10 SP1 / 海光 C86 / X11 1920x1080）
+============================================================
+
+部署：从 HEAD（3a3b01e）打包 → scp → 换源码（保留 target/）→
+`cargo build --release -p uulan-server -p uulan-host` 30.69s，0 警告。
+
+① 安装预检（真机，真 systemd 在 PATH 里但被假 systemctl 挡住）
+   bash scripts/verify-install-preflight.sh → **15 通过 / 0 失败**（含正常路径）
+   正常路径这次是真 Linux，`install -d -m 0700` 不再报权限问题 —— 本机那条 SKIP 因此被补上。
+
+② 画面（12 秒会话，Windows 控制端 → 真机）
+   收到 AU 358 / 关键帧 24 / 解出 356 帧 / **解码丢帧 0** / 首帧 **223 ms**
+   平均码率 9795 kbps / 实测 **29.6 fps** / 被控端自报 **30.40 fps** / 1920x1080
+   与真机 :0 截图逐像素比对：**相关系数 0.9997，平均绝对误差 1.28/255 = 0.50%**
+   （基线 2026-10-22 是 0.9982 / 0.71%；本轮更好，没有回归）
+
+③ 文件传输（真机 ext4，2 MiB 随机字节）
+   put → 远端 `sha256sum ~/uulan-ktest2.bin` = 06a0fae5e59526e2…（与本地一致）
+   get → 本地 sha256 = 06a0fae5e59526e2…（三处同一个值）
+
+④ 端口映射（真机 sshd）
+   `--forward 127.0.0.1:2222:127.0.0.1:22` → 本机连 2222 收到
+   `SSH-2.0-OpenSSH_8.2p1 Ubuntu-4kylin3k0.11`（真机 sshd 的 banner）
+
+⑤ 终端（真 PTY，Linux 侧）
+   `tty` → /dev/pts/1；`echo UULAN-REAL-$((6*7))` → UULAN-REAL-42；
+   `stty size` → **30 120**（与 `--term-size 120x30` 一致）；stdout 无日志污染
+
+⑥ 键鼠注入（真 :0，不是 Xvfb）
+   `--inject "move:800,500; wait:200; move:801,501"` → 注入后
+   `xdotool getmouselocation` 读到 `x:801 y:501`（随后还原到 1599,0）。
+   退出码 0，未送出 0 条、被控端拒绝 0 条。
+   **仍未验**：往应用里打字/拖拽 —— `:0` 的焦点窗口还是 `ukui-screensaver-dialog`（锁屏）。
+
+⑦ 就地重装（升级）—— 本轮新增的验收
+   从 HEAD 打包：`deploy/make-package.sh --version 20261024a` → 2.2 MB，
+   sha256 7cfa468b26f14194…；解包后在**已装好、服务正在跑**的真机上执行
+   `bash install.sh --userland --server 192.168.223.15:21116 --no-start`：
+
+     安装完成，设备 ID 805747189（安装脚本自己读出来打印的）
+     host.json sha256 重装前后都是 9d121004f820a61e…（**配置与口令原封不动**）
+     bin/ 里两个二进制被替换（sha256 0105da9a… / 47567786…，与 target/release 一致）
+     ⚠ `--no-start` 时不重启服务，所以此刻跑着的还是旧进程 —— 这是预期
+
+   然后 `systemctl --user kill -s KILL uulan-host / uulan-server`（cron 里 restart 被审批拦下）：
+     MainPID 927448 → 973931，NRestarts 3 → 4
+     `/proc/973931/exe` = /home/mis/.local/uulan/bin/uulan-host，sha256 0105da9a…（新二进制）
+     journal：「已用原有设备 ID 上线 device_id=805747189」「访问密码: （已隐藏…）」
+     中继 journal：「已载入设备台账 devices=1 …」「被控端上线 device_id=805747189」
+   升级后再连一次（6 秒）：29.2 fps / 丢帧 0 / 首帧 196 ms —— 升级没有破坏可用性。
+
+   附带结论（顺手验的）：在这台机器的 ext4 上，`install` 替换**正在运行**的可执行文件
+   不会报 ETXTBSY（用 `sleep` 做同物异位对照：运行中的 /tmp/sleepprobe 被 install 覆盖，
+   退出码 0，进程照旧跑）。所以「先停服务再拷二进制」不是必须的。
+
+⑧ 稳定性（20 分钟长连接，无人值守，控制端 --headless --seconds 1200）
+   持续 1200.0 s：收到 AU 35998 / 关键帧 2400 / 解出 35990 帧 / **解码丢帧 0**
+   实测 30.0 fps，被控端自报 30.00 fps，平均码率 9058 kbps，首帧 205 ms
+   解码器重建 0 次（画幅一次没变，符合预期）
+   被控端进程内存：1 分 53 秒 8004 kB → 7.5 分 9448 kB → 14.6 分 9468 kB → 收尾 7720 kB
+   线程数 17–19（收尾 17）。20 分钟里没有单调上涨，**没看到泄漏迹象**。
+
+⑨ CPU（加密接通后第一次在真机上量；8 秒窗口，单核 100% 为满）
+   uulan-host          0.9%      ← 加密/协议/输入这一侧的总开销，基本可以忽略
+   uulan-server        0.4%      ← 中继只搬字节（它本来也看不懂内容）
+   ffmpeg(x11grab+x264) 130.0%   ← 大头，软件编码 1080p@30
+   机器：Hygon C86 3250，8 核 16 线程
+   ⚠ 采样时屏幕基本静止（锁屏界面），x264 的代价是最省的那一档；动态桌面上会更高。
+     但「加密本身的开销可以忽略」这个结论不受影响 —— 它算在 uulan-host 那 0.9% 里。
+
+⑩ 回归（本机，改了 install.sh 与新增脚本，没动 Rust 代码）
+   cargo test --workspace  342 passed / 0 failed / 1 ignored，0 警告
+   bash scripts/verify-window-e2e.sh
+     painted=826 / 收到 AU 1804 / 关键帧 121 / 解出 1759 / 丢帧 0 / 首帧 61ms
+
+============================================================
+四、仍未验（照实写）
+============================================================
+
+- **Windows ↔ 麒麟剪贴板整链**：这个 cron 会话拿不到 Windows 剪贴板 ——
+  直接调 Win32 `OpenClipboard` 返回错误 5（拒访问），PowerShell 的 `Get-Clipboard` 同样失败。
+  ⚠ 顺带查明一个**观察得到的实现事实**（本轮读代码确认，没有改它）：
+  `uulan_clip` 的 Win32 后端 `available()` **恒返回 true**（`crates/uulan-clip/src/win.rs:84`），
+  它只表示「这个平台有后端」，不代表当下真的能开剪贴板。于是这种会话里控制端会照样
+  声明 Clipboard 能力，而被控端推过来的内容在本地读/写都会失败 —— 表现为**静默不同步**
+  （headless 模式的统计块也不打印剪贴板那行），正是这个 crate 的注释里说的
+  「静默吞掉是最难查的一类失败」。要不要把 `available()` 改成真探一次 OpenClipboard 是个取舍：
+  剪贴板是全局锁，别的程序正占着时会误判成「没有后端」，而能力是在会话开始时声明一次的。
+  这条留给有人守着的时候改，顺带把「读不到」也计入 errors。
+  X11 侧（owner/requestor 双向）已于 2026-10-23 用独立 X 客户端验过，缺的只是 Windows 这一端。
+- **:0 真实桌面上的打字/拖拽**：`xdotool getwindowfocus getwindowname` 仍是
+  `ukui-screensaver-dialog`（锁屏），注入只会打进锁屏，不去碰。
+- **M5 整机重启后的自启**：`sudo -n` 在真机上要口令，`systemctl reboot` 走 polkit 也要认证，
+  无人值守的夜里不能重启那台机器（也不该动别人的桌面会话）。
+- **root 系统装路径**（/opt/uulan）：同上，没有 sudo 口令。
+- **Linux 控制端（麒麟上当控制端）**：真机上编不了 `uulan-client`
+  （winit/softbuffer 的 X11 后端要 `x11.pc`，随 `libx11-dev` 一起来，而麒麟源里装不上）。
+- **PAKE**（防主动 MITM 离线撞口令）：仍是最主要的 M6 缺口，未动。
+
+============================================================
+五、下一步
+============================================================
+
+1. M6 剩下的只有 PAKE。要在夜里动它，得先确认能取到经过审计的实现
+   （自研 SPAKE2 不适合无人值守批次），并同步升协议版本（v2 → v3，两端+中继同批换）。
+2. 剪贴板整链和 :0 打字需要「有交互桌面 + 能开剪贴板」的环境（有人在的时段跑一次即可）。
+3. 现场的整机重启自启、root 系统装，需要一次带 sudo 口令的人工验收。

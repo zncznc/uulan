@@ -323,7 +323,7 @@ uulan/
 | **M2.5 画好** | ✅ | 窗口 ✅；**键鼠注入 ✅（两端已接，本机全链路 + 真机 XTest 实测）**；**实测帧率上报 ✅**；**剪贴板文本双向 ✅（本机全链路 + 真 Win32；X11 后端已在真机与外部 X 客户端双向验过）**；**分辨率变化重建解码器 ✅（两端都做了，本机全链路实测）** | 能远程操作并双向粘文字、被控端换分辨率后画面自动跟上。真机实测见 `docs/milestones/M3-M4-真机-2026-10-23.txt`（XTest 注入：指针落点精确、keysym 正确、滚轮=按钮5、autorepeat 已还原；X11 剪贴板：与独立 X 客户端双向互通） |
 | **M3 能操作** | ✅ | XTest 注入 + 按键连发处理；`--inject` 脚本化注入（可无人值守验）；uinput 兜底仍未做 | **真机已验**（2026-10-23）：`--inject` 走真链路 → 被控端 XTest → 真 X 服务器；用 `xev`/`xdotool` 当独立判据，坐标/键位/按钮号/配对全对（当次验在另起的 `Xvfb :99` 上）。**同一轮夜间批补验**：`--inject move:640,400` 直接打到真 `:0`，`xdotool getmouselocation` 读到 `x:640 y:400`（注入前 1901,0，已还原）。限制：`:0` 被 UKUI 锁屏挡着，**往应用里打字/拖拽仍未验** |
 | **M4 工具齐全** | 🔄 | **文件传输 ✅**（列/取/送/建/删/改名/哈希 + 路径沙箱 + sha256，真二进制实测 6 MiB 往返一致）；**端口映射 ✅**（bulk 多路复用 + `--forward`，真二进制实测 256 KiB 单流 + 两条并发流逐字节一致）；**终端（PTY）✅ 本机全链路 + 真机 Linux 侧**（真 `/dev/pts`、termios 默认、winsize 下发、退出码 7 原样回来、SIGHUP→SIGKILL 升级日志） | 三项都用真 server + 真被控端 + 真客户端链路验过。终端已上真麒麟验 Linux 独有部分；剪贴板整链（Windows↔麒麟）本轮**未验**（cron 上下文没有交互式剪贴板） |
-| **M5 麒麟落地** | 🔄 | 离线安装包（tar.gz + install.sh + 3 个 systemd 单元）✅、systemd 开机自启 ✅（用户态装实测）、部署文档 ✅（`deploy/README.md` + `docs/DEPLOY-KYLIN.md` 第 13 节） | 真机上 `bash install.sh --userland` 一次装通：中继+被控端都是 `enabled`+`active`、`Linger=yes`、`ExecStartPre` 的 uulan-wait-x 真的等到 `:0`；`systemctl --user kill -s KILL` 后 `NRestarts=1` 自动拉起并重新上线；包内二进制取帧 29.6fps、相关系数 0.9969。见 `docs/milestones/M5-麒麟落地-2026-10-23.txt`。**未验**：整机重启后的自启、系统装（root，/opt/uulan）路径（本机 sudo 要口令） |
+| **M5 麒麟落地** | 🔄 | 离线安装包（tar.gz + install.sh + 3 个 systemd 单元）✅、systemd 开机自启 ✅（用户态装实测）、**就地重装（升级）✅**、**安装预检前移 ✅（缺输入不再留半装前缀）**、部署文档 ✅（`deploy/README.md` + `docs/DEPLOY-KYLIN.md` 第 13/14 节） | 真机上 `bash install.sh --userland` 一次装通：中继+被控端都是 `enabled`+`active`、`Linger=yes`、`ExecStartPre` 的 uulan-wait-x 真的等到 `:0`；`systemctl --user kill -s KILL` 后 `NRestarts=1` 自动拉起并重新上线；包内二进制取帧 29.6fps、相关系数 0.9969。见 `docs/milestones/M5-麒麟落地-2026-10-23.txt`。**就地升级已验**（2026-10-24）：在服务正在跑的真机上从离线包装重装 → 设备 ID 与 host.json 一字未变、二进制被替换、KILL 后 systemd 拉起的是前缀里的新二进制、再连 29.2fps/丢帧 0；见 `docs/milestones/M5-就地升级与安装预检-2026-10-24.txt`。**未验**：整机重启后的自启、系统装（root，/opt/uulan）路径（本机 sudo 要口令） |
 | **M6 加固** | 🔄 | **E2E 加密 ✅（本机全链路 + 中继抓包实测）**；临时验证码「用一次即失效」✅ + **每小时自动轮换 ✅（只轮换已存在的码）**；**日志脱敏 ✅ 全量**（口令只在终端/`--show` 打；会话票据改成不可逆标签 `tXXXXXXXX`；终端内容/剪贴板只记长度；两个二进制的日志一律走 stderr）；控制端口令可走 `--password-file` / `UULAN_PASSWORD`（不再只能写在 `ps` 能看到的命令行上） | 中继抓包看不到明文内容 —— **已用「记录字节的代理」实测**：clipboard 两个方向共 10978 字节，找不到任何明文；日志脱敏见 `docs/milestones/M6-日志脱敏-2026-10-23.txt`：本机 `RUST_LOG=trace` 134 行日志里口令/票据/终端原文 4 类秘密 0 命中，真机 journal 162 行 0 命中、30 行是标签形态。剩下的是 PAKE（防主动 MITM 离线撞口令） |
 
 ### M5 落地：部署形态（systemd + 离线安装包）
@@ -352,6 +352,34 @@ uulan/
 `systemctl --user kill -s KILL` 后 `NRestarts=1` 自动拉起并重新上线（同一设备 ID）、
 包内二进制取帧 29.6 fps、与真机截图相关系数 0.9969。
 **未验**：整机重启后的自启、root 系统装路径。详见 `docs/milestones/M5-麒麟落地-2026-10-23.txt`。
+
+#### 就地升级与安装预检（2026-10-24）
+
+内网现场的升级路径只有一条：把新的 `uulan-<ver>-x86_64-linux.tar.gz` 拷进去、解包、
+在**服务正在跑**的机器上重跑一遍 `install.sh`。这条路径的真机实测结论：
+
+- **配置与身份不会被覆盖**：重装前后 `~/.config/uulan/host.json` 的 sha256 一字未变
+  （设备 ID 805747189、访问口令、临时码全在），安装摘要会自己把设备 ID 读出来打印。
+- **跑起来的是前缀里的新二进制**：`systemctl --user kill -s KILL` 让 systemd 重新拉起后，
+  `readlink /proc/<pid>/exe` 指向 `~/.local/uulan/bin/uulan-host`，其 sha256 与 `target/release` 一致。
+- **在 ext4 上替换正在运行的可执行文件不需要先停服务**：`install` 走的是 unlink+create，
+  同物异位对照（运行中的 `sleep` 被 install 覆盖）退出码 0、进程照旧跑；
+  所以「升级 = 重装 + 重启服务」，没有 ETXTBSY 这一关。
+
+**安装预检必须挡在动磁盘之前。** 原来的预检漏了 `uulan-wait-x`（它在 `install -d $PREFIX`
+和两个二进制落盘**之后**才去找），于是缺它就在装到一半时 die —— 真机上真的留下过
+一个只有 host+server 的半装前缀，`systemctl` 显示 failed，而安装输出看着只是「报了个错」。
+现在三种布局的查找都在预检段（前缀一个字节都不写），并由 `scripts/verify-install-preflight.sh`
+钉住：假 getent/systemctl/loginctl + 沙箱家目录 + 假二进制，四条失败路径都断言
+「退出码非 0 **且 prefix 未被创建**」，外加一条正常路径。本机 15/0（正常路径因 MSYS 的
+目录 chmod 限制标 SKIP），真麒麟 15/0（含正常路径）。
+
+另附 20 分钟长连接稳定性实测（同一轮）：持续 1200 s、收到 AU 35998、解出 35990 帧、
+**解码丢帧 0**、稳定 30.0 fps、平均码率 9058 kbps、首帧 205 ms；被控端进程内存
+8004 kB → 9448 → 9468 → 收尾 7720 kB（无单调上涨），线程 17–19。
+
+详见 `docs/milestones/M5-就地升级与安装预检-2026-10-24.txt`，升级步骤见
+`docs/DEPLOY-KYLIN.md` 第 14 节。
 
 ### M2.5 进行中：控制端窗口（已完成）
 
@@ -1038,7 +1066,11 @@ SIGHUP→SIGKILL 的收尾），见 docs/DEPLOY-KYLIN.md §10。
 **本机验不了 / 待真机**：
 
 - X25519/AEAD 本身与平台无关，单测已覆盖；麒麟上只需确认 `getrandom` 能正常取熵（麒麟 V10 SP1 正常）。
-- 加密后 CPU 占用与延迟要在真机上量（本机 1080p 单帧加解密开销在微秒级，但要以实测为准）。
+- 加密后 CPU 占用已在真机上量过（2026-10-24，Hygon C86 3250 8 核 16 线程，1080p@30 推流 20 分钟）：
+  `uulan-host`（含加解密、协议、输入）**0.9%** 单核、`uulan-server` **0.4%**，
+  大头是软件编码 `ffmpeg(x11grab+libx264)` **130%**。所以加密本身的开销可以忽略，
+  1080p 的 CPU 预算全在 x264 上（要省就得换硬件编码或降帧/降分辨率）。
+  采样时屏幕基本静止，是 x264 最省的一档；动态桌面上编码那部分会更高。
 - 与旧版本（v1，明文）**不互通**：`PROTO_VERSION` 已升到 2，服务端会用 `proto_mismatch` 拒绝旧端；
   被控端等不到 `CryptoHello` 会在 10 秒后收尾。这是刻意的：宁可连不上，也不要悄悄退回明文。
 
