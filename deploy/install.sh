@@ -80,6 +80,19 @@ UNIT_SRC="$HERE/systemd"
 [ -d "$UNIT_SRC" ] || UNIT_SRC="$HERE/../deploy/systemd"
 [ -d "$UNIT_SRC" ] || die "找不到 systemd 单元模板（$HERE/systemd）"
 
+# 等 X 的小脚本：源码树里叫 deploy/uulan-wait-x.sh，离线包里被放到 bin/uulan-wait-x。
+# 两种布局都要认，否则「打包能打、装包就断」——真机上第一次装就踩到了。
+#
+# **必须在建 prefix 之前就找到它**：这是最后一个「先落盘、后失败」的输入。
+# 真机上真发生过：PREFIX/bin 和前两个二进制都已经写下去，才在这里 die，
+# 留下一个半装前缀 —— 服务起不来，而且看起来像装成功了。
+# 规矩：所有输入先验完，再动磁盘。
+WAIT_X=""
+for c in "$HERE/uulan-wait-x.sh" "$HERE/bin/uulan-wait-x" "$HERE/bin/uulan-wait-x.sh"; do
+    if [ -f "$c" ]; then WAIT_X="$c"; break; fi
+done
+[ -n "$WAIT_X" ] || die "找不到 uulan-wait-x（源码树应在 deploy/，安装包应在 bin/）"
+
 # 让 systemctl --user 在 ssh / 脚本里也能用
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$USER_UID}"
 if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "$XDG_RUNTIME_DIR/bus" ]; then
@@ -105,13 +118,7 @@ install -m 0755 "$BIN_DIR/uulan-host" "$PREFIX/bin/uulan-host"
 if [ "$DO_SERVER" = 1 ]; then
     install -m 0755 "$BIN_DIR/uulan-server" "$PREFIX/bin/uulan-server"
 fi
-# 等 X 的小脚本：源码树里叫 deploy/uulan-wait-x.sh，离线包里被放到 bin/uulan-wait-x。
-# 两种布局都要认，否则「打包能打、装包就断」——真机上第一次装就踩到了。
-WAIT_X=""
-for c in "$HERE/uulan-wait-x.sh" "$HERE/bin/uulan-wait-x" "$HERE/bin/uulan-wait-x.sh"; do
-    if [ -f "$c" ]; then WAIT_X="$c"; break; fi
-done
-[ -n "$WAIT_X" ] || die "找不到 uulan-wait-x（源码树应在 deploy/，安装包应在 bin/）"
+# 等 X 的小脚本（路径已在预检里确定，这里只落盘）
 install -m 0755 "$WAIT_X" "$PREFIX/bin/uulan-wait-x"
 if [ -d "$HERE/doc" ]; then
     cp -f "$HERE/doc/"*.md "$PREFIX/doc/" 2>/dev/null || true
