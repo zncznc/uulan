@@ -9,6 +9,7 @@ pub mod bulk;
 pub mod crypto;
 pub mod frame;
 pub mod msg;
+pub mod redact;
 pub mod rv;
 pub mod rvclient;
 pub mod vk;

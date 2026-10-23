@@ -22,7 +22,11 @@ use uulan_protocol::msg::Cap;
 struct Args {
     server: String,
     device: String,
+    /// 口令。**别从命令行传**：`--password` 会留在 `ps`、shell 历史、工单截图里。
+    /// 推荐 `--password-file`（首行）或环境变量 `UULAN_PASSWORD`，见 `resolve_password`。
     password: String,
+    /// 从文件读口令（取首行、去空白）。与 `UULAN_PASSWORD` 二选一即可。
+    password_file: Option<PathBuf>,
     name: String,
     frames: Option<u64>,
     seconds: Option<f64>,
@@ -57,7 +61,9 @@ uulan-client —— uulan 内网远控的控制端
 
   --server <addr>     中继地址（默认 127.0.0.1:21116）
   --device <id>       被控端设备 ID（9 位数字）
-  --password <pwd>    访问密码或一次性临时验证码
+  --password <pwd>    访问密码或一次性临时验证码（会出现在 ps/历史里，能用别的就用别的）
+  --password-file <f> 从文件首行读口令（推荐：不进进程表，也不进 shell 历史）
+                      也可以设环境变量 UULAN_PASSWORD；优先级 --password > 文件 > 环境变量
   --name <name>       本机在对方界面上显示的名字
   --frames <N>        解出 N 帧后退出
   --seconds <S>       跑 S 秒后退出
@@ -104,6 +110,7 @@ fn parse_args() -> Result<Args> {
         server: format!("127.0.0.1:{}", uulan_protocol::DEFAULT_PORT),
         device: String::new(),
         password: String::new(),
+        password_file: None,
         name: default_client_name(),
         frames: None,
         seconds: None,
@@ -126,6 +133,11 @@ fn parse_args() -> Result<Args> {
             "--server" => a.server = it.next().unwrap_or_default(),
             "--device" => a.device = it.next().unwrap_or_default(),
             "--password" => a.password = it.next().unwrap_or_default(),
+            "--password-file" => {
+                a.password_file = Some(PathBuf::from(
+                    it.next().context("--password-file 需要一个文件路径")?,
+                ))
+            }
             "--name" => a.name = it.next().unwrap_or_default(),
             "--frames" => {
                 a.frames = Some(it.next().unwrap_or_default().parse().context("--frames 要数字")?)
@@ -187,10 +199,49 @@ fn parse_args() -> Result<Args> {
     if a.device.is_empty() {
         bail!("必须给出 --device（被控端界面上显示的 9 位设备 ID）");
     }
+    let env_pw = std::env::var("UULAN_PASSWORD").ok();
+    a.password = resolve_password(&a.password, a.password_file.as_deref(), env_pw.as_deref())?;
     if a.password.is_empty() {
-        bail!("必须给出 --password（被控端的访问密码或一次性临时码）");
+        bail!(
+            "没有口令：用 --password、--password-file <文件>、或环境变量 UULAN_PASSWORD \
+             （被控端的访问密码或一次性临时码）"
+        );
     }
     Ok(a)
+}
+
+/// 口令的来路有三条，按优先级取：命令行 > 文件首行 > 环境变量。
+///
+/// 为什么非要后两条：`--password xxx` 在 Linux 上对同机任何用户都是 `ps` 里可读的，
+/// 在 Windows 上会进 PowerShell 历史、还会被截图贴进工单。而一次性临时码恰恰是
+/// 「发给人、让人赶紧连一次」的东西 —— 它最经不起这么抄。
+///
+/// 纯函数（三个入参都给全），所以能在本机用 `cargo test` 钉住优先级与边界情况。
+fn resolve_password(
+    from_cli: &str,
+    file: Option<&std::path::Path>,
+    from_env: Option<&str>,
+) -> Result<String> {
+    if !from_cli.is_empty() {
+        return Ok(from_cli.to_string());
+    }
+    if let Some(p) = file {
+        let raw = std::fs::read_to_string(p)
+            .with_context(|| format!("读不了 --password-file：{}", p.display()))?;
+        // 只取首行：口令文件往往顺手写成 `口令\n` 或多行备忘，多出来的内容不该混进口令。
+        let line = raw.lines().next().unwrap_or("").trim().to_string();
+        if line.is_empty() {
+            bail!("--password-file 的第一行是空的：{}", p.display());
+        }
+        return Ok(line);
+    }
+    if let Some(v) = from_env {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            return Ok(v);
+        }
+    }
+    Ok(String::new())
 }
 
 /// 解析 `COLSxROWS`（也收大写 `X` 和 `*`，省得为了一个分隔符去查文档）。
@@ -216,6 +267,9 @@ fn default_client_name() -> String {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        // 日志一律走 stderr：stdout 只放「数据」（终端字节、目录列表、统计 JSON）。
+        // 否则 `RUST_LOG=info uulan-client --term > out.bin` 会把 INFO 行混进 PTY 字节流。
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
@@ -279,7 +333,7 @@ async fn main() -> Result<()> {
             c.host.caps.len()
         );
     }
-    info!(session = %c.session, os = %c.host.os, "鉴权通过");
+    info!(session = %uulan_protocol::redact::tag(&c.session), os = %c.host.os, "鉴权通过");
 
     // 文件操作：不开窗口、不收画面，干完就退出。视频通道连上就丢掉（被控端看到 EOF
     // 会自己停编码器），这样下载大文件时不会和视频抢带宽。
@@ -575,4 +629,55 @@ fn write_ppm(path: &std::path::Path, f: &uulan_client::watch::Frame) -> Result<(
     out.write_all(&rgb)?;
     out.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpfile(name: &str, content: &str) -> PathBuf {
+        // 放在 exe 旁边（target/debug/deps）而不是系统临时目录：
+        // 这台开发机对某些目录有写盘限制，见 skill 里的「坑 2」。
+        let dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."));
+        let p = dir.join(format!("pwtest-{}-{}", std::process::id(), name));
+        std::fs::write(&p, content).expect("写临时口令文件");
+        p
+    }
+
+    #[test]
+    fn cli_password_wins_over_file_and_env() {
+        let f = tmpfile("a", "from-file\n");
+        let got = resolve_password("from-cli", Some(&f), Some("from-env")).unwrap();
+        assert_eq!(got, "from-cli");
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn file_wins_over_env_and_is_trimmed() {
+        // 口令文件常带尾随空白/CRLF（有人从 Windows 记事本存下来）
+        let f = tmpfile("b", "  s3cret-PW  \r\n第二行不该被读到\r\n");
+        let got = resolve_password("", Some(&f), Some("from-env")).unwrap();
+        assert_eq!(got, "s3cret-PW");
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn env_is_the_last_resort() {
+        assert_eq!(resolve_password("", None, Some(" from-env ")).unwrap(), "from-env");
+        assert_eq!(resolve_password("", None, Some("   ")).unwrap(), "");
+        assert_eq!(resolve_password("", None, None).unwrap(), "");
+    }
+
+    #[test]
+    fn empty_or_missing_password_file_is_an_error_not_silence() {
+        let empty = tmpfile("c", "\ndeadbeef\n"); // 首行是空的就必须报错，不能拿第二行顶上
+        assert!(resolve_password("", Some(&empty), Some("from-env")).is_err());
+        let _ = std::fs::remove_file(&empty);
+
+        let missing = std::path::Path::new("D:/definitely-not-here/uulan-pw.txt");
+        assert!(resolve_password("", Some(missing), Some("from-env")).is_err());
+    }
 }

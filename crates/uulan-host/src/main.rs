@@ -105,6 +105,8 @@ fn parse_args() -> Result<Args> {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        // 日志走 stderr，stdout 留给凭据横幅这类「给人看的数据」。
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -304,7 +306,8 @@ async fn run_forever(
         };
         match msg {
             ToEndpoint::Incoming { session, client_name, client_addr } => {
-                info!(%session, %client_name, %client_addr, "有人要连进来");
+                // 票据只在内存/线上有意义，日志里留不可逆标签（与服务端那三条能对上）。
+                info!(session = %uulan_protocol::redact::tag(&session), %client_name, %client_addr, "有人要连进来");
                 let params = SessionParams {
                     state: state.clone(),
                     ffmpeg: ffmpeg.clone(),

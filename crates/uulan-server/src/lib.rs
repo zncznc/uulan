@@ -19,6 +19,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use uulan_protocol::frame::{read_frame, write_frame, Frame, FrameKind};
+use uulan_protocol::redact;
 use uulan_protocol::rv::{
     gen_device_id, gen_session, is_valid_device_id, Channel, ErrCode, Role, ToEndpoint, ToServer,
 };
@@ -345,6 +346,8 @@ impl Server {
         };
 
         let session = gen_session();
+        // 票据是 60 秒有效的 bearer token：日志里只留不可逆标签，两端的标签能对上。
+        let session_tag = redact::tag(&session);
         {
             let mut sessions = self.inner.sessions.lock().unwrap();
             sessions.insert(
@@ -370,7 +373,7 @@ impl Server {
             return Ok(());
         }
 
-        info!(device_id = %device_id, %peer, client = %client_name, session = %session, "发起会话");
+        info!(device_id = %device_id, %peer, client = %client_name, session = %session_tag, "发起会话");
 
         write_frame(
             &mut stream,
@@ -413,6 +416,8 @@ impl Server {
         role: Role,
     ) -> Result<()> {
         stream.set_nodelay(true).ok();
+        // 同上：票据原值一律不进日志，只留不可逆标签。
+        let session_tag = redact::tag(session_id);
         /// 锁内只做簿记，锁外才做 IO。
         /// `std::sync::MutexGuard` 不是 `Send`，持有它跨 await 会让整个连接任务无法 `tokio::spawn`。
         enum Outcome {
@@ -471,7 +476,7 @@ impl Server {
                 Ok(())
             }
             Outcome::Waiting => {
-                debug!(session = %session_id, ?channel, ?role, "等待对端拨号");
+                debug!(session = %session_tag, ?channel, ?role, "等待对端拨号");
                 Ok(())
             }
             Outcome::Paired(mut h, mut c) => {
@@ -483,7 +488,7 @@ impl Server {
                 if write_frame(&mut c, FrameKind::Json, &ready).await.is_err() {
                     return Ok(());
                 }
-                info!(session = %session_id, ?channel, "通道已配对，开始盲转发");
+                info!(session = %session_tag, ?channel, "通道已配对，开始盲转发");
                 tokio::spawn(async move {
                     match copy_bidirectional(&mut h, &mut c).await {
                         Ok((a, b)) => debug!(?channel, up = a, down = b, "通道关闭"),
