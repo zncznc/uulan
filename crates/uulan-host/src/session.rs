@@ -236,6 +236,35 @@ impl HostState {
         self.cfg.lock().unwrap().name.clone()
     }
 
+    /// 让常驻进程看见「**别的进程**改了配置文件」。
+    ///
+    /// 为什么必须有：`uulan-host --new-temp-code` 是另一个短命进程，它把新码写进
+    /// `host.json` 就退出；如果常驻服务只认启动时读到的那份内存状态，新码永远不生效
+    /// —— 真机上实测过：CLI 生成的码直接被「密码不正确」拒掉，而服务下一次
+    /// `persist()`（吃掉临时码、或按小时轮换）还会把它悄悄改回去。
+    /// 现场表现就是「生成的验证码不能用」，而且日志上什么都看不出来。
+    ///
+    /// 只采用**凭据相关**的三项（口令 / 临时码 / 显示名）：设备 ID、采集参数属于
+    /// 运行期状态，由本进程维护，不能被一份可能过期的文件盖回去。
+    fn adopt_external_config(&self) {
+        let Some(p) = &self.cfg_path else { return };
+        let Ok(text) = std::fs::read_to_string(p) else { return };
+        let Ok(fresh) = serde_json::from_str::<HostConfig>(&text) else { return };
+        let mut g = self.cfg.lock().unwrap();
+        if g.password != fresh.password {
+            // 只记「变了」，绝不记值。
+            info!("配置文件里的访问口令变了，已采用新口令");
+            g.password = fresh.password;
+        }
+        if g.temp_code != fresh.temp_code {
+            info!("配置文件里的一次性临时验证码变了（新码不写日志）");
+            g.temp_code = fresh.temp_code;
+        }
+        if g.name != fresh.name {
+            g.name = fresh.name;
+        }
+    }
+
     /// 校验口令证明，一次性临时码用掉即失效。
     ///
     /// 顺序上先比永久密码再比临时码 —— 临时码是给「临时协助」场景的，
@@ -245,6 +274,8 @@ impl HostState {
     /// 看到解密前内容的一方；把口令换成「用会话密钥算的证明」，中继拿到的就只是一个
     /// 认不出来的十六进制串。证明每次会话都不同（临时密钥对每次新生成），不能重放。
     pub fn authenticate_proof(&self, keys: &SessionKeys, proof: &str) -> AuthResult {
+        // 先看一眼磁盘：临时码/口令可能是 `uulan-host --new-temp-code` 写的。
+        self.adopt_external_config();
         let (used_temp, password) = {
             let mut g = self.cfg.lock().unwrap();
             if keys.verify_client_proof(&g.password, proof) {
@@ -287,6 +318,9 @@ impl HostState {
     /// 为什么按小时换：临时码是给人临时协助用的，长期不变就等于一个第二密码；
     /// 换掉的旧码立刻失效（`temp_code` 被整体替换）。已经用掉（`None`）的码也不会复活。
     pub fn rotate_temp_code(&self) -> Option<String> {
+        // 轮换前先对齐磁盘：别人刚发的码要按「最新的那一个」去换，
+        // 而不是拿内存里的旧值盖掉它。
+        self.adopt_external_config();
         let mut g = self.cfg.lock().unwrap();
         if g.temp_code.is_none() {
             return None;
@@ -1706,6 +1740,83 @@ mod tests {
         let fresh = s.rotate_temp_code().expect("已有临时码时应该轮换");
         assert_ne!(fresh, old, "轮换必须换成不同的码");
         assert_eq!(s.snapshot().temp_code.as_deref(), Some(fresh.as_str()));
+    }
+
+    /// 另一个进程写的临时码，常驻服务必须看得见。
+    ///
+    /// 真机场景：装好的机器跑的是 systemd 用户单元，操作者敲
+    /// `uulan-host --new-temp-code` 拿到一个码发给同事 —— 那是**另一个进程**，
+    /// 写文件就退出。服务若只认启动时的内存状态，这个码会被「密码不正确」拒掉
+    /// （2026-10-24 真机实测就是这个表现），而服务下一次落盘还会把它改回去。
+    #[tokio::test]
+    async fn temp_code_written_by_another_process_is_honoured() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..").join("..").join("target").join("testtmp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(format!("hotcfg-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+
+        let mut cfg = HostConfig::default();
+        cfg.password = "aB3dE5fG".into();
+        cfg.temp_code = None;
+        cfg.save(&p).unwrap();
+
+        // 常驻服务先起来（内存里没有临时码）
+        let s = HostState::new(cfg.clone(), Some(p.clone()));
+        let (c, h) = keys_pair().await;
+
+        // 另一个进程此时写进一个新码
+        let mut on_disk = HostConfig::load(&p).unwrap();
+        let fresh = on_disk.refresh_temp_code();
+        on_disk.save(&p).unwrap();
+
+        // 新码必须能用，且用掉一次就失效（磁盘上也要被清掉）
+        match s.authenticate_proof(&h, &c.client_proof(&fresh)) {
+            AuthResult::Ok { used_temp_code, .. } => assert!(used_temp_code),
+            AuthResult::Bad => panic!("另一个进程写的临时码被拒 —— 常驻服务没看见配置变化"),
+        }
+        assert!(s.snapshot().temp_code.is_none(), "用掉的码必须从内存里清掉");
+        assert!(
+            HostConfig::load(&p).unwrap().temp_code.is_none(),
+            "用掉的码必须落盘清掉，否则重启后又能用一次"
+        );
+        // 再从磁盘读一遍也不能「复活」
+        assert!(matches!(s.authenticate_proof(&h, &c.client_proof(&fresh)), AuthResult::Bad));
+        // 永久密码照旧
+        let perm = c.client_proof("aB3dE5fG");
+        assert!(matches!(s.authenticate_proof(&h, &perm), AuthResult::Ok { .. }));
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 外部改了口令也要立刻生效（改口令不该要求重启服务）。
+    #[tokio::test]
+    async fn password_written_by_another_process_is_honoured() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..").join("..").join("target").join("testtmp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(format!("hotpwd-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+
+        let mut cfg = HostConfig::default();
+        cfg.password = "oldPass11".into();
+        cfg.save(&p).unwrap();
+        let s = HostState::new(cfg.clone(), Some(p.clone()));
+        let (c, h) = keys_pair().await;
+
+        let mut on_disk = HostConfig::load(&p).unwrap();
+        on_disk.password = "newPass22".into();
+        on_disk.save(&p).unwrap();
+
+        assert!(matches!(s.authenticate_proof(&h, &c.client_proof("oldPass11")), AuthResult::Bad));
+        match s.authenticate_proof(&h, &c.client_proof("newPass22")) {
+            AuthResult::Ok { host_proof, .. } => {
+                assert!(c.verify_host_proof("newPass22", &host_proof), "被控端证明应跟着新口令走");
+            }
+            AuthResult::Bad => panic!("外部改的新口令没生效 —— 常驻服务没看见配置变化"),
+        }
+
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
