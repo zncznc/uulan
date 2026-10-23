@@ -324,7 +324,7 @@ uulan/
 | **M3 能操作** | ✅ | XTest 注入 + 按键连发处理；`--inject` 脚本化注入（可无人值守验）；uinput 兜底仍未做 | **真机已验**（2026-10-23）：`--inject` 走真链路 → 被控端 XTest → 真 X 服务器；用 `xev`/`xdotool` 当独立判据，坐标/键位/按钮号/配对全对（当次验在另起的 `Xvfb :99` 上）。**同一轮夜间批补验**：`--inject move:640,400` 直接打到真 `:0`，`xdotool getmouselocation` 读到 `x:640 y:400`（注入前 1901,0，已还原）。限制：`:0` 被 UKUI 锁屏挡着，**往应用里打字/拖拽仍未验** |
 | **M4 工具齐全** | 🔄 | **文件传输 ✅**（列/取/送/建/删/改名/哈希 + 路径沙箱 + sha256，真二进制实测 6 MiB 往返一致）；**端口映射 ✅**（bulk 多路复用 + `--forward`，真二进制实测 256 KiB 单流 + 两条并发流逐字节一致）；**终端（PTY）✅ 本机全链路 + 真机 Linux 侧**（真 `/dev/pts`、termios 默认、winsize 下发、退出码 7 原样回来、SIGHUP→SIGKILL 升级日志） | 三项都用真 server + 真被控端 + 真客户端链路验过。终端已上真麒麟验 Linux 独有部分；剪贴板整链（Windows↔麒麟）本轮**未验**（cron 上下文没有交互式剪贴板） |
 | **M5 麒麟落地** | 🔄 | 离线安装包（tar.gz + install.sh + 3 个 systemd 单元）✅、systemd 开机自启 ✅（用户态装实测）、**就地重装（升级）✅**、**安装预检前移 ✅（缺输入不再留半装前缀）**、部署文档 ✅（`deploy/README.md` + `docs/DEPLOY-KYLIN.md` 第 13/14 节） | 真机上 `bash install.sh --userland` 一次装通：中继+被控端都是 `enabled`+`active`、`Linger=yes`、`ExecStartPre` 的 uulan-wait-x 真的等到 `:0`；`systemctl --user kill -s KILL` 后 `NRestarts=1` 自动拉起并重新上线；包内二进制取帧 29.6fps、相关系数 0.9969。见 `docs/milestones/M5-麒麟落地-2026-10-23.txt`。**就地升级已验**（2026-10-24）：在服务正在跑的真机上从离线包装重装 → 设备 ID 与 host.json 一字未变、二进制被替换、KILL 后 systemd 拉起的是前缀里的新二进制、再连 29.2fps/丢帧 0；见 `docs/milestones/M5-就地升级与安装预检-2026-10-24.txt`。**未验**：整机重启后的自启、系统装（root，/opt/uulan）路径（本机 sudo 要口令） |
-| **M6 加固** | 🔄 | **E2E 加密 ✅（本机全链路 + 中继抓包实测）**；临时验证码「用一次即失效」✅ + **每小时自动轮换 ✅（只轮换已存在的码）**；**日志脱敏 ✅ 全量**（口令只在终端/`--show` 打；会话票据改成不可逆标签 `tXXXXXXXX`；终端内容/剪贴板只记长度；两个二进制的日志一律走 stderr）；控制端口令可走 `--password-file` / `UULAN_PASSWORD`（不再只能写在 `ps` 能看到的命令行上） | 中继抓包看不到明文内容 —— **已用「记录字节的代理」实测**：clipboard 两个方向共 10978 字节，找不到任何明文；日志脱敏见 `docs/milestones/M6-日志脱敏-2026-10-23.txt`：本机 `RUST_LOG=trace` 134 行日志里口令/票据/终端原文 4 类秘密 0 命中，真机 journal 162 行 0 命中、30 行是标签形态。剩下的是 PAKE（防主动 MITM 离线撞口令） |
+| **M6 加固** | 🔄 | **E2E 加密 ✅（本机全链路 + 中继抓包实测）**；临时验证码「用一次即失效」✅ + **每小时自动轮换 ✅（只轮换已存在的码）**+ **运行中的服务能看见 `--new-temp-code` 新写的码 ✅（2026-10-24 真机实测：改前被拒，改后可用且只能用一次）**；**日志脱敏 ✅ 全量**（口令只在终端/`--show` 打；会话票据改成不可逆标签 `tXXXXXXXX`；终端内容/剪贴板只记长度；两个二进制的日志一律走 stderr）；控制端口令可走 `--password-file` / `UULAN_PASSWORD`（不再只能写在 `ps` 能看到的命令行上） | 中继抓包看不到明文内容 —— **已用「记录字节的代理」实测**：clipboard 两个方向共 10978 字节，找不到任何明文；日志脱敏见 `docs/milestones/M6-日志脱敏-2026-10-23.txt`：本机 `RUST_LOG=trace` 134 行日志里口令/票据/终端原文 4 类秘密 0 命中，真机 journal 162 行 0 命中、30 行是标签形态。剩下的是 PAKE（防主动 MITM 离线撞口令） |
 
 ### M5 落地：部署形态（systemd + 离线安装包）
 
@@ -1073,6 +1073,39 @@ SIGHUP→SIGKILL 的收尾），见 docs/DEPLOY-KYLIN.md §10。
   采样时屏幕基本静止，是 x264 最省的一档；动态桌面上编码那部分会更高。
 - 与旧版本（v1，明文）**不互通**：`PROTO_VERSION` 已升到 2，服务端会用 `proto_mismatch` 拒绝旧端；
   被控端等不到 `CryptoHello` 会在 10 秒后收尾。这是刻意的：宁可连不上，也不要悄悄退回明文。
+
+### M6 加固：一次性临时码的热加载（已完成 · 真机实测）
+
+装好的机器上，被控端是常驻的 systemd 用户单元；而 `uulan-host --new-temp-code` 是**另一个进程**
+（现场就是「敲一条命令，把码发给同事」）。原来 `HostState` 只在启动时读一次 `host.json`
+并把凭据留在内存里，于是：
+
+- CLI 写进磁盘的新码**常驻服务根本看不见** —— 真机实测：新码连上去直接被「密码不正确」拒掉；
+- 更糟的是服务下一次 `persist()`（吃掉临时码、或按小时轮换）会拿内存里的旧值把文件盖回去，
+  于是 CLI 生成过什么都不留痕迹；
+- 日志上什么都看不出来，现场表现就是「生成的验证码不能用」。
+
+修法：`HostState::adopt_external_config()` 在**鉴权前**和**轮换临时码前**读一次磁盘，
+只采用凭据相关的三项（口令 / 临时码 / 显示名）；设备 ID 与采集参数属于运行期状态，
+仍由进程自己维护，不让一份可能过期的文件盖回去。口令与临时码的变化只记「变了」，值不进日志。
+
+真机验收（2026-10-24，麒麟真机 + Windows 控制端）：
+
+```
+# 改前（旧二进制）
+uulan-host --new-temp-code → 生成的码连上去：「被控端拒绝：密码不正确」（exit 1）
+
+# 改后（2f44513）
+uulan-host --new-temp-code → 新码第一次连接：已连上（exit 0），journal:
+    INFO uulan_host::session: 配置文件里的一次性临时验证码变了（新码不写日志）
+    INFO uulan_host::session: 鉴权通过 peer=… used_temp_code=true
+  同一个码再连一次：「被控端拒绝：密码不正确」（exit 1）
+  host.json 里 temp_code 已清成 null（用一次即失效，落盘生效）
+  永久密码照旧可用（exit 0）
+```
+
+单测 `temp_code_written_by_another_process_is_honoured` / `password_written_by_another_process_is_honoured`
+把这两条钉住（都是「先红后绿」：没有 adopt 时第一个断言就失败）。
 
 ### M6 加固：日志脱敏（已完成 · 本机 + 真机）
 
