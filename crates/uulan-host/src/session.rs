@@ -1313,7 +1313,12 @@ async fn video_loop(
                         }
                     }
                     Ok(None) => {
-                        // 合成源放完了。抓屏源不会走到这里。
+                        // EOF。合成源放完了；**但真抓屏源也会走到这里** ——
+                        // x11grab 的抓取区域一旦大于当前屏幕（分辨率被调小），ffmpeg 是
+                        // 直接退出、不是报错，于是 next_au() 拿到的是 EOF 而不是 Err。
+                        // 2026-10-23 真麒麟实测：1920x1080 → 1600x900，会话当场断，
+                        // journal 里只有这条「视频源结束」。所以这里要和 Err 分支一样
+                        // 先探一次尺寸：真的变了就按新尺寸重开，没变才收工。
                         info!(
                             frames = src.emitted(),
                             keyframes = src.keyframes(),
@@ -1322,6 +1327,15 @@ async fn video_loop(
                             "视频源结束"
                         );
                         let _ = src.stop().await;
+                        if let Some(s) = probe_once(&probe).await {
+                            if s != screen {
+                                info!(from_w = screen.w, from_h = screen.h, to_w = s.w, to_h = s.h,
+                                      "视频源 EOF 且分辨率已变，按新尺寸重启");
+                                screen = s;
+                                let _ = size_tx.send(screen);
+                                break true;
+                            }
+                        }
                         return;
                     }
                     Err(e) => {

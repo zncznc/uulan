@@ -66,12 +66,38 @@ fn test_config(server: &str) -> HostConfig {
     cfg
 }
 
+/// 「每有人连进来就造一个新探针」的工厂。
+///
+/// 用工厂而不是直接传探针，是因为被控端每接一个会话都要一个**新**探针闭包
+/// （生产上每条会话各开一个 `xdpyinfo` 探针，互不干扰）。
+type ProbeFactory = Arc<dyn Fn() -> session::ScreenProbe + Send + Sync>;
+
 /// 起一个被控端；屏幕尺寸由 `screen_w/screen_h` 两个原子量驱动。
 async fn spawn_host(
     server: &str,
     cfg: HostConfig,
     out: Arc<Mutex<Vec<Inject>>>,
     screen: (Arc<AtomicU32>, Arc<AtomicU32>),
+) -> String {
+    let (sw, sh) = screen;
+    let probes: ProbeFactory = Arc::new(move || {
+        let (pw, ph) = (sw.clone(), sh.clone());
+        Arc::new(move || {
+            Some(Screen {
+                w: pw.load(Ordering::Relaxed),
+                h: ph.load(Ordering::Relaxed),
+            })
+        }) as session::ScreenProbe
+    });
+    spawn_host_with(server, cfg, out, probes).await
+}
+
+/// 同上，但探针由调用方决定（用来复现「源 EOF 之后才发现分辨率变了」这条路径）。
+async fn spawn_host_with(
+    server: &str,
+    cfg: HostConfig,
+    out: Arc<Mutex<Vec<Inject>>>,
+    probes: ProbeFactory,
 ) -> String {
     let mut conn = RvConn::connect(server).await.expect("被控端连不上中继");
     let (device_id, _) = conn
@@ -84,7 +110,6 @@ async fn spawn_host(
     let settings = VideoSettings::from_config(&cfg);
     let addr = conn.server_addr().to_string();
     let ffmpeg = ffmpeg::find_ffmpeg(None).unwrap_or_else(|| std::path::PathBuf::from("ffmpeg"));
-    let (sw, sh) = screen;
 
     tokio::spawn(async move {
         loop {
@@ -93,13 +118,7 @@ async fn spawn_host(
                 Err(_) => break,
             };
             if let ToEndpoint::Incoming { session: sid, client_addr, .. } = msg {
-                let (pw, ph) = (sw.clone(), sh.clone());
-                let probe: session::ScreenProbe = Arc::new(move || {
-                    Some(Screen {
-                        w: pw.load(Ordering::Relaxed),
-                        h: ph.load(Ordering::Relaxed),
-                    })
-                });
+                let probe = probes();
                 let params = SessionParams {
                     state: state.clone(),
                     ffmpeg: ffmpeg.clone(),
@@ -228,6 +247,96 @@ async fn host_resolution_change_rebuilds_client_decoder() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+
+    watcher.shutdown();
+}
+
+/// 抓屏源在「抓取区域比屏幕大」时是**直接退出**（ffmpeg stdout EOF），不是报错。
+///
+/// 2026-10-23 真麒麟实测：把 :0 从 1920x1080 改成 1600x900，会话当场断，
+/// journal 里只有一句「视频源结束」—— 因为 `Ok(None)` 这条分支被当成
+/// 「合成源放完了」直接 return，视频通道跟着关掉，控制端看到 EOF 就退出。
+///
+/// 复现方式：用**有限长度**的 lavfi 源（`duration=1`），它不限速（没加 `-re`），
+/// 所以 1 秒的素材在这个进程里 0.1 秒就跑完 → EOF 在第 1 秒的常规探测**之前**到达。
+/// 于是「发现尺寸变了」只可能发生在 EOF 的那次补探上：要是有人把 `Ok(None)`
+/// 分支改回直接 return，视频通道会在 0.1 秒后就关掉，这里一帧新尺寸都拿不到。
+#[tokio::test]
+async fn source_eof_on_screen_shrink_restarts_encoder() {
+    let Some(ff) = ffmpeg::find_ffmpeg(None) else {
+        eprintln!("跳过：本机没有 ffmpeg");
+        return;
+    };
+    let addr = spawn_server().await;
+    let mut cfg = test_config(&addr);
+    // 有限长度：素材放完 ffmpeg 自己退出 → 被控端读到 Ok(None)
+    cfg.capture = CaptureInput::parse("lavfi:testsrc2=size=320x240:rate=10:duration=1").unwrap();
+    let out = Arc::new(Mutex::new(Vec::<Inject>::new()));
+
+    // 探针一律报「新尺寸」。第一代源 0.1 秒就放完了，1 秒的常规探测根本来不及跑，
+    // 所以这次被问到的一定是 EOF 后的补探（`asked` 用来在失败时把这件事说清楚）。
+    let asked = Arc::new(AtomicU32::new(0));
+    let probes: ProbeFactory = {
+        let asked = asked.clone();
+        Arc::new(move || {
+            let asked = asked.clone();
+            Arc::new(move || {
+                asked.fetch_add(1, Ordering::Relaxed);
+                Some(Screen { w: 480, h: 360 })
+            }) as session::ScreenProbe
+        })
+    };
+    let device_id = spawn_host_with(&addr, cfg.clone(), out.clone(), probes).await;
+
+    let c = timeout(
+        Duration::from_secs(30),
+        connect::connect(&addr, &device_id, &cfg.password, "EOF 测试控制端", vec![]),
+    )
+    .await
+    .expect("连接超时")
+    .expect("连接失败");
+    drop(c.bulk);
+
+    let mut watcher = VideoWatcher::start(c.video, Some(ff))
+        .await
+        .expect("启动解码失败");
+    assert_eq!((watcher.info().w, watcher.info().h), (320, 240));
+
+    // ① 起点：握手时被控端报的画幅是 320x240（第一代的 VideoCfg）
+    assert_eq!((watcher.info().w, watcher.info().h), (320, 240));
+
+    // ② EOF 之后：编码源必须按新尺寸重开，控制端跟着重建解码器。
+    //
+    // 第一代只有 10 帧、而且 lavfi 不限速（0.1 秒就放完），所以「换代前的帧」
+    // 可能在测试开始读之前就被新尺寸盖掉了（watch 通道只留最新一帧）。
+    // 因此这里不断言「先看到 320x240」，只数：真正有判别力的是**新尺寸的帧有没有**。
+    let mut small = 0u32;
+    let mut big = 0u32;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while big < 3 && tokio::time::Instant::now() < deadline {
+        match timeout(Duration::from_secs(10), watcher.next_frame()).await {
+            Ok(Some(f)) => match (f.width, f.height) {
+                (320, 240) => small += 1,
+                (480, 360) => big += 1,
+                other => panic!("出现了第三种画幅 {other:?}"),
+            },
+            _ => break,
+        }
+    }
+
+    let s = watcher.snapshot();
+    eprintln!(
+        "EOF 场景：320x240 {small} 帧 / 480x360 {big} 帧；重建 {} 次；解出 {} / 喂入 {} AU",
+        s.resizes, s.decoded, s.fed
+    );
+    assert!(
+        big >= 3,
+        "源 EOF 之后没有按新尺寸重开（只拿到 {big} 帧 480x360；探针被问了 {} 次）\
+         —— 会话被 EOF 断掉了",
+        asked.load(Ordering::Relaxed)
+    );
+    assert!(s.resizes >= 1, "控制端没有重建解码器");
+    assert_eq!((s.cfg_w, s.cfg_h), (480, 360), "统计里的当前画幅没跟上");
 
     watcher.shutdown();
 }
