@@ -3,7 +3,10 @@
 
 环境：真麒麟 V10 SP1 x86_64（海光 C86），X11 1920x1080，:0 处于 UKUI 锁屏态
       （DISPLAY=:0 xdotool getwindowfocus getwindowname → ukui-screensaver-dialog）
-中继/被控端：systemd 用户单元（M5 用户态装），版本 = 本文件对应的提交
+中继/被控端：systemd 用户单元（M5 用户态装），版本 = 提交 b7d9766
+      （下面第二节的安装实测先在工作区快照上做，收尾又从 HEAD 打包重装了一遍：
+        包 uulan-20261024e，重装后同一台机器再连 29.6 fps / 丢帧 0 / 首帧 264ms，
+        设备 ID 与 host.json sha256 仍未变）
 控制端：两个
   ① 麒麟本机编出来的 uulan-client（本轮新增能力）
   ② Windows 10 上的 uulan-client.exe（对照）
