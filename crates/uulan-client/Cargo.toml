@@ -34,6 +34,11 @@ uulan-bulk = { path = "../uulan-bulk" }
 # - Linux：winit 必须显式开 `x11`；softbuffer 0.4 必须选一个后端特性（x11/wayland/kms），
 #   否则它的 `make_dispatch!` 宏一个分支都不生成，直接 E0004「非穷尽匹配」编译不过。
 #   这个坑只有在真麒麟上编才会暴露（本机 Windows 编得好好的）。
+# - 另外必须带 `x11-dlopen`：麒麟 V10 SP1 的源里 `libx11-dev` 装不上（dev 包比运行时包落后
+#   一个 revision，apt 修不了），于是 `x11.pc` / `X11/*.h` / `libX11.so` 全都没有，
+#   softbuffer 的默认路径（tiny-xlib 链接 libX11 + 找 x11.pc）直接编不过。开 dlopen 后
+#   libX11/libxcb 变成运行期 dlopen，构建期不需要任何 X11 开发文件 —— 控制端在麒麟上
+#   才编得出来。代价：启动时依赖运行库存在，而桌面环境自己就在用它们。
 [target.'cfg(windows)'.dependencies]
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 softbuffer = { version = "0.4", default-features = false }
@@ -41,7 +46,7 @@ softbuffer = { version = "0.4", default-features = false }
 # unix 侧：窗口后端要 x11 特性；libc 供终端 raw 模式 / 问窗口大小用。
 [target.'cfg(unix)'.dependencies]
 winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11"] }
-softbuffer = { version = "0.4", default-features = false, features = ["x11"] }
+softbuffer = { version = "0.4", default-features = false, features = ["x11", "x11-dlopen"] }
 libc = "0.2"
 
 [dev-dependencies]

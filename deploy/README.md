@@ -10,6 +10,10 @@
 ```bash
 bash deploy/make-package.sh --version 0.3.0
 # → /tmp/uulan-0.3.0-x86_64-linux.tar.gz（含 sha256）
+
+# 现场还需要一台麒麟当控制端时，把控制端一起打进包：
+bash deploy/make-package.sh --version 0.3.0 --with-client
+# → 同上，但 bin/ 里多一个 uulan-client（麒麟上原生编出来的那份）
 ```
 
 把包拷到目标机（U 盘 / scp），然后二选一：
@@ -25,7 +29,8 @@ bash install.sh --userland --server 192.168.223.15:21116
 
 `install.sh` 做的事（幂等，可重复跑）：
 
-1. 二进制进 `<prefix>/bin/`（`uulan-server`、`uulan-host`、`uulan-wait-x`）；
+1. 二进制进 `<prefix>/bin/`（`uulan-server`、`uulan-host`、`uulan-wait-x`；
+   包里有 `uulan-client` 时也一起装，它不是服务、不建单元）；
 2. 中继单元：系统装 → `/etc/systemd/system/uulan-server.service`；
    用户态装 → `~/.config/systemd/user/uulan-server.service`；
 3. 被控端 → `~/.config/systemd/user/uulan-host.service`（**两种装法都是用户单元**）；

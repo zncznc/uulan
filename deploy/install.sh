@@ -120,6 +120,14 @@ if [ "$DO_SERVER" = 1 ]; then
 fi
 # 等 X 的小脚本（路径已在预检里确定，这里只落盘）
 install -m 0755 "$WAIT_X" "$PREFIX/bin/uulan-wait-x"
+# 控制端是**可选**的：带 --with-client 打出来的包里有 uulan-client 就装上（不是服务，没有单元）。
+# 它要 winit/softbuffer，只有同款桌面环境编出来的二进制才该装 —— 所以「有就装、没有就跳过」，
+# 缺它不能让整个安装失败（被控端/中继跟它无关）。
+HAVE_CLIENT=0
+if [ -x "$BIN_DIR/uulan-client" ]; then
+    install -m 0755 "$BIN_DIR/uulan-client" "$PREFIX/bin/uulan-client"
+    HAVE_CLIENT=1
+fi
 if [ -d "$HERE/doc" ]; then
     cp -f "$HERE/doc/"*.md "$PREFIX/doc/" 2>/dev/null || true
 fi
@@ -222,5 +230,8 @@ if [ "$DO_HOST" = 1 ]; then
     echo " 设备 ID  : $DEVICE_ID"
     echo " 访问密码 : uulan-host --show   （刻意不写进安装日志）"
     echo " 日志     : journalctl --user -u uulan-host -f"
+fi
+if [ "$HAVE_CLIENT" = 1 ]; then
+    echo " 控制端   : $PREFIX/bin/uulan-client --server $SERVER --device $DEVICE_ID --password-file <文件>"
 fi
 echo "──────────────────────────────────────────────"

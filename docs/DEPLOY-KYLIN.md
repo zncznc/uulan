@@ -662,3 +662,84 @@ bash scripts/verify-install-preflight.sh
 
 （在 git-bash/MSYS 上跑时，正常路径会标 SKIP —— MSYS 的 `install -d -m 0700`
 改目录权限不可靠；以真机上的结果为准。）
+
+## 15. 控制端（uulan-client）在麒麟上编与装（2026-10-24 实测）
+
+以前的结论是「客户端在真机编不了」——这一轮编出来了，**而且不需要 root**。
+M2 的验收标准里那句「控制端同时支持麒麟(Linux)和 Windows」，到这一轮才算有麒麟侧的实证。
+
+### 15.1 两个卡点，两个修法
+
+1. **`tiny-xlib` 找不到 `x11.pc`**（softbuffer 的默认 X11 路径要链接 `libX11` 并读 `x11.pc`）。
+   麒麟源里 `libx11-dev` 装不上（dev 包比运行时包落后一个 revision），所以 `x11.pc`、
+   `X11/*.h`、`libX11.so` 全都没有。修法：`crates/uulan-client/Cargo.toml` 的 unix 段给
+   softbuffer 加 **`x11-dlopen`** 特性（= `tiny-xlib/dlopen` + `x11rb/dl-libxcb`）——
+   libX11/libxcb 变成运行期 `dlopen`，构建期不需要任何 X11 开发文件。
+   代价只有一条：运行时必须有 `libX11.so.6` / `libxcb.so.1`，而桌面环境自己就在用它们。
+2. **`#[link(name = "X11")]` / `#[link(name = "Xtst")]` 仍然要链接期的 `.so`**
+   （`uulan-clip` 的剪贴板后端、`uulan-host` 的 XTest 注入）。以前靠一条
+   「把 `libX11.so.6` 软链成 `libX11.so`」的 root 级系统改动 —— 现场要口令。
+   现在两个 crate 各带一个 `build.rs`：系统里**没有** `libX11.so` 时，在
+   `OUT_DIR/x11-link/` 里把 `libX11.so.6` 软链成 `libX11.so` 并
+   `cargo:rustc-link-search`，普通用户就能编。系统里本来有 `.so`（正常发行版）时
+   什么都不做；非 Linux 构建机直接空转。
+
+   机制本身在这台真机上用一个合成 crate 验过（链接器 `-Wl,-t` 打印的加载路径是
+   `…/shim/libX11.so`，不是系统那份），链接出来的程序 `XOpenDisplay(NULL)` 正常返回。
+   **未验**：把系统软链真的删掉之后的整仓首编 —— 删它要 root，这一步做不到。
+
+### 15.2 编译 / 打包 / 安装
+
+```bash
+export PATH=$HOME/.cargo/bin:$PATH
+cd ~/.local/uulan/src
+cargo build --release -p uulan-server -p uulan-host -p uulan-client   # 实测 30s（增量）
+bash deploy/make-package.sh --with-client --version 20261024d --out ~/pkg
+# → ~/pkg/uulan-20261024d-x86_64-linux.tar.gz（3.8M，bin/ 里有 uulan-client）
+
+cd ~/pkg && tar xzf uulan-20261024d-x86_64-linux.tar.gz
+cd uulan-20261024d-x86_64-linux && bash install.sh --userland --server 192.168.223.15:21116
+# 安装摘要里会多打一行「控制端 : <前缀>/bin/uulan-client …」
+
+# 用法（口令走文件，不要写在命令行上，ps 能看见）
+<前缀>/bin/uulan-client --server 192.168.223.15:21116 --device <设备ID> \
+    --password-file ~/.local/uulan/state/client-pass          # 加 --headless 回命令行
+```
+
+- `--with-client` 是**可选**的：编不出来不该连被控端的包一起打不出来（见 make-package.sh 注释）。
+- 控制端**不是服务**：`install.sh` 只在包里带了 `uulan-client` 时把它拷进 `$PREFIX/bin`，
+  不建 systemd 单元（它是前台交互程序）。
+
+### 15.3 实测数字（2026-10-24，海光 C86 真机，X11 1920x1080，:0 处于锁屏态）
+
+就地重装（服务正在跑）后核到的：
+
+- 设备 ID 805747189 不变；`host.json` sha256 `af65ced5…` 前后一致；MainPID 1051194 → 1054237；
+  `/proc/<pid>/exe` 指向前缀里的 `uulan-host`；`uulan-server`/`uulan-host` 都是 `enabled`。
+- 前缀里的 `uulan-client` 与包内、`target/release` 三者 sha256 一致。
+
+麒麟控制端（在真机上编出来的二进制，连本机中继）：
+
+| 项目 | headless | 开窗 |
+|---|---|---|
+| 实测帧率 | 29.7 fps | — |
+| 首帧 | 256 ms | 346 ms |
+| 解出帧 / 丢帧 | 357 / **0** | 448 / **0** |
+| 平均码率 | 9774 kbps | — |
+| 窗口呈现 | — | **painted=870**（15 s） |
+| 与真机截图比对 | **相关系数 0.9998 / 平均绝对误差 0.50%** | — |
+
+对照（同一时刻的 Windows 控制端）：29.6 fps、首帧 239 ms、丢帧 0、相关系数 0.9998 / 0.50%。
+两端的画面都是那台机器的真实桌面（`:0` 锁屏界面），不是「解出了帧但没画/画错」。
+
+麒麟控制端的终端路径（Linux 客户端的 termios raw 模式，以前只有 Windows 侧验过）：
+
+```bash
+printf 'echo TERM-OK-$((6*7)); exit 3\n' | \
+  script -qec "<前缀>/bin/uulan-client --server <中继> --device <ID> \
+               --password-file <文件> --term --term-shell /bin/bash" /dev/null
+# 输出里有 TERM-OK-42，客户端进程退出码 = 3（shell 的退出码原样回来）
+```
+
+**仍未验**：`:0` 被 UKUI 锁屏挡着，麒麟控制端「往应用里打字/拖拽」没验；
+麒麟↔麒麟的剪贴板整链没验（cron 会话没有交互式剪贴板）。

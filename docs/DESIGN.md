@@ -319,11 +319,11 @@ uulan/
 | 阶段 | 状态 | 交付 | 验收标准（实际达成的） |
 |---|---|---|---|
 | **M1 骨架** | ✅ | workspace 能编译；protocol 单测过；server 能注册设备并配对转发 | `cargo test` 全绿；本机起 server，两端能配对三条通道并盲转发 |
-| **M2 能看见** | ✅ | 被控端采集编码、控制端解码；端到端视频通路 | 进程内端到端测试全绿；**并在真麒麟 V10 SP1 上跑通**：Windows 控制端看到 1920x1080 真实桌面，首帧 216ms、零丢帧、画面与实机截图相关系数 0.9995 |
+| **M2 能看见** | ✅ | 被控端采集编码、控制端解码；端到端视频通路 | 进程内端到端测试全绿；**并在真麒麟 V10 SP1 上跑通**：Windows 控制端看到 1920x1080 真实桌面，首帧 216ms、零丢帧、画面与实机截图相关系数 0.9995。**2026-10-24 补：麒麟控制端也过了同一套验收** —— `uulan-client` 在真机上编得出来（见 M5 小节），headless 29.7 fps / 首帧 256ms / 丢帧 0 / 相关系数 0.9998、MAE 0.50%，开窗 15 s `painted=870` |
 | **M2.5 画好** | ✅ | 窗口 ✅；**键鼠注入 ✅（两端已接，本机全链路 + 真机 XTest 实测）**；**实测帧率上报 ✅**；**剪贴板文本双向 ✅（本机全链路 + 真 Win32；X11 后端已在真机与外部 X 客户端双向验过）**；**分辨率变化重建解码器 ✅（两端都做了，本机全链路实测）** | 能远程操作并双向粘文字、被控端换分辨率后画面自动跟上。真机实测见 `docs/milestones/M3-M4-真机-2026-10-23.txt`（XTest 注入：指针落点精确、keysym 正确、滚轮=按钮5、autorepeat 已还原；X11 剪贴板：与独立 X 客户端双向互通） |
 | **M3 能操作** | ✅ | XTest 注入 + 按键连发处理；`--inject` 脚本化注入（可无人值守验）；uinput 兜底仍未做 | **真机已验**（2026-10-23）：`--inject` 走真链路 → 被控端 XTest → 真 X 服务器；用 `xev`/`xdotool` 当独立判据，坐标/键位/按钮号/配对全对（当次验在另起的 `Xvfb :99` 上）。**同一轮夜间批补验**：`--inject move:640,400` 直接打到真 `:0`，`xdotool getmouselocation` 读到 `x:640 y:400`（注入前 1901,0，已还原）。限制：`:0` 被 UKUI 锁屏挡着，**往应用里打字/拖拽仍未验** |
 | **M4 工具齐全** | 🔄 | **文件传输 ✅**（列/取/送/建/删/改名/哈希 + 路径沙箱 + sha256，真二进制实测 6 MiB 往返一致）；**端口映射 ✅**（bulk 多路复用 + `--forward`，真二进制实测 256 KiB 单流 + 两条并发流逐字节一致）；**终端（PTY）✅ 本机全链路 + 真机 Linux 侧**（真 `/dev/pts`、termios 默认、winsize 下发、退出码 7 原样回来、SIGHUP→SIGKILL 升级日志） | 三项都用真 server + 真被控端 + 真客户端链路验过。终端已上真麒麟验 Linux 独有部分；剪贴板整链（Windows↔麒麟）本轮**未验**（cron 上下文没有交互式剪贴板） |
-| **M5 麒麟落地** | 🔄 | 离线安装包（tar.gz + install.sh + 3 个 systemd 单元）✅、systemd 开机自启 ✅（用户态装实测）、**就地重装（升级）✅**、**安装预检前移 ✅（缺输入不再留半装前缀）**、部署文档 ✅（`deploy/README.md` + `docs/DEPLOY-KYLIN.md` 第 13/14 节） | 真机上 `bash install.sh --userland` 一次装通：中继+被控端都是 `enabled`+`active`、`Linger=yes`、`ExecStartPre` 的 uulan-wait-x 真的等到 `:0`；`systemctl --user kill -s KILL` 后 `NRestarts=1` 自动拉起并重新上线；包内二进制取帧 29.6fps、相关系数 0.9969。见 `docs/milestones/M5-麒麟落地-2026-10-23.txt`。**就地升级已验**（2026-10-24）：在服务正在跑的真机上从离线包装重装 → 设备 ID 与 host.json 一字未变、二进制被替换、KILL 后 systemd 拉起的是前缀里的新二进制、再连 29.2fps/丢帧 0；见 `docs/milestones/M5-就地升级与安装预检-2026-10-24.txt`。**未验**：整机重启后的自启、系统装（root，/opt/uulan）路径（本机 sudo 要口令） |
+| **M5 麒麟落地** | 🔄 | 离线安装包（tar.gz + install.sh + 3 个 systemd 单元）✅、systemd 开机自启 ✅（用户态装实测）、**就地重装（升级）✅**、**安装预检前移 ✅（缺输入不再留半装前缀）**、**控制端可编可装 ✅（`--with-client` 打包 + install.sh 装进前缀，2026-10-24）**、部署文档 ✅（`deploy/README.md` + `docs/DEPLOY-KYLIN.md` 第 13/14/15 节） | 真机上 `bash install.sh --userland` 一次装通：中继+被控端都是 `enabled`+`active`、`Linger=yes`、`ExecStartPre` 的 uulan-wait-x 真的等到 `:0`；`systemctl --user kill -s KILL` 后 `NRestarts=1` 自动拉起并重新上线；包内二进制取帧 29.6fps、相关系数 0.9969。见 `docs/milestones/M5-麒麟落地-2026-10-23.txt`。**就地升级已验**（2026-10-24）：在服务正在跑的真机上从离线包装重装 → 设备 ID 与 host.json 一字未变、二进制被替换、KILL 后 systemd 拉起的是前缀里的新二进制、再连 29.2fps/丢帧 0；见 `docs/milestones/M5-就地升级与安装预检-2026-10-24.txt`。**控制端在麒麟上编+装已验**（2026-10-24，见 `docs/milestones/麒麟控制端-2026-10-24.txt`）：`--with-client` 的包 3.8M、重装后前缀里多出 `uulan-client`（sha 与包内/`target` 三者一致）。**未验**：整机重启后的自启、系统装（root，/opt/uulan）路径（本机 sudo 要口令） |
 | **M6 加固** | 🔄 | **E2E 加密 ✅（本机全链路 + 中继抓包实测）**；临时验证码「用一次即失效」✅ + **每小时自动轮换 ✅（只轮换已存在的码）**+ **运行中的服务能看见 `--new-temp-code` 新写的码 ✅（2026-10-24 真机实测：改前被拒，改后可用且只能用一次）**；**日志脱敏 ✅ 全量**（口令只在终端/`--show` 打；会话票据改成不可逆标签 `tXXXXXXXX`；终端内容/剪贴板只记长度；两个二进制的日志一律走 stderr）；控制端口令可走 `--password-file` / `UULAN_PASSWORD`（不再只能写在 `ps` 能看到的命令行上） | 中继抓包看不到明文内容 —— **已用「记录字节的代理」实测**：clipboard 两个方向共 10978 字节，找不到任何明文；日志脱敏见 `docs/milestones/M6-日志脱敏-2026-10-23.txt`：本机 `RUST_LOG=trace` 134 行日志里口令/票据/终端原文 4 类秘密 0 命中，真机 journal 162 行 0 命中、30 行是标签形态。剩下的是 PAKE（防主动 MITM 离线撞口令） |
 
 ### M5 落地：部署形态（systemd + 离线安装包）
@@ -380,6 +380,24 @@ uulan/
 
 详见 `docs/milestones/M5-就地升级与安装预检-2026-10-24.txt`，升级步骤见
 `docs/DEPLOY-KYLIN.md` 第 14 节。
+
+#### 控制端（麒麟）编得出来、装得进去（2026-10-24）
+
+设计目标一直是「控制端同时支持麒麟和 Windows」，但到这一轮之前，**麒麟侧的二进制从来没存在过**：
+`libx11-dev` 在麒麟源里装不上，`x11.pc` / `X11/*.h` / `libX11.so` 全缺，`cargo build -p uulan-client`
+直接断在 `tiny-xlib` 的 `pkg-config x11` 上。两处修法（都是构建期的事，不动业务代码）：
+
+- **softbuffer 走 dlopen**：unix 段加 `x11-dlopen` 特性（`tiny-xlib/dlopen` + `x11rb/dl-libxcb`），
+  libX11/libxcb 变成运行期 `dlopen`，构建期不需要任何 X11 开发文件。
+- **`#[link(name = "X11")]` 的链接期软链自己造**：`uulan-clip` / `uulan-host` 各加一个 `build.rs`，
+  系统里没有 `libX11.so` 时在 `OUT_DIR/x11-link/` 里软链出这个名字再 `cargo:rustc-link-search`。
+  以前这条路要走 root 改 `/usr/lib`，现场没有 sudo 口令就断在这里。
+
+由此 `make-package.sh --with-client` 能打出带控制端的离线包，`install.sh` 见到包里有
+`uulan-client` 就装进前缀（它不是服务，不建单元）。真机实测：麒麟控制端 headless 29.7 fps /
+首帧 256ms / 丢帧 0 / 与真机截图相关系数 0.9998、MAE 0.50%；开窗 15 s `painted=870`；
+`--term` 里 shell 的 `exit 3` 原样回来。详见 `docs/milestones/麒麟控制端-2026-10-24.txt`
+与 `docs/DEPLOY-KYLIN.md` 第 15 节。
 
 ### M2.5 进行中：控制端窗口（已完成）
 

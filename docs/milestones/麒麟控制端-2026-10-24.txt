@@ -1,0 +1,125 @@
+麒麟控制端（uulan-client）落地与实测 —— 2026-10-24 夜间批
+========================================================
+
+环境：真麒麟 V10 SP1 x86_64（海光 C86），X11 1920x1080，:0 处于 UKUI 锁屏态
+      （DISPLAY=:0 xdotool getwindowfocus getwindowname → ukui-screensaver-dialog）
+中继/被控端：systemd 用户单元（M5 用户态装），版本 = 本文件对应的提交
+控制端：两个
+  ① 麒麟本机编出来的 uulan-client（本轮新增能力）
+  ② Windows 10 上的 uulan-client.exe（对照）
+
+--------------------------------------------------------
+一、本轮解决的问题：控制端在麒麟上编不出来
+--------------------------------------------------------
+
+现象（改前，真机实测）：
+  cargo build --release -p uulan-client
+  → pkg-config exited with status code 1
+     Package x11 was not found ... The system library `x11` required by crate `tiny-xlib`
+
+根因：麒麟源里 libx11-dev 装不上（dev 包依赖 libx11-6 = 2:1.6.9-2kylin1.2，
+系统里是 2:1.6.9-2kylin1.6，dev 落后一个 revision，apt 一律「无法修正错误」）。
+于是 x11.pc / X11/*.h / libX11.so 全都不存在。两条独立的路都会踩到：
+
+  A) softbuffer 的默认 X11 路径 = tiny-xlib 链接期找 X11 + pkg-config 读 x11.pc
+  B) uulan-clip / uulan-host 的 #[link(name = "X11")] / #[link(name = "Xtst")]
+     要链接期有一个叫 libX11.so 的文件（系统里只有 libX11.so.6）
+
+修法：
+  A) crates/uulan-client/Cargo.toml 的 cfg(unix) 段：softbuffer 加 x11-dlopen 特性
+     （= tiny-xlib/dlopen + x11rb/dl-libxcb）。libX11/libxcb 变成运行期 dlopen，
+     构建期不需要任何 X11 开发文件。副作用只有一条：运行时要 libX11.so.6/libxcb.so.1
+     在，而桌面环境自己就在用它们。
+  B) 新增 crates/uulan-clip/build.rs 与 crates/uulan-host/build.rs（同一份逻辑，
+     host 多要一个 Xtst）：系统里没有 libX11.so 时，在 $OUT_DIR/x11-link/ 里把
+     libX11.so.6 软链成 libX11.so，再 cargo:rustc-link-search=native=<该目录>。
+     不需要 root、不改系统目录。系统里本来有 .so 时什么都不做；非 Linux 构建机空转。
+
+B 的机制验证（本机真机，合成 crate，避免「以为行」）：
+  /tmp/lt 里一个只有 #[link(name="X11")] + XOpenDisplay 的小程序，
+  build.rs 把一份 libX11 拷贝软链成私有 shim/libX11.so；
+  RUSTFLAGS=-C link-arg=-Wl,-t 编译，链接器打印的加载路径是
+    /tmp/lt/target/debug/build/linktest-…/shim/libX11.so
+  即 -L 私有目录确实排在系统目录之前、-lX11 从它解析；程序运行 XOpenDisplay(NULL) 正常。
+  **未验**：把系统里那份 libX11.so 真的删掉之后的整仓首编 —— 删它要 root。
+
+--------------------------------------------------------
+二、编译 / 打包 / 安装（真机实测命令）
+--------------------------------------------------------
+
+  export PATH=$HOME/.cargo/bin:$PATH
+  cd ~/.local/uulan/src
+  cargo build --release -p uulan-server -p uulan-host -p uulan-client
+  → Finished release profile in 30.35s，零警告
+
+  bash deploy/make-package.sh --with-client --version 20261024d --out ~/pkg
+  → ~/pkg/uulan-20261024d-x86_64-linux.tar.gz
+    大小 3.8M，sha256 6e063d58fd49c9d3772751d4e4f7eb78a921ba472dca01c68dc4f028017b23c5
+    tar 内容核对：bin/ 里 uulan-client / uulan-host / uulan-server / uulan-wait-x 齐全
+
+  cd ~/pkg && tar xzf uulan-20261024d-x86_64-linux.tar.gz
+  cd uulan-20261024d-x86_64-linux && bash install.sh --userland --server 192.168.223.15:21116
+  → 装完摘要多一行：
+     控制端 : /home/mis/.local/uulan/bin/uulan-client --server 192.168.223.15:21116 --device <ID> --password-file <文件>
+
+就地重装（服务正在跑）后的四项核对：
+  ✓ 设备 ID 805747189 不变
+  ✓ ~/.config/uulan/host.json sha256 af65ced51159617b… 升级前后一致
+  ✓ MainPID 1051194 → 1054237（真的重启过）；NRestarts 5（restart 不算自愈重启）
+  ✓ /proc/<pid>/exe → /home/mis/.local/uulan/bin/uulan-host
+  ✓ uulan-server / uulan-host 都是 enabled
+  ✓ 前缀里的 uulan-client = 包内 = target/release（sha256 75add2b6b71fafc2… 三者一致）
+
+--------------------------------------------------------
+三、麒麟控制端实测数字（连本机中继，127.0.0.1 与 192.168.223.15 都试过）
+--------------------------------------------------------
+
+headless（--headless --seconds 12 --save-frame）：
+  实测帧率   29.7 fps（控制端解出）
+  被控端帧率 29.70 fps（对面 FpsMeter）
+  首帧延迟   256 ms
+  收到 AU    358 / 关键帧 24 / 解出 357
+  解码丢帧   0
+  平均码率   9774 kbps
+  画幅       1920x1080，解码器重建 0 次
+
+开窗（--seconds 15，默认窗口模式）：
+  窗口已就绪 → 窗口已关闭 painted=870 input_sent=0
+  收到 AU 449 / 解出 448 / 丢帧 0 / 首帧 346ms
+  （painted 是**客户端自己数的呈现帧数**，不是「解出帧数」——这条是 M2 验收口径）
+
+逐像素比对（M2 那套方法）：
+  真机截图：DISPLAY=:0 ffmpeg -f x11grab -video_size 1920x1080 -i :0 -frames:v 1 -y /tmp/shot2.ppm
+  控制端最后一帧：--save-frame ~/client-frame2.ppm
+  相关系数 0.9998 / 平均绝对误差 1.28/255 = 0.50%
+  ⇒ 麒麟控制端画出来的确实是那台机器的真实桌面（:0 锁屏界面）
+
+终端（Linux 客户端的 termios raw 模式，以前只有 Windows 侧验过）：
+  printf 'echo TERM-OK-$((6*7)); exit 3\n' |
+    script -qec "<前缀>/bin/uulan-client … --term --term-shell /bin/bash" /dev/null
+  → 输出里有 TERM-OK-42；客户端进程退出码 = 3（shell 的退出码原样回来）
+
+对照（同一时刻，Windows 控制端 → 同一台真机）：
+  29.6 fps / 首帧 239ms / 解出 355 / 丢帧 0 / 码率 9781 kbps
+  相关系数 0.9998 / 平均绝对误差 0.50%
+  （历史基线 29.1 fps / 首帧 146ms ⇒ 无回归；首帧差异来自 :0 画面内容与网络路径）
+
+--------------------------------------------------------
+四、仍未验
+--------------------------------------------------------
+
+1. :0 被 UKUI 锁屏挡着 —— 麒麟控制端「往应用里打字/拖拽」没验；
+   键鼠注入的真机结论仍是 2026-10-23 那份（指针落点/键位/按钮对了，往应用里打字没验）。
+2. 麒麟 ↔ 麒麟的剪贴板整链没验（cron 会话没有交互式剪贴板，两端都拿不到）。
+3. 「系统里真的没有 libX11.so」状态下的整仓首编没验（删系统软链要 root）。
+4. 整机重启后的自启、root 系统装（/opt/uulan）仍然要一次带 sudo 口令的人工验收。
+5. M6 只剩 PAKE（防主动 MITM 的离线撞口令），需要审计过的实现，不适合无人值守夜里动。
+
+--------------------------------------------------------
+五、下一步
+--------------------------------------------------------
+
+1. M6 PAKE：先确认能取到经过审计的实现（SPAKE2 / OPAQUE 的成熟 crate），
+   再同步升协议版本（v2 → v3），两端 + 中继同批换。
+2. 有人在的时段跑一次：:0 解锁后验「往应用里打字/拖拽」+ Windows ↔ 麒麟剪贴板整链。
+3. 现场落地收尾：整机重启自启、root 系统装（要 sudo 口令，人工一次）。
