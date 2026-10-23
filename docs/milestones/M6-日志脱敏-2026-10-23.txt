@@ -1,0 +1,129 @@
+M6 收尾：日志脱敏全量 + 会话票据脱敏 + 控制端口令不走命令行
+验收日期：2026-10-23（夜间批，真麒麟 + 本机）
+提交：dfddef2（代码） / 见本轮后续 docs 提交
+
+============================================================
+一、这一轮改了什么（以及为什么不是「照着清单打勾」）
+============================================================
+
+1) 会话票据（session token）从日志里拿掉
+
+   `gen_session()` 生成的是 32 个十六进制字符、**60 秒有效**的配对凭据：
+   谁拿到它，谁就能在窗口期内拨 relay 的三条通道。而它原来被原样打进了 5 处日志
+   （服务端 3 处、被控端 1 处、控制端 1 处）。journal 恰好是最容易被贴进工单的东西
+   （`journalctl --user -u uulan-host` 一行命令就能导出）。
+
+   做法：新增 `uulan_protocol::redact::tag()` = `t` + SHA-256 前 4 字节（8 个十六进制）。
+   - 稳定：同一票据在任何进程里得到同一个标签 → 服务端与被控端的日志仍然能对上；
+   - 不可逆：反推不出票据；
+   - 实测形态：`session=t07058fa3`。
+
+2) 控制端口令不再只能写在命令行上
+
+   `--password xxx` 在 Linux 上对同机任何用户都是 `ps` 里可读的，在 Windows 上会进
+   PowerShell 历史、被截图贴进工单。而**一次性临时码**恰恰是「发给别人、赶紧连一次」的东西，
+   最经不起这么抄。新增：
+
+   - `--password-file <文件>`：取首行、去首尾空白（口令文件常带 CRLF / 尾随空格）；
+     首行是空的就报错，不拿第二行顶上。
+   - 环境变量 `UULAN_PASSWORD`：文件也不方便时的兜底。
+   - 优先级：`--password` > `--password-file` > `UULAN_PASSWORD`。
+   - 实现是纯函数 `resolve_password(cli, file, env)`，4 条单测钉住优先级/裁剪/空文件/不存在的文件。
+
+3) 日志一律走 stderr，stdout 只放数据
+
+   两个二进制原本都用 `tracing_subscriber::fmt()` 的默认 writer（stdout）。后果不是理论问题：
+   `RUST_LOG=info uulan-client --term > out.bin` 会把 `INFO ... 鉴权通过` 混进 PTY 字节流，
+   而终端字节流是要被程序消费的（脚本、日志重放）。现在 host/client 都显式
+   `.with_writer(std::io::stderr)`；stdout 只留终端字节、目录列表、统计 JSON、凭据横幅。
+
+4) 新增验收脚本 `scripts/verify-log-hygiene.sh`
+
+   `RUST_LOG=trace` 全量跑一次真会话（文件列目录 + 终端跑一条带金丝雀的命令 + 键鼠注入），
+   然后在 5 份日志里搜 4 类秘密；并且**反向断言「这一轮确实发生了」**（有会话、有终端、
+   有文件操作），否则「搜不到」可能只是没发生。
+
+============================================================
+二、本机实测数字（可重复）
+============================================================
+
+cargo test --workspace        341 passed / 0 failed / 1 ignored   （本轮基线 332，+9）
+                              0 警告
+cargo build --release         0 警告
+
+python 单测分布：uulan-protocol +63（含 redact 5 条）、uulan-client bin +4（口令来路）
+
+bash scripts/verify-log-hygiene.sh
+  日志行数合计：134（RUST_LOG=trace：server 38 / host 86 / client 10）
+  ✓ 访问密码原值：0 次命中
+  ✓ 访问密码原值（按字段名 "password":"..."）：0 次命中
+  ✓ 终端命令金丝雀（HYGIENE-<ts>-Zq7）：0 次命中
+  ✓ 会话票据原值（旧格式 session=<32 hex>）：0 次命中
+  ✓ 被控端日志里会话是标签形态（tXXXXXXXX）
+  ✓ 终端 stdout 干净：没有日志行混进 PTY 字节流
+  ✓ 确有会话建立 / 确有终端会话 / 确有文件操作（不是空跑）
+
+回归（改了 client/host 的日志与口令入口，这四条必须重跑）：
+  verify-window-e2e.sh    painted=789 / 收到 AU 1787 / 关键帧 120 / 解出 1743 / 丢帧 0 / 首帧 57ms
+  verify-files-e2e.sh     6 MiB 往返 sha256 一致
+  verify-portmap-e2e.sh   262144 字节单流 + 128K/192K 两条并发流，逐字节一致
+  verify-term-e2e.sh      真 ConPTY + 真 cmd.exe，退出码 7 原样回来，stdout 只有 PTY 字节
+  verify-clipboard-e2e.sh SKIP（cron 上下文里 Set-Clipboard/Get-Clipboard 都失败，剪贴板不是文本）
+
+============================================================
+三、真麒麟实测（192.168.223.15 / mis-pc / V10 SP1 / 海光 C86 / X11 1920x1080）
+============================================================
+
+部署方式是 `--userland` 那套 systemd 用户单元（上一轮装好的），本轮只换二进制：
+
+  从 HEAD（dfddef2）打包 → scp → 真机换源码（保留 target/）→
+  cargo build --release -p uulan-server -p uulan-host   → 31.6s，0 警告
+  cp target/release/uulan-{server,host} ~/.local/uulan/bin/
+  systemctl --user kill -s KILL uulan-server / uulan-host（cron 里 restart 被拦，用 KILL 让
+  Restart=always 自己拉起）
+  → is-active: active / active；uulan-host MainPID 920960 / NRestarts=2
+
+① 画面（12 秒会话，Windows 控制端 → 真机）
+   收到 AU 359 / 关键帧 24 / 解出 356 帧 / **解码丢帧 0** / 首帧 **224 ms**
+   平均码率 9798 kbps / 实测 **29.7 fps** / 被控端自报 **30.00 fps** / 1920x1080
+   与真机 :0 截图逐像素比对：**相关系数 0.9993，平均绝对误差 1.30/255 = 0.51%**
+   （对比 2026-10-22 的基线 0.9982 / 0.71%，没有回归）
+
+② 文件传输（真机 ext4）
+   put 2 MiB 随机字节 → `sha256sum ~/uulan-ktest.bin` = 827c2ea90600…（与本地一致）
+   get 回来 → 本地 sha256 与源文件一致；--ls ~/ 能看到该文件
+
+③ 端口映射（真机 sshd）
+   `--forward 127.0.0.1:2222:127.0.0.1:22` → 本机连 2222 收到
+   `SSH-2.0-OpenSSH_8.2p1 Ubuntu-4kylin3k0.11`（真机 sshd 的 banner，逐字节来自对端）
+
+④ 终端（真 PTY）
+   tty → /dev/pts/1；`echo UULAN-REAL-$((6*7))` → UULAN-REAL-42；
+   stty: rows 30 columns 120；客户端退出码 7（= 远端 shell 的退出码）；stdout 无日志污染
+
+⑤ 日志脱敏（真机 journal，从重新部署时刻 22:20 起算）
+   journal 行数 162
+   raw_token_hits（session=<32 hex>）= **0**
+   tag_lines（session=tXXXXXXXX）= **30**
+   password_hits = **0**；tempcode_hits = **0**
+   ⚠ 历史日志里仍有 15 行**旧格式票据**（2026-10-22 21:27–21:29，改前的二进制写的）。
+     已经写进 journal 的东西改不回来；现场要么 `journalctl --user --vacuum-time=1d`，
+     要么接受「这 15 张票据在写入时就已过期」（票据只活 60 秒）。
+
+⑥ 键鼠注入（新增：真的打进了 :0，不是 Xvfb）
+   `--inject "move:640,400"` → 独立判据 `xdotool getmouselocation` 读到 `x:640 y:400`；
+   注入前是 `x:1901 y:0`，注入后已还原。`xset q` 显示 auto repeat 仍是 on。
+   **仍未验**：往应用里打字 / 拖拽 —— `:0` 仍被 `ukui-screensaver-dialog` 锁着（截图为锁屏壁纸）。
+
+============================================================
+四、仍未验（照实写）
+============================================================
+
+- **M5 整机重启后的自启**：`sudo -n -l` 在真机上就是「需要密码」，`systemctl reboot` 走 polkit
+  也要认证；无人值守的夜里没法重启那台机器（也不该动别人的桌面会话）。
+- **root 系统装路径**（/opt/uulan）：同上，没有 sudo 口令。
+- **Windows ↔ 麒麟剪贴板整链**：cron 上下文里 `Get-Clipboard` 直接失败
+  （「打开剪贴板时发生错误」），`Set-Clipboard` 同理 → 驱动不了这条链路。
+  X11 侧的 owner/requestor 双向已在 2026-10-23 用独立 X 客户端验过。
+- **:0 真实桌面上的打字/拖拽**：锁屏挡着（见上）。
+- **Linux 控制端**：真机上编不了（winit/softbuffer 要 x11.pc，libx11-dev 在麒麟源里装不上）。

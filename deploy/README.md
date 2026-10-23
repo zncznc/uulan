@@ -92,7 +92,7 @@ systemctl --user is-active uulan-host
 DISPLAY=:0 xdpyinfo | grep dimensions
 
 # 3) 从控制端取一帧并与真机截图比对（M2 的方法，见 docs/DEPLOY-KYLIN.md）
-uulan-client --server 192.168.223.15:21116 --device <ID> --password <口令> \
+uulan-client --server 192.168.223.15:21116 --device <ID> --password-file pw.txt \
   --headless --seconds 12 --save-frame D:/uulan-bin/x.ppm
 ```
 

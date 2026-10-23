@@ -521,7 +521,12 @@ systemctl --user kill -s KILL uulan-host
 # journal 里重新出现「已用原有设备 ID 上线 device_id=805747189」
 ```
 
-**未验**：整机重启后的自启（要 `sudo reboot`，本机 sudo 要口令，也没有去动用户的桌面会话）。
+**未验**：整机重启后的自启、root 系统装路径（都要 root）。
+2026-10-23 夜间批复核过：真机上 `sudo -n -l` 直接回「需要密码」，`systemctl reboot` 走 polkit
+也要认证 —— 无人值守不能重启那台机器（也不该动别人的桌面会话）。
+有 root 口令的人可以这样收尾：`sudo systemctl reboot`，等 40 秒，再
+`systemctl --user is-active uulan-server uulan-host` + `loginctl show-user mis | grep Linger`；
+预期两个单元都自己起来、`ExecStartPre` 等到 `:0` 就绪。
 
 ### 13.3 为什么被控端必须是用户单元
 
@@ -542,6 +547,24 @@ journalctl --user -u uulan-host --no-pager | grep -cF "$PW"    # → 0
 ```
 
 journal 里的横幅是：`访问密码: （已隐藏 —— 输出不是终端；在终端里跑 uulan-host --show 查看）`。
+
+### 13.4b 会话票据脱敏（2026-10-23 真机复核）
+
+会话票据（32 个十六进制字符、60 秒有效的配对凭据）以前是原样打进 journal 的。
+现在日志里只有 `session=tXXXXXXXX`（`t` + SHA-256 前 4 字节），两端的标签能对上、但拿不回票据。
+
+真机复核（从换上带脱敏的二进制那一刻起算）：
+
+```bash
+journalctl --user -u uulan-host -u uulan-server --since "2026-10-23 22:20:00" --no-pager | ...
+  journal_lines=162   raw_token=0   tag_lines=30   password_hits=0
+```
+
+⚠ 换成新二进制**之前**写下的 15 行里仍是旧格式票据（2026-10-22 21:27–21:29）。
+日志写出去就收不回来，现场要么 `journalctl --user --vacuum-time=1d`，要么接受它。
+
+顺带一条现场经验：控制端**别用 `--password`**，用 `--password-file`（取首行）或
+环境变量 `UULAN_PASSWORD` —— 命令行参数在 `ps` 里对同机所有用户可读。
 
 ### 13.5 这一节踩到的坑
 

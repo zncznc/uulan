@@ -80,8 +80,9 @@ export DISPLAY=:0
 ./target/release/uulan-host --server <中继IP>:21116 --name 我的电脑
 
 # 控制端（图形窗口；--headless 走纯命令行，适合脚本）
+# 口令别放命令行（会进 ps / shell 历史）：用 --password-file <文件> 或 UULAN_PASSWORD
 ./target/release/uulan-client --server <中继IP>:21116 \
-  --device <9位设备ID> --password <访问密码>
+  --device <9位设备ID> --password-file ~/.config/uulan/client-pw.txt
 ```
 
 首次运行被控端会自动生成 12 位访问密码并落盘（权限 0600），设备 ID 由中继分配。
