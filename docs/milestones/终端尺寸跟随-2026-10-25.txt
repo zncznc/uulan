@@ -1,0 +1,64 @@
+终端尺寸跟随（终端尺寸变了，远端 PTY 跟着变）
+======================================================================
+日期：2026-10-25（夜间批）
+代码：crates/uulan-client/src/termx.rs（SizeWatch / local_size / 尺寸轮询任务）、
+      crates/uulan-client/src/main.rs（--term-size 给了就不跟随）
+被控端：无改动 —— `TermOp::Resize` 早就实现（host term.rs 落到 MasterPty::resize）。
+
+为什么做
+--------
+DESIGN「已知限制」里原来写着「终端不会跟随控制端窗口大小变化：行列只在开会话时发一次，
+改窗口之后 vim/top 的排版还是按旧尺寸，要重开会话。第一版不做 SIGWINCH 跟随
+（控制端 unix 分支在本机编不了，写了也验不了）」。
+
+这条理由在 2026-10-24 之后不成立了：控制端已经能在麒麟上编出来、也能验（见
+docs/milestones/麒麟控制端-2026-10-24.txt）。所以这一轮把它接上。
+
+做法（三个决定）
+----------------
+1. 轮询 300 ms，不接 SIGWINCH：Windows 没有这个信号（那边只能问
+   GetConsoleScreenBufferInfo），而信号处理器里不能碰 tokio（async-signal-safe），
+   真接得再造一条自我唤醒的管道。轮询只在**尺寸变化时**发消息，空闲时零字节开销。
+2. 纯逻辑单独一层 `termx::SizeWatch`，盯三条规则：0 不是尺寸（是问不到）、
+   问不到 ≠ 变了、同一个尺寸不重复发。规则错任何一条，远端要么排版崩（0 行列），
+   要么每 300 ms 收一条无意义的 resize。规则都在状态机里，所以 Windows 上单测就能钉住。
+3. 基线 = 已经发出去的那个：SizeWatch::new(initial) 用的是开会话时真正下发的行列。
+
+测试（本机，Windows / GNU 工具链）
+----------------------------------
+cargo test --workspace          353 passed / 0 failed / 1 ignored，零警告
+  （基线 350 + 本轮新增 3 条：size_watch_reports_only_changes、
+    size_watch_ignores_zero_and_never_sends_zero、
+    resize_via_handle_reaches_the_pty）
+cargo test -p uulan-client --test term_path   5 passed（含新加的那条，
+  走的是尺寸跟随任务真正用的 CloseHandle::resize，不是 TermLink::resize）
+cargo build --release           零警告
+
+真机实测（2026-10-25 01:2x，麒麟 V10 SP1 / 海光 C86 / X11 1920x1080）
+--------------------------------------------------------------------
+链路：python pty 起**真** uulan-client --term（麒麟本机，target/release 从本轮工作区编）
+      → 真 uulan-server（systemd 用户单元）→ 真 uulan-host（同上）→ 真 PTY 里的 bash。
+
+  scripts/verify-term-size-follow.py --bin target/release/uulan-client \
+      --server 192.168.223.15:21116 --device 805747xxx --password-file <0600>
+
+  跟随 : 初始 30x100=True  改 132x43 后=True  日志通知=1  退出码=0
+  钉死 : 初始 24x80=True   本地改 132x43 后仍是 24x80=True  日志通知=0  退出码=0
+  结果 : PASS
+
+判据解释：
+- 「初始 30x100」= 本地 pty 100 列 30 行时，远端 `stty size` 输出 `30 100`（行在前）。
+- 「改 132x43 后」= 只改本地 pty 的 winsize（ioctl TIOCSWINSZ），客户端在 300 ms 内
+  发现变化并下发 term_resize，远端 bash 的 `stty size` 变成 `43 132`。
+- 「钉死」对照组是必须的：--term-size 80x24 时本地怎么改远端都是 `24 80`，
+  证明「跟随」是新加的行为，不是远端本来就在乱报。
+
+未验
+----
+- **Windows 控制端的控制台尺寸读取**（GetConsoleScreenBufferInfo 那条）**没有实机验**：
+  无人值守 cron 会话没有交互式控制台（stdout 是文件），local_size() 必然返回 None，
+  这条路只在「人在真终端里跑」时才走。逻辑上是 `if GetConsoleScreenBufferInfo == 0 { None }`，
+  退化成「不跟随」，不会误发 0 行列。
+- 控制端窗口模式（--term 是命令行模式）下的窗口拖拽没有反复手测，只测了 pty winsize 这一层；
+  xterm 之类的仿真器拖窗口走的是同一条 TIOCGWINSZ，语义一致。
+- 麒麟上没验 `vim`/`top` 里的实际重排观感（只验了 PTY 的行列数），属于人眼项。

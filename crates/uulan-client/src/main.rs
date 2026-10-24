@@ -356,7 +356,9 @@ async fn main() -> Result<()> {
             cols: args.term_size.map(|s| s.0).unwrap_or(0),
             rows: args.term_size.map(|s| s.1).unwrap_or(0),
         };
-        let code = uulan_client::termx::run(c.control, opts).await?;
+        // 用户显式给了 --term-size 就钉死，不再跟随本机窗口（脚本化验证要的是确定的行列）。
+        let follow = args.term_size.is_none();
+        let code = uulan_client::termx::run(c.control, opts, follow).await?;
         std::process::exit(code);
     }
 

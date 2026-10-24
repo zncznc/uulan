@@ -204,6 +204,19 @@ async fn resize_reaches_the_pty() {
     link.finish().await;
 }
 
+/// 尺寸跟随任务（和看门狗一样）用的是 `CloseHandle::resize` 而不是 `TermLink::resize` ——
+/// 那条路径也要真的落到 PTY 上，否则「本机窗口变了、远端没反应」这种 bug 只能靠人眼看出来。
+#[tokio::test]
+async fn resize_via_handle_reaches_the_pty() {
+    let mut link = harness(Options { shell: None, cols: 80, rows: 24 }).await;
+    let h = link.closer();
+    h.resize(132, 43).await.expect("发 resize 失败");
+    link.input(b"size\n").await.expect("发输入失败");
+    let seen = output_until(&mut link, "132x43").await;
+    assert!(seen.contains("132x43"), "假 shell 报的窗口大小应当是新值，实际 {seen:?}");
+    link.finish().await;
+}
+
 /// 主动关闭要收到退出事件（不然控制端会以为会话还活着，窗口永远不关）。
 #[tokio::test]
 async fn closing_reports_the_exit() {

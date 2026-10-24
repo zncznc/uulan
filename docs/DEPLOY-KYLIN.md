@@ -271,7 +271,7 @@ Error: 期望 Pong，收到 Incoming {...}
 | 剪贴板双向 | ✅ 文本双向（Win32 + X11）；**真机 X11 与外部 X 客户端双向互通已验**。整链 Windows↔麒麟在无人值守会话里验不了（cron 没有交互式剪贴板） |
 | 文件传输 | ✅ 真二进制 6 MiB 往返 sha256 一致 |
 | 端口映射 | ✅ 真二进制 256 KiB 单流 + 两条并发流逐字节一致 |
-| 终端（PTY） | ✅ 本机真 PTY + **真麒麟**（`/dev/ptmx`、termios、winsize、退出码、SIGHUP→SIGKILL） |
+| 终端（PTY） | ✅ 本机真 PTY + **真麒麟**（`/dev/ptmx`、termios、winsize、退出码、SIGHUP→SIGKILL）；**尺寸跟随 ✅ 真机验**（本地窗口 100x30→132x43，远端 `stty size` 同步变，`--term-size` 钉死时不跟随） |
 | 分辨率变化后重建解码器 | ✅ 两端都做了，本机全链路实测（真机分辨率热切未验） |
 | `actual_fps` | ✅ 被控端 1 秒窗口 `FpsMeter`，每 2 秒用 `VideoCfg.actual_fps` 推（真机自报 30.0 fps） |
 | 端到端加密 + PAKE | ✅ 强制加密（协议 v3 / 加密层 v2）；主动 MITM 既解不开也撞不了口令 |

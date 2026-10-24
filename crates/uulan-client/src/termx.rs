@@ -49,7 +49,7 @@ impl Options {
     /// 分辨率定下来：给了就用，没给就问本机终端，问不到用 120x30。
     fn resolved(mut self) -> Self {
         if self.cols == 0 || self.rows == 0 {
-            let (c, r) = detect_size().unwrap_or((120, 30));
+            let (c, r) = local_size().unwrap_or((120, 30));
             self.cols = c;
             self.rows = r;
         }
@@ -212,7 +212,8 @@ impl TermLink {
     }
 }
 
-/// 只能发「关闭会话」的句柄：看门狗要在别的任务里关会话，但又不需要整套 `TermLink`。
+/// 只会发「改尺寸 / 关会话」的句柄：看门狗和尺寸跟随都要在**别的任务**里动这个会话，
+/// 但又不需要整套 `TermLink`（那个还握着读任务和消息队列）。
 pub struct CloseHandle {
     tx: mpsc::Sender<ToHost>,
     id: u32,
@@ -225,17 +226,59 @@ impl CloseHandle {
             .await
             .map_err(|_| anyhow::anyhow!("控制通道已关闭"))
     }
+
+    /// 通知被控端改 PTY 大小（本机窗口变了）。
+    pub async fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        self.tx
+            .send(ToHost::Json(C2H::Term(TermOp::Resize { id: self.id, cols, rows })))
+            .await
+            .map_err(|_| anyhow::anyhow!("控制通道已关闭"))
+    }
 }
 
 /// 本机 stdin 结束后，等远端 shell 自己退出最多这么久，然后强制关会话。
 const EOF_GRACE: Duration = Duration::from_secs(3);
 
+/// 轮询本机终端尺寸的间隔。空闲时零开销（只在变化时发消息），所以可以问得勤一点。
+const SIZE_POLL: Duration = Duration::from_millis(300);
+
 /// 交互式终端：把本机 stdin/stdout 接到远端 PTY 上，返回远端 shell 的退出码。
-pub async fn run(control: SecControl, opts: Options) -> Result<i32> {
+pub async fn run(control: SecControl, opts: Options, follow_size: bool) -> Result<i32> {
+    // 开会话时用的行列就是尺寸跟随的**基线**：之后只有真的变了才发 `term_resize`，
+    // 否则一连上就多发一条，远端会以为自己尺寸变了、白重排一次。
+    let opts = opts.resolved();
+    let initial = (opts.cols, opts.rows);
     let mut link = TermLink::open(control, opts).await?;
 
     // raw 模式必须在**本函数作用域**里进出：Drop 时还原，否则崩溃留下一个不回显的终端。
     let _raw = RawMode::enter();
+
+    // 本机终端尺寸跟随：轮询本机窗口大小，变了就发一条 `term_resize`。
+    //
+    // 为什么轮询而不是接 `SIGWINCH`：一是 Windows 上根本没这个信号（那边靠
+    // `GetConsoleScreenBufferInfo` 问），二是信号处理器里不能碰 tokio（async-signal-safe），
+    // 真接起来得再造一个管道把自己叫醒，收益不抵复杂度。轮询只在**尺寸变化时**发消息，
+    // 空闲时一个字节都不发；300 ms 的延迟人眼看不出来。
+    // 用户显式给了 `--term-size` 就不跟随（他要的就是钉死的行列，比如脚本化验证）。
+    let size_task = if follow_size {
+        let h = link.closer();
+        Some(tokio::spawn(async move {
+            let mut w = SizeWatch::new(initial);
+            let mut tick = tokio::time::interval(SIZE_POLL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                if let Some((cols, rows)) = w.observe(local_size()) {
+                    if h.resize(cols, rows).await.is_err() {
+                        break; // 控制通道没了，这条任务也没意义
+                    }
+                    info!(cols, rows, "本机终端尺寸变了，已通知被控端");
+                }
+            }
+        }))
+    } else {
+        None
+    };
 
     // stdin 用 std 线程读（tokio 的 stdin 在 Windows 上不可用，而且这里本来就是阻塞语义）。
     let (in_tx, mut in_rx) = mpsc::channel::<Option<Vec<u8>>>(32);
@@ -312,6 +355,9 @@ pub async fn run(control: SecControl, opts: Options) -> Result<i32> {
         }
     };
 
+    if let Some(t) = size_task {
+        t.abort();
+    }
     link.finish().await;
     Ok(code)
 }
@@ -393,19 +439,110 @@ impl Drop for RawMode {
     }
 }
 
-/// 问本机终端有多大。问不到返回 `None`（调用方用 120x30 兜底）。
-fn detect_size() -> Option<(u16, u16)> {
+/// 终端尺寸跟随的纯逻辑：记住「上次告诉被控端的是多少」，只在真变了时给出新值。
+///
+/// 单独抽出来是为了能在本机（没有真终端、没有 X11）用单测钉住规则：
+/// 「0 不是尺寸」「问不到 ≠ 变了」「同一个尺寸不重复发」。这三条错任何一条，
+/// 远端要么排版崩掉（0 行列），要么每 300 ms 收一条无意义的 resize。
+#[derive(Debug)]
+pub struct SizeWatch {
+    last: (u16, u16),
+}
+
+impl SizeWatch {
+    /// `initial` 必须是**开会话时实际发过去的**行列，否则第一条就是假的变化。
+    pub fn new(initial: (u16, u16)) -> Self {
+        Self { last: initial }
+    }
+
+    /// 观察一次本机尺寸，返回要发给被控端的新尺寸；没变 / 无效 / 问不到都是 `None`。
+    pub fn observe(&mut self, cur: Option<(u16, u16)>) -> Option<(u16, u16)> {
+        let (cols, rows) = cur?;
+        // 0 是「问不到」，不是「变成 0 列」—— 发过去远端 PTY 里的程序排版会崩。
+        if cols == 0 || rows == 0 {
+            return None;
+        }
+        if (cols, rows) == self.last {
+            return None;
+        }
+        self.last = (cols, rows);
+        Some((cols, rows))
+    }
+}
+
+/// 问本机终端有多大（先问 stdout，再问 stdin）。问不到返回 `None`。
+///
+/// 管道 / 重定向 / 没有控制台时就是 `None`，调用方（`Options::resolved`）用 120x30 兜底、
+/// 尺寸跟随当「没变」处理 —— 否则 `--term > out.txt` 会被当成「窗口是 0 列」。
+fn local_size() -> Option<(u16, u16)> {
     #[cfg(unix)]
     unsafe {
-        let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
-            return Some((ws.ws_col, ws.ws_row));
+        // 先问 stdout：`--term > 文件` 时 fd 0 可能还是 tty、而写出去的是文件，
+        // 但两者指向同一个终端窗口，所以哪个问得到就用哪个。
+        for fd in [1, 0] {
+            let mut ws: libc::winsize = std::mem::zeroed();
+            if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
+                return Some((ws.ws_col, ws.ws_row));
+            }
         }
         None
     }
     #[cfg(not(unix))]
     {
-        None
+        windows_console_size()
+    }
+}
+
+/// Windows：问控制台**窗口**多大（不是缓冲区多大 —— 缓冲区常常比窗口宽得多）。
+///
+/// 只用两个 kernel32 调用，所以不为此引 `windows-sys`：控制端的依赖表已经够长，
+/// 离线打包的机器上多一个 crate 就是多一份可能缺失的东西（与 host 侧手写 X11 绑定同一套考虑）。
+#[cfg(windows)]
+fn windows_console_size() -> Option<(u16, u16)> {
+    use std::ffi::c_void;
+    #[repr(C)]
+    struct Coord {
+        x: i16,
+        y: i16,
+    }
+    #[repr(C)]
+    struct SmallRect {
+        left: i16,
+        top: i16,
+        right: i16,
+        bottom: i16,
+    }
+    #[repr(C)]
+    struct Csbi {
+        size: Coord,
+        cursor: Coord,
+        attrs: u16,
+        window: SmallRect,
+        max: Coord,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(which: u32) -> *mut c_void;
+        fn GetConsoleScreenBufferInfo(h: *mut c_void, info: *mut Csbi) -> i32;
+    }
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    // SAFETY: 只读控制台信息；`info` 是 zeroed 的本地结构，返回后立刻取字段。
+    unsafe {
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        if h.is_null() {
+            return None;
+        }
+        let mut info: Csbi = std::mem::zeroed();
+        if GetConsoleScreenBufferInfo(h, &mut info) == 0 {
+            return None;
+        }
+        let cols = info.window.right - info.window.left + 1;
+        let rows = info.window.bottom - info.window.top + 1;
+        if cols > 0 && rows > 0 {
+            Some((cols as u16, rows as u16))
+        } else {
+            None
+        }
     }
 }
 
@@ -440,6 +577,28 @@ mod tests {
         assert!(answers_dsr(&mut tail, &[b'6', b'n']), "跨帧的 DSR 必须认出来");
         let mut tail = Vec::new();
         assert!(!answers_dsr(&mut tail, b"ls -l\r\nno escape here"));
+    }
+
+    #[test]
+    fn size_watch_reports_only_changes() {
+        let mut w = SizeWatch::new((100, 30));
+        // 开会话时已经把这个尺寸发过去了，第一次观察不能又发一条。
+        assert_eq!(w.observe(Some((100, 30))), None);
+        assert_eq!(w.observe(Some((132, 43))), Some((132, 43)));
+        assert_eq!(w.observe(Some((132, 43))), None, "同一个尺寸不该重复发");
+        // 问不到大小不能清掉基线，否则下一次「还是 132x43」会被误判成又变了。
+        assert_eq!(w.observe(None), None);
+        assert_eq!(w.observe(Some((132, 43))), None);
+        assert_eq!(w.observe(Some((80, 24))), Some((80, 24)));
+    }
+
+    #[test]
+    fn size_watch_ignores_zero_and_never_sends_zero() {
+        let mut w = SizeWatch::new((80, 24));
+        // 0 是「问不到」，不是「变成 0 列」：发过去远端 PTY 里的程序排版会崩。
+        assert_eq!(w.observe(Some((0, 24))), None);
+        assert_eq!(w.observe(Some((80, 0))), None);
+        assert_eq!(w.observe(Some((80, 24))), None, "0 不能污染基线");
     }
 
     #[test]
