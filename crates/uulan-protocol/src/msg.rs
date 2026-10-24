@@ -58,12 +58,14 @@ pub struct HostHelloOk {
 pub enum C2H {
     Hello(ClientHello),
 
-    /// 口令证明。走到这一步之前，被控端不应处理任何输入消息。
+    /// 口令证明，**一组**：被控端可能有几个候选凭据（永久口令 + 临时码），
+    /// 控制端不知道是哪一个，就按 `PakeResp.ybs` 的顺序各给一份。
     ///
-    /// **不是密码明文**：`HMAC-SHA256(K, "uulan-auth-v1"||"uulan-auth-c1"||转录哈希||口令)`。
-    /// K 是端到端握手派生出来的会话密钥（见 [`crate::crypto`]），所以中继拿到的只是一个
-    /// 认不出来的十六进制串 —— 更不能靠它重放（每次都换临时密钥）。
-    Auth { proof: String },
+    /// `proofs[i]` = `HMAC-SHA256(会话密钥_i, "uulan-auth-v2"||"uulan-auth-c2"||转录哈希)`，
+    /// 而 `会话密钥_i` 里混了 PAKE 的共享点。所以中继拿到的是一串
+    /// **没法离线校验口令**的十六进制串：要对某个口令算证明，它得先在线跟被控端跑一轮 PAKE。
+    /// 走到这一步之前，被控端不应处理任何输入消息。
+    Auth { proofs: Vec<String> },
 
     // ── 输入 ──
     MouseMoveAbs { x: f32, y: f32 },
@@ -240,10 +242,12 @@ pub enum PortMapOp {
 pub enum H2C {
     HelloOk(HostHelloOk),
 
-    /// 鉴权成功。`proof` 是被控端的口令证明（标签 `uulan-auth-h1`）。
+    /// 鉴权成功。`idx` 是命中的候选序号（控制端据此挑出那一把会话密钥，
+    /// 并决定要不要把那把密钥用在后续所有通道上）；`proof` 是被控端的口令证明
+    /// （标签 `uulan-auth-h2`）。
     ///
     /// 控制端**必须**校验它：不校验的话，中继可以冒充被控端，把用户的键盘与文件收走。
-    AuthOk { proof: String },
+    AuthOk { idx: u32, proof: String },
     AuthFail { reason: AuthFailReason, retry_after_ms: u64 },
 
     /// 编码器已（重）启动，参数以此为准。
@@ -471,7 +475,7 @@ mod tests {
             name: "ZNC-7G4D".into(),
             caps: vec![Cap::Clipboard, Cap::Files, Cap::Terminal],
         }));
-        rt_c2h(C2H::Auth { proof: "ab12".into() });
+        rt_c2h(C2H::Auth { proofs: vec!["ab12".into(), "cd34".into()] });
         rt_c2h(C2H::MouseMoveAbs { x: 1.0, y: 0.0 });
         rt_c2h(C2H::MouseMoveRel { dx: -5, dy: 7 });
         rt_c2h(C2H::MouseButton { button: MouseButton::X2, down: true });
@@ -503,7 +507,7 @@ mod tests {
             caps: vec![Cap::Clipboard, Cap::Metrics],
             has_desktop: true,
         }));
-        rt_h2c(H2C::AuthOk { proof: "cd34".into() });
+        rt_h2c(H2C::AuthOk { idx: 1, proof: "cd34".into() });
         rt_h2c(H2C::AuthFail { reason: AuthFailReason::Busy, retry_after_ms: 60000 });
         rt_h2c(H2C::VideoCfg(HostVideoCfg {
             w: 1920,

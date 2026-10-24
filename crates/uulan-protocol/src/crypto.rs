@@ -28,23 +28,30 @@
 //! 方向分开派生（c→h 与 h→c 用不同密钥）是为了让两个方向各自从 0 开始的计数器
 //! **不可能**撞到同一个 (key, nonce) —— ChaCha20-Poly1305 下 nonce 重用等于把明文交出去。
 //!
-//! ## 口令证明（`Auth` 不再发明文口令）
+//! ## 口令证明（`Auth` 既不发明文口令，也不再是「可离线校验」的值）
 //!
-//! 握手完成后，双方各发一份 `HMAC-SHA256(K, "uulan-auth-v1"||标签||转录哈希||口令)`：
-//! 控制端发 `uulan-auth-c1` 标签，被控端发 `uulan-auth-h1`。**双向**都要验：
+//! 握手（X25519）之后还有一轮 **PAKE**（[`crate::pake`]）：口令只用来生成 Ristretto255 的
+//! 生成元，双方各自的点交换一次，得到共享点 `Kp`。会话密钥是 `HKDF(K ‖ Kp)` ——
+//! 中继知道 `K`，但算不出 `Kp`，所以它连解密都做不到（旧版能解、只能靠证明发现自己被中间人）。
 //!
-//! - 被控端验：对面确实知道口令（否则拒绝，跟明文时代一样按次数锁定）；
+//! 认证阶段发的是 `HMAC-SHA256(会话密钥, "uulan-auth-v2"||标签||转录哈希)`：
+//! 控制端发 `uulan-auth-c2`，被控端发 `uulan-auth-h2`，**双向**都要验。
+//!
+//! - 被控端验：对面用的是某个候选凭据（否则拒绝，跟明文时代一样按次数锁定）；
 //! - 控制端验：对面确实知道口令 —— 否则「中继冒充被控端」就能把用户的键盘、文件收走。
 //!
 //! 标签不同，所以两份证明不能互相冒用（不是反射攻击）。
 //!
+//! 一条连接上会同时出现 `n` 份控制端证明（`n` = 被控端的候选凭据数，通常 1 或 2）：
+//! 控制端不知道对面有几个、是哪个，只能每个候选次序各算一把密钥、各给一份证明；
+//! 被控端拿自己那一个共享点去核对，命中的序号就是它 `AuthOk` 里回的 `idx`。
+//!
 //! ## 这一层**没有**解决的问题（写在明处，别当成已经解决）
 //!
-//! 1. **主动 MITM 的中继**可以各连各的握手，于是它同时知道两份 K。此时它拿到的
-//!    `Auth` 是一个「口令正确与否」的离线校验值，可以拿字典去撞（8-16 位随机口令的
-//!    空间很大，但这不是密码学意义上的安全）。彻底解决要用 PAKE（SPAKE2/OPAQUE），
-//!    属于后续工作；在那之前的口径是：**被动抓包看不到任何明文内容，主动 MITM 需要
-//!    先拿下中继并具备离线爆破口令的算力**。
+//! 1. ~~主动 MITM 能拿口令证明离线撞字典~~ —— **已解决（v2 加密层）**：PAKE 之后
+//!    证明里没有口令、密钥里有控制端算不出来的共享点，中继要么猜（必须在线连一次）、
+//!    要么什么都读不到。剩下的只是「PAKE 的实现是本仓库自己写的、没做第三方审计」
+//!    这一条，写进了 [`crate::pake`] 的模块注释。
 //! 2. 记录长度仍以明文前缀发送。帧长在旧协议里本来就是明文的
 //!    （`read_frame` 的长度前缀），TCP 层也能从分段看出来，所以不额外泄露新信息。
 //!    代价是「屏幕上有没有大动作」这类流量特征仍可见。
@@ -67,11 +74,15 @@ use tokio::net::TcpStream;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::frame::{read_frame, write_frame, FrameError, FrameKind, MAX_FRAME};
+use crate::pake::{PakeInit, PakeResp};
 use crate::rv::{Channel, Role};
 
 /// 加密握手版本。与 [`crate::PROTO_VERSION`] 分开：加密层将来可能单独演进
 /// （比如换 PAKE 时要递增它，而不必动整体协议）。
-pub const CRYPTO_VERSION: u32 = 1;
+///
+/// v2（M6 加固）：X25519 之后多一轮 PAKE（[`crate::pake`]），`Auth` 的证明不再含口令、
+/// 改为「PAKE 密钥上的 HMAC」，会话密钥也由 PAKE 密钥混合而成。
+pub const CRYPTO_VERSION: u32 = 2;
 
 /// X25519 公钥字节数。
 pub const EPH_LEN: usize = 32;
@@ -168,36 +179,57 @@ impl SessionKeys {
         okm
     }
 
-    /// 控制端出示的口令证明。
-    pub fn client_proof(&self, password: &str) -> String {
-        self.proof(b"uulan-auth-c1", password)
+    /// 握手转录哈希（同时也是 PAKE 的 `sid`）。
+    pub fn transcript(&self) -> &[u8; 32] {
+        &self.transcript
     }
 
-    /// 被控端出示的口令证明（标签不同，不能拿控制端的证明来冒用）。
-    pub fn host_proof(&self, password: &str) -> String {
-        self.proof(b"uulan-auth-h1", password)
-    }
-
-    /// 校验「控制端知道口令」。
+    /// 把 PAKE 的口令密钥混进来，得到**真正的会话密钥**。
     ///
-    /// 被控端可能有多个候选口令（永久密码 + 一次性临时码），
-    /// 所以调用方对每个候选各调一次；**不要**把候选拼起来一次算 ——
-    /// 那样等于把「猜对一个就等于全对」这种语义漏洞引进来。
-    pub fn verify_client_proof(&self, password: &str, got: &str) -> bool {
-        ct_eq_hex(&self.client_proof(password), got)
+    /// 为什么必须混：不混的话主动 MITM 的中继自己也知道两端的主密钥，
+    /// 加密只是「防被动抓包」。混进来以后它要解密就得先猜对出口令 —— 而 PAKE 保证
+    /// 每猜一次都必须在线交互一轮。
+    ///
+    /// 对同一份握手密钥调用多次是**正常路径**：控制端并不知道被控端手上有几个候选凭据，
+    /// 于是每个候选各算一把，最后按 `AuthOk.idx` 挑出真的那一把。
+    pub fn with_pake(&self, pake_k: &[u8; 32]) -> SessionKeys {
+        let mut ikm = Vec::with_capacity(64);
+        ikm.extend_from_slice(&self.master);
+        ikm.extend_from_slice(pake_k);
+        let hk = Hkdf::<Sha256>::new(Some(&self.transcript), &ikm);
+        let mut master = [0u8; 32];
+        hk.expand(b"uulan-session-v2", &mut master)
+            .expect("32 字节在 HKDF-SHA256 上限内");
+        SessionKeys { master, transcript: self.transcript }
     }
 
-    /// 校验「被控端知道口令」。控制端不做这一步的话，中继可以冒充被控端收走所有输入。
-    pub fn verify_host_proof(&self, password: &str, got: &str) -> bool {
-        ct_eq_hex(&self.host_proof(password), got)
+    /// 控制端出示的证明。
+    ///
+    /// **不含口令**：口令已经在 PAKE 里进了密钥。正因为证明里没有口令、
+    /// 又没法从抓到的证明反推 PAKE 密钥，中继拿它撞字典这条路就断了。
+    pub fn client_proof(&self) -> String {
+        self.proof(b"uulan-auth-c2")
     }
 
-    fn proof(&self, label: &[u8], password: &str) -> String {
+    /// 被控端出示的证明（标签不同，不能拿控制端的证明来冒用）。
+    pub fn host_proof(&self) -> String {
+        self.proof(b"uulan-auth-h2")
+    }
+
+    /// 校验「对方知道那份 PAKE 密钥」——即「对方用的是这个候选凭据」。
+    pub fn matches_client_proof(&self, got: &str) -> bool {
+        ct_eq_hex(&self.client_proof(), got)
+    }
+
+    pub fn matches_host_proof(&self, got: &str) -> bool {
+        ct_eq_hex(&self.host_proof(), got)
+    }
+
+    fn proof(&self, label: &[u8]) -> String {
         let mut m = <Hmac<Sha256> as Mac>::new_from_slice(&self.master).expect("HMAC 接受任意长度密钥");
-        m.update(b"uulan-auth-v1");
+        m.update(b"uulan-auth-v2");
         m.update(label);
         m.update(&self.transcript);
-        m.update(password.as_bytes());
         hex::encode(m.finalize().into_bytes())
     }
 
@@ -244,6 +276,15 @@ fn channel_code(ch: Channel) -> u8 {
         Channel::Video => 2,
         Channel::Bulk => 3,
         Channel::Audio => 4,
+    }
+}
+
+fn channel_from_code(c: u8) -> Channel {
+    match c {
+        2 => Channel::Video,
+        3 => Channel::Bulk,
+        4 => Channel::Audio,
+        _ => Channel::Control,
     }
 }
 
@@ -343,6 +384,53 @@ where
     Ok(f.decode_json::<CryptoHello>()?)
 }
 
+// ───────────────────────────── PAKE 的两帧 ─────────────────────────────
+//
+// 与 CryptoHello 一样是**明文**帧（一次性的公开点），排在 CryptoHello 之后、
+// 加密层之前。它们本身不保密；保密的是「只有知道口令才能算出同一个共享点」。
+
+/// 控制端发自己的 PAKE 点。
+pub async fn send_pake_init<S>(s: &mut S, init: &PakeInit) -> Result<(), CryptoError>
+where
+    S: AsyncWrite + Unpin,
+{
+    write_frame(s, FrameKind::Json, &serde_json::to_vec(init)?).await?;
+    Ok(())
+}
+
+/// 被控端收控制端的 PAKE 点。
+pub async fn recv_pake_init<S>(s: &mut S) -> Result<PakeInit, CryptoError>
+where
+    S: AsyncRead + Unpin,
+{
+    let f = read_frame(s).await?;
+    if f.kind != FrameKind::Json {
+        return Err(CryptoError::Protocol(format!("PAKE 时期望 JSON，收到 {:?}", f.kind)));
+    }
+    Ok(f.decode_json::<PakeInit>()?)
+}
+
+/// 被控端回自己的 PAKE 点（**每个候选凭据一个**）。
+pub async fn send_pake_resp<S>(s: &mut S, resp: &PakeResp) -> Result<(), CryptoError>
+where
+    S: AsyncWrite + Unpin,
+{
+    write_frame(s, FrameKind::Json, &serde_json::to_vec(resp)?).await?;
+    Ok(())
+}
+
+/// 控制端收被控端的 PAKE 点。
+pub async fn recv_pake_resp<S>(s: &mut S) -> Result<PakeResp, CryptoError>
+where
+    S: AsyncRead + Unpin,
+{
+    let f = read_frame(s).await?;
+    if f.kind != FrameKind::Json {
+        return Err(CryptoError::Protocol(format!("PAKE 时期望 JSON，收到 {:?}", f.kind)));
+    }
+    Ok(f.decode_json::<PakeResp>()?)
+}
+
 /// 控制端侧握手：发自己的 hello → 收被控端的 hello → 算密钥。
 pub async fn client_handshake<S>(s: &mut S) -> Result<SessionKeys, CryptoError>
 where
@@ -413,11 +501,21 @@ impl AeadState {
     }
 
     fn aad(&self) -> [u8; 13] {
-        let mut a = [0u8; 13];
-        a[..12].copy_from_slice(REC_AAD_PREFIX);
-        a[12] = self.ch;
-        a
-    }
+            let mut a = [0u8; 13];
+            a[..12].copy_from_slice(REC_AAD_PREFIX);
+            a[12] = self.ch;
+            a
+        }
+
+        /// 换成另一把密钥，计数器归零。
+        ///
+        /// 为什么归零是安全的：nonce 是「密钥 + 计数器」的组合，密钥换了以后
+        /// 同一个计数器值不会产生重复的 (key, nonce)。反过来说，**同一把密钥**
+        /// 重新包一遍（`SecConn::new` 再来一次）才是灾难 —— 那才是 nonce 重用。
+        fn rekey(&mut self, key: [u8; 32]) {
+            let ch = self.ch;
+            *self = AeadState::new(key, channel_from_code(ch));
+        }
 
     /// 加密一条记录，返回「密文 || 16 字节标签」。计数器只在这里前进 ——
     /// **密封成功才算用过这个 nonce**，失败时计数器不动（宁可重试也不跳号）。
@@ -486,6 +584,21 @@ impl<W> SecWriter<W> {
     /// 还没写出去的明文字节数（测试/排障用）。
     pub fn buffered(&self) -> usize {
         self.buf.len() + self.pending.len() - self.pending_off
+    }
+
+    /// 换成会话密钥（鉴权通过之后调用一次）。
+    ///
+    /// 调用点必须保证「此刻没有半条记录在飞」：加密层是按 flush 切记录的，
+    /// 换密钥时缓冲里若还有明文，就会被封在新密钥下、而对端还在用旧密钥读。
+    pub fn rekey(&mut self, key: [u8; 32]) {
+        debug_assert!(
+            self.buf.is_empty() && self.pending.is_empty(),
+            "换密钥时还有未写完的记录"
+        );
+        self.buf.clear();
+        self.pending.clear();
+        self.pending_off = 0;
+        self.aead.rekey(key);
     }
 
     fn start_record(&mut self) -> Result<(), CryptoError> {
@@ -582,6 +695,12 @@ impl<R> SecReader<R> {
             body_len: 0,
             eof: false,
         }
+    }
+
+    /// 换成会话密钥（鉴权通过之后调用一次）。已经解出来的明文不受影响 ——
+    /// 换的是「往后每条记录用哪把密钥」，缓冲区里的字节早就解完了。
+    pub fn rekey(&mut self, key: [u8; 32]) {
+        self.aead.rekey(key);
     }
 }
 
@@ -819,24 +938,89 @@ mod tests {
         assert_ne!(a.transcript_hex(), b.transcript_hex());
     }
 
+    /// 在内存里跑一遍「PAKE + 混合」：握手 → 口令 → 两端各自的会话密钥。
+    /// 生产路径的点是真的走线的，这里只是省掉 socket。
+    fn pake_pair(
+        c: &SessionKeys,
+        h: &SessionKeys,
+        client_pw: &str,
+        host_cands: &[&str],
+    ) -> (SessionKeys, SessionKeys) {
+        let sid = *c.transcript();
+        let (cl, init) = crate::pake::PakeClient::start(&sid, client_pw);
+        let cands: Vec<String> = host_cands.iter().map(|s| s.to_string()).collect();
+        let (host, resp) = crate::pake::PakeHost::respond(&sid, &cands).unwrap();
+        let ck = cl.finish(&resp).unwrap();
+        let hk = host.finish(&init).unwrap();
+        let idx = host_cands.iter().position(|p| *p == client_pw).unwrap_or(0);
+        (c.with_pake(&ck[idx]), h.with_pake(&hk))
+    }
+
     #[tokio::test]
-    async fn proofs_are_directional_and_password_bound() {
+    async fn proofs_are_directional_and_do_not_cross() {
         let (c, h) = pair().await;
-        let cp = c.client_proof("aB3dE5fG");
-        assert!(h.verify_client_proof("aB3dE5fG", &cp), "被控端应认这份控制端证明");
-        assert!(!h.verify_client_proof("wrongPass9", &cp), "口令不对必须拒");
+        let (cw, hw) = pake_pair(&c, &h, "aB3dE5fG", &["aB3dE5fG"]);
+        let cp = cw.client_proof();
+        assert!(hw.matches_client_proof(&cp), "被控端应认这份控制端证明");
         // 方向之间不能互相冒用
-        assert!(!h.verify_host_proof("aB3dE5fG", &cp), "控制端证明不能当被控端证明用");
-        let hp = h.host_proof("aB3dE5fG");
-        assert!(c.verify_host_proof("aB3dE5fG", &hp));
-        assert!(!c.verify_client_proof("aB3dE5fG", &hp));
+        assert!(!hw.matches_host_proof(&cp), "控制端证明不能当被控端证明用");
+        let hp = hw.host_proof();
+        assert!(cw.matches_host_proof(&hp));
+        assert!(!cw.matches_client_proof(&hp));
     }
 
     #[tokio::test]
     async fn proofs_differ_across_sessions() {
-        let (c1, _) = pair().await;
-        let (c2, _) = pair().await;
-        assert_ne!(c1.client_proof("pw"), c2.client_proof("pw"));
+        let (c1, h1) = pair().await;
+        let (c2, h2) = pair().await;
+        let (cw1, _) = pake_pair(&c1, &h1, "pw", &["pw"]);
+        let (cw2, _) = pake_pair(&c2, &h2, "pw", &["pw"]);
+        assert_ne!(cw1.client_proof(), cw2.client_proof());
+    }
+
+    /// 猜错口令时两端算出来的**密钥本身**就不一样 —— 这正是「中继没法拿抓到的证明
+    /// 离线撞字典」的根：它连「这个口令对应的密钥」都算不出来（那需要 PAKE 共享点）。
+    #[tokio::test]
+    async fn wrong_password_yields_unrelated_keys_and_unverifiable_proofs() {
+        let (c, h) = pair().await;
+        let sid = *c.transcript();
+        // 控制端用错口令，被控端只有正确口令
+        let (cl, init) = crate::pake::PakeClient::start(&sid, "wrongPass9");
+        let (host, resp) =
+            crate::pake::PakeHost::respond(&sid, &["aB3dE5fG".to_string()]).unwrap();
+        let ck = cl.finish(&resp).unwrap()[0];
+        let hk = host.finish(&init).unwrap();
+        assert_ne!(ck, hk, "口令不同，PAKE 共享点必须不同");
+        let cw = c.with_pake(&ck);
+        let hw = h.with_pake(&hk);
+        assert!(!hw.matches_client_proof(&cw.client_proof()), "错口令的证明必须验不过");
+        assert_ne!(
+            cw.channel(Channel::Control).c2h,
+            hw.channel(Channel::Control).c2h,
+            "错口令的会话密钥必须不同（中继无法解密）"
+        );
+    }
+
+    /// 候选清单里第二个命中也能用 —— 临时码就是走这条（凭据顺序不能写死成「只有第一个」）。
+    #[tokio::test]
+    async fn proof_matches_the_right_candidate_slot() {
+        let (c, h) = pair().await;
+        let (cw, hw) = pake_pair(&c, &h, "tE9mP2cO", &["aB3dE5fG", "tE9mP2cO"]);
+        assert!(hw.matches_client_proof(&cw.client_proof()), "第二个候选必须能命中");
+    }
+
+    /// PAKE 密钥参与会话密钥派生：同一份握手、同一口令之外的任何差异都必须变密钥。
+    #[tokio::test]
+    async fn session_keys_mix_in_the_pake_secret() {
+        let (c, _) = pair().await;
+        let a = c.with_pake(&[1u8; 32]);
+        let b = c.with_pake(&[2u8; 32]);
+        assert_ne!(a.channel(Channel::Control).c2h, b.channel(Channel::Control).c2h);
+        assert_ne!(
+            a.channel(Channel::Control).c2h,
+            c.channel(Channel::Control).c2h,
+            "混了 PAKE 之后必须和只做 DH 的密钥不同"
+        );
     }
 
     #[tokio::test]

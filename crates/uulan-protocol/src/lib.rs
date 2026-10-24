@@ -9,6 +9,7 @@ pub mod bulk;
 pub mod crypto;
 pub mod frame;
 pub mod msg;
+pub mod pake;
 pub mod redact;
 pub mod rv;
 pub mod rvclient;
@@ -24,7 +25,11 @@ pub use rvclient::{RelaySet, RvConn, RvError};
 /// v2（M6）：三条会话连接上强制端到端加密，`Auth` 改成口令证明、`AuthOk` 带被控端证明。
 /// 旧端（v1）不会做加密握手，被控端等不到 `CryptoHello` 就会超时收尾 ——
 /// 这正是我们要的：宁可连不上，也不要悄悄退回明文。
-pub const PROTO_VERSION: u32 = 2;
+///
+/// v3（M6 加固）：加密握手之后多一轮 PAKE，`Auth` 变成**一组**证明（每个候选凭据一份）、
+/// `AuthOk` 带上命中序号，会话密钥里混进 PAKE 共享点。旧端在 `CryptoHello` 阶段就会被
+/// `BadVersion` 挡掉（加密层版本也一起递增了），不会出现「一半新一半旧」的半加密状态。
+pub const PROTO_VERSION: u32 = 3;
 
 /// 默认中继端口。
 pub const DEFAULT_PORT: u16 = 21116;

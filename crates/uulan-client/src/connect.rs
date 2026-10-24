@@ -1,18 +1,20 @@
 //! 控制端：连接、握手、鉴权。
 //!
-//! 顺序（M6 起多了一步端到端握手，见 [`uulan_protocol::crypto`]）：
+//! 顺序（M6 起多了端到端握手与 PAKE，见 [`uulan_protocol::crypto`] 与 [`uulan_protocol::pake`]）：
 //!
 //! ```text
-//! 会合（中继）→ 三条 relay 连接 → CryptoHello 交换 → Hello/HelloOk → Auth/AuthOk
+//! 会合（中继）→ 三条 relay 连接 → CryptoHello 交换 → PAKE 交换 → Hello/HelloOk → Auth/AuthOk
 //! ```
 //!
-//! 握手之后三条连接上的**每个帧都是密文**，中继即使被拿下也看不到画面/键盘/文件。
+//! 握手之后三条连接上的**每个帧都是密文**；PAKE 之后密钥里还混进了「只有知道口令才能
+//! 算出来的共享点」，所以中继即使被拿下、即使它主动冒充两端，也解不开任何一个字节。
 
 use std::time::Duration;
 
 use tokio::time::timeout;
 
 use uulan_protocol::crypto::{self, CryptoError, SecConn, SecControl, SessionKeys};
+use uulan_protocol::pake::PakeClient;
 use uulan_protocol::frame::{read_frame, write_frame, FrameKind};
 use uulan_protocol::msg::{AuthFailReason, C2H, Cap, ClientHello, H2C, HostHelloOk};
 use uulan_protocol::rv::{Channel, Role};
@@ -81,10 +83,20 @@ pub async fn connect(
     let (host, keys, ctl) = timeout(Duration::from_secs(15), async {
         // 0) 端到端握手。这一步是**明文**的（临时公钥本来就是公开信息），
         //    但它之后这条连接上每个帧都是密文，口令也从此不再上线。
-        let keys: SessionKeys = crypto::client_handshake(&mut control).await?;
-        // 握手之后就把控制通道包上加密层：Hello/Auth 也必须是密文，
-        // 而且这两半之后要一直用到会话结束（计数器不能归零重来）。
-        let mut ctl = SecControl::new(control, &keys.channel(Channel::Control), Role::Client);
+        let keys0: SessionKeys = crypto::client_handshake(&mut control).await?;
+
+        // 0b) PAKE：把自己的点发过去，换回「被控端每个候选凭据各一个点」。
+        //     只有「我们的口令恰好是它某个凭据」的那一个点，才能和它算出同一个共享点 ——
+        //     我们不知道是哪个，所以每个都算一把密钥，等 AuthOk 告诉我们序号。
+        let (pake, pake_init) = PakeClient::start(keys0.transcript(), password);
+        crypto::send_pake_init(&mut control, &pake_init).await?;
+        let pake_resp = crypto::recv_pake_resp(&mut control).await?;
+        let pake_keys = pake.finish(&pake_resp)?;
+        let cands: Vec<SessionKeys> = pake_keys.iter().map(|k| keys0.with_pake(k)).collect();
+
+        // 鉴权这一段用只由 DH 派生的那一把（此时还不知道会命中哪个候选）：
+        // Hello/Auth 也必须是密文，而且这两半之后要一直用到会话结束（计数器不能归零重来）。
+        let mut ctl = SecControl::new(control, &keys0.channel(Channel::Control), Role::Client);
 
         // 1) Hello
         send_c2h(
@@ -109,21 +121,35 @@ pub async fn connect(
             other => return Err(ClientError::Unexpected(format!("{other:?}"))),
         };
 
-        // 3) Auth：只发口令证明，不发口令本身。
-        send_c2h(&mut ctl.wr, &C2H::Auth { proof: keys.client_proof(password) }).await?;
+        // 3) Auth：一组口令证明，口令本身从不上线。
+        //    每个候选次序各给一份 —— 被控端看哪份对得上它自己的共享点，就知道我们用的是哪个凭据。
+        let proofs: Vec<String> = cands.iter().map(|k| k.client_proof()).collect();
+        send_c2h(&mut ctl.wr, &C2H::Auth { proofs }).await?;
 
         let resp: H2C = match read_h2c(&mut ctl.rd).await? {
             Some(m) => m,
             None => return Err(ClientError::Unexpected("鉴权期间被控端断开".into())),
         };
+        // 命中的候选序号：决定后面视频/bulk 用哪一把密钥。
+        let matched_idx: Option<usize>;
         match resp {
-            H2C::AuthOk { proof } => {
-                // 校验对面的口令证明：不做这一步，中继就能冒充被控端收走所有输入。
-                if !keys.verify_host_proof(password, &proof) {
+            H2C::AuthOk { idx, proof } => {
+                // 被控端告诉我们命中的是第几个候选。校验它的证明：不做这一步，
+                // 中继就能冒充被控端收走所有输入。
+                let keys = cands.get(idx as usize).ok_or_else(|| {
+                    ClientError::Unexpected(format!("AuthOk 给了越界的候选序号 {idx}"))
+                })?;
+                if !keys.matches_host_proof(&proof) {
                     return Err(ClientError::Rejected(
                         "被控端没能证明它知道口令（可能是中继在冒充）".to_string(),
                     ));
                 }
+                // 鉴权通过 → 控制通道换成「含 PAKE」的会话密钥。
+                // 必须原地换：重建会把计数器归零，那就是 nonce 重用。
+                let fin = keys.channel(Channel::Control);
+                ctl.rd.rekey(fin.receiving(Role::Client));
+                ctl.wr.rekey(fin.sending(Role::Client));
+                matched_idx = Some(idx as usize);
             }
             H2C::AuthFail { reason, retry_after_ms } => {
                 return Err(ClientError::Rejected(match reason {
@@ -140,6 +166,12 @@ pub async fn connect(
 
         // 4) 无关紧要的差异：设备名以被控端上报的为准
         let _ = (back_id, device_name);
+        // 后面 video/bulk 也要用「含 PAKE」的密钥：只有命中那个候选才是真的，
+        // 所以这里按序号挑出来（鉴权失败的话上面已经 return 了）。
+        let keys = match matched_idx {
+            Some(i) => cands[i].clone(),
+            None => cands[0].clone(),
+        };
         Ok((host, keys, ctl))
     })
     .await

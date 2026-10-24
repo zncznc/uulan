@@ -33,6 +33,9 @@ sha2 = "0.10"
 base64 = "0.22"
 # M6 端到端加密：只用最少的一组（X25519 交换 + HKDF 派生 + ChaCha20-Poly1305 每帧认证加密）。
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+# PAKE（M6）：只借 curve25519-dalek 的 Ristretto255 群与哈希到群映射。
+# 它本来就在依赖树里（x25519-dalek 的底层），所以内网离线打包不需要多带任何东西。
+curve25519-dalek = "4"
 chacha20poly1305 = "0.10"
 hkdf = "0.12"
 hmac = "0.12"

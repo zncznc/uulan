@@ -33,6 +33,7 @@ use uulan_protocol::msg::{
     Quality, Screen, TermOp,
 };
 use uulan_protocol::crypto::{self, SecConn, SecReadHalf, SecWriteHalf, SessionKeys};
+use uulan_protocol::pake::PakeHost;
 use uulan_protocol::rv::{Channel, Role};
 use uulan_protocol::rvclient::RelaySet;
 
@@ -202,10 +203,11 @@ pub struct HostState {
 pub enum AuthResult {
     /// 通过。`used_temp_code` 为真表示吃掉了一次性临时验证码，调用方该去落盘。
     ///
-    /// `host_proof` 是被控端自己的口令证明（`HMAC(K,"uulan-auth-h1"||…||口令)`），
+    /// `idx` 是命中的候选序号（控制端按这个序号挑出它那一把会话密钥）。
+    /// `host_proof` 是被控端自己的口令证明（`HMAC(会话密钥,"uulan-auth-v2"…"uulan-auth-h2")`），
     /// 由这里算好交给调用方发出去 —— **口令明文不离开这个函数**。
     /// 控制端拿到它会校验；不校验的话中继可以冒充被控端收走输入。
-    Ok { used_temp_code: bool, host_proof: String },
+    Ok { used_temp_code: bool, idx: u32, host_proof: String },
     /// 密码不对。
     Bad,
 }
@@ -265,39 +267,61 @@ impl HostState {
         }
     }
 
-    /// 校验口令证明，一次性临时码用掉即失效。
+    /// 当前的候选凭据（顺序即 `PakeResp.ybs` 的顺序）：永久口令在前，临时码在后。
     ///
-    /// 顺序上先比永久密码再比临时码 —— 临时码是给「临时协助」场景的，
+    /// 顺序先比永久密码再比临时码 —— 临时码是给「临时协助」场景的，
     /// 用它连接不应打断主人自己用永久密码。
     ///
-    /// 为什么不再收口令明文：M6 起通道虽然已加密，但中继是**主动 MITM 时**唯一能
-    /// 看到解密前内容的一方；把口令换成「用会话密钥算的证明」，中继拿到的就只是一个
-    /// 认不出来的十六进制串。证明每次会话都不同（临时密钥对每次新生成），不能重放。
-    pub fn authenticate_proof(&self, keys: &SessionKeys, proof: &str) -> AuthResult {
+    /// 返回值带 `is_temp`：命中之后要靠它决定「要不要吃掉这个码」。
+    pub fn candidates(&self) -> Vec<(bool, String)> {
         // 先看一眼磁盘：临时码/口令可能是 `uulan-host --new-temp-code` 写的。
         self.adopt_external_config();
-        let (used_temp, password) = {
+        let g = self.cfg.lock().unwrap();
+        let mut v = vec![(false, g.password.clone())];
+        if let Some(t) = g.temp_code.clone() {
+            v.push((true, t));
+        }
+        v
+    }
+
+    /// 校验控制端发来的一组证明（`proofs[i]` 对应 `candidates()[i]`）。
+    ///
+    /// 为什么是一组而不是一条：PAKE 之后**证明里不再含口令**，被控端也没法「拿口令
+    /// 逐个试算」—— 它只有自己那一个 PAKE 共享点。于是控制端把它能算出来的每个候选
+    /// 各给一份证明，被控端看哪一份对得上自己的共享点，就知道对方用的是哪个凭据。
+    ///
+    /// 安全性：猜错口令时控制端那边的密钥是**另一把**（PAKE 共享点不同），
+    /// 而中继既算不出正确的那把、也无法离线校验任何猜测 —— 每猜一次都得真连一次。
+    pub fn authenticate(&self, keys: &SessionKeys, proofs: &[String]) -> AuthResult {
+        let cands = self.candidates();
+        if proofs.len() != cands.len() || cands.len() > uulan_protocol::pake::PAKE_MAX_CANDIDATES {
+            return AuthResult::Bad;
+        }
+        let Some(i) = proofs.iter().position(|p| keys.matches_client_proof(p)) else {
+            return AuthResult::Bad;
+        };
+        let (is_temp, value) = cands[i].clone();
+        // 命中之后回到锁里复核「这个凭据还是当前这个」再消费 ——
+        // 从 `candidates()` 到这里隔着一次 PAKE 往返，期间配置文件可能被改过。
+        {
             let mut g = self.cfg.lock().unwrap();
-            if keys.verify_client_proof(&g.password, proof) {
-                (false, g.password.clone())
-            } else if let Some(t) = g.temp_code.clone() {
-                if keys.verify_client_proof(&t, proof) {
-                    // 临时码用掉即失效：在同一把锁里摘掉，避免并发会话各用一次。
-                    g.temp_code = None;
-                    (true, t)
-                } else {
+            if is_temp {
+                if g.temp_code.as_deref() != Some(value.as_str()) {
                     return AuthResult::Bad;
                 }
-            } else {
+                // 临时码用掉即失效：在同一把锁里摘掉，避免并发会话各用一次。
+                g.temp_code = None;
+            } else if g.password != value {
                 return AuthResult::Bad;
             }
-        };
-        if used_temp {
+        }
+        if is_temp {
             self.persist();
         }
         AuthResult::Ok {
-            used_temp_code: used_temp,
-            host_proof: keys.host_proof(&password),
+            used_temp_code: is_temp,
+            idx: i as u32,
+            host_proof: keys.host_proof(),
         }
     }
 
@@ -425,10 +449,10 @@ pub async fn run_with_sink(
     let RelaySet { control, video, bulk } = relays;
     let mut control = control;
 
-    // ── M6：端到端握手 ──
+    // ── M6：端到端握手（X25519 + PAKE）──
     // 放在最前面（Hello 之前）：之后的每个帧都是密文，连口令证明也不会明文上线。
-    // 这一步本身是明文的（两帧临时公钥），但拿不到它就没法解密后续任何一个字节。
-    let keys = match tokio::time::timeout(
+    // 这两步本身是明文的（几个一次性的公开点），但拿不到它们就没法解密后续任何一个字节。
+    let keys0 = match tokio::time::timeout(
         CRYPTO_HANDSHAKE_TIMEOUT,
         crypto::host_handshake(&mut control),
     )
@@ -444,11 +468,52 @@ pub async fn run_with_sink(
             return SessionOutcome::Error("端到端握手超时".into());
         }
     };
-    // 三条连接各用自己通道的子密钥：换个通道、换个方向都换密钥，
-    // 所以各方向的计数器可以各自从 0 开始而不会撞 nonce。
-    let control = SecConn::new(control, &keys.channel(Channel::Control), Role::Host, Channel::Control);
-    let video = SecConn::new(video, &keys.channel(Channel::Video), Role::Host, Channel::Video);
-    let bulk = SecConn::new(bulk, &keys.channel(Channel::Bulk), Role::Host, Channel::Bulk);
+
+    // PAKE：控制端先出自己的点，我们按**每个候选凭据**各算一个点回过去。
+    // 注意顺序是「先收后发」—— 与 hello 一样，卡住时我们先能超时收尾。
+    let pake_init = match tokio::time::timeout(
+        CRYPTO_HANDSHAKE_TIMEOUT,
+        crypto::recv_pake_init(&mut control),
+    )
+    .await
+    {
+        Ok(Ok(i)) => i,
+        Ok(Err(e)) => {
+            warn!(%peer, error = %e, "PAKE 失败");
+            return SessionOutcome::Error(format!("PAKE 失败: {e}"));
+        }
+        Err(_) => {
+            warn!(%peer, "PAKE 超时（对端没在期限内发点）");
+            return SessionOutcome::Error("PAKE 超时".into());
+        }
+    };
+    let cands = params.state.candidates();
+    let cand_values: Vec<String> = cands.iter().map(|(_, v)| v.clone()).collect();
+    let (pake, pake_resp) = match PakeHost::respond(keys0.transcript(), &cand_values) {
+        Ok(x) => x,
+        Err(e) => {
+            warn!(%peer, error = %e, "PAKE 响应生成失败");
+            return SessionOutcome::Error(format!("PAKE 失败: {e}"));
+        }
+    };
+    if let Err(e) = crypto::send_pake_resp(&mut control, &pake_resp).await {
+        warn!(%peer, error = %e, "PAKE 响应发送失败");
+        return SessionOutcome::Error(format!("PAKE 失败: {e}"));
+    }
+    let pake_k = match pake.finish(&pake_init) {
+        Ok(k) => k,
+        Err(e) => {
+            warn!(%peer, error = %e, "PAKE 共享点计算失败");
+            return SessionOutcome::Error(format!("PAKE 失败: {e}"));
+        }
+    };
+    // 会话密钥 = DH **再混上** PAKE 共享点。中继能算出前者、算不出后者，
+    // 于是它连「读」这件事都做不到（以前的方案里它能解密，只是不敢改）。
+    let keys = keys0.with_pake(&pake_k);
+
+    // 鉴权阶段仍用只由 DH 派生出来的那一把（此时还不知道对面用的是哪个候选）；
+    // 鉴权一通过就换成上面那把（控制通道两半 + 视频 + bulk 一起换，见下面的 rekey）。
+    let control = SecConn::new(control, &keys0.channel(Channel::Control), Role::Host, Channel::Control);
     let (mut control_rd, mut control_wr) = control.into_split();
 
     // 剪贴板后端：抓的是哪个 X 显示，剪贴板就得是哪个 X 显示的。
@@ -484,6 +549,15 @@ pub async fn run_with_sink(
         device_id = ?cfg.device_id,
         "会话已授权，开始推流"
     );
+
+    // 鉴权通过 → 三通道全部换成「含 PAKE」的会话密钥。
+    // 控制通道这里必须原地换（不能重建：重建会让计数器归零，那是 nonce 重用）；
+    // 视频与 bulk 还没开始用，直接用最终密钥建就行。
+    let final_ctl = keys.channel(Channel::Control);
+    control_rd.rekey(final_ctl.receiving(Role::Host));
+    control_wr.rekey(final_ctl.sending(Role::Host));
+    let video = SecConn::new(video, &keys.channel(Channel::Video), Role::Host, Channel::Video);
+    let bulk = SecConn::new(bulk, &keys.channel(Channel::Bulk), Role::Host, Channel::Bulk);
 
     // 视频参数的热更新通道：控制端改画质/帧率时不需要断开重连。
     let (set_tx, set_rx) = watch::channel(params.settings);
@@ -706,9 +780,9 @@ where
     )
     .await?;
 
-    // 3) 等 Auth（口令证明，不是口令本身）
-    let proof = match read_c2h(rd).await? {
-        Some(C2H::Auth { proof }) => proof,
+    // 3) 等 Auth（一组口令证明；口令本身从不上线）
+    let proofs = match read_c2h(rd).await? {
+        Some(C2H::Auth { proofs }) => proofs,
         Some(other) => return Err(format!("握手时期望 Auth，收到 {other:?}")),
         None => return Err("对端在鉴权前就断开了".into()),
     };
@@ -728,16 +802,17 @@ where
         return Ok(None);
     }
 
-    // 5) 校验：证明对着会话密钥算，所以中继重放/伪造都过不了
-    match state.authenticate_proof(keys, &proof) {
-        AuthResult::Ok { used_temp_code, host_proof: proof } => {
+    // 5) 校验：证明是对着「含 PAKE 的会话密钥」算的，所以中继重放/伪造都过不了
+    match state.authenticate(keys, &proofs) {
+        AuthResult::Ok { used_temp_code, idx, host_proof: proof } => {
             state.auth.record_success();
             info!(
                 %peer,
                 used_temp_code,
+                cred_slot = idx,
                 "鉴权通过"
             );
-            send_h2c(wr, &H2C::AuthOk { proof }).await?;
+            send_h2c(wr, &H2C::AuthOk { idx, proof }).await?;
             Ok(Some(client))
         }
         AuthResult::Bad => {
@@ -1610,13 +1685,26 @@ mod tests {
     /// 造一对真会话密钥（跑一遍真握手，不造假密钥）。
     ///
     /// 键方向：返回 `(控制端, 被控端)`；用控制端那份算证明，被控端那份校验。
-    async fn keys_pair() -> (SessionKeys, SessionKeys) {
+    async fn keys_pair(cands: &[&str], client_pw: &str) -> (SessionKeys, Vec<SessionKeys>) {
         let (mut a, mut b) = tokio::io::duplex(8192);
         let (c, h) = tokio::join!(
             uulan_protocol::crypto::client_handshake(&mut a),
             uulan_protocol::crypto::host_handshake(&mut b)
         );
-        (c.expect("控制端握手"), h.expect("被控端握手"))
+        let (c, h) = (c.expect("控制端握手"), h.expect("被控端握手"));
+        // PAKE 的 sid 必须是**真握手**的转录哈希 —— 不然这里测的就不是生产那条路。
+        let sid = *c.transcript();
+        let (cl, init) = uulan_protocol::pake::PakeClient::start(&sid, client_pw);
+        let values: Vec<String> = cands.iter().map(|s| s.to_string()).collect();
+        let (host, resp) = uulan_protocol::pake::PakeHost::respond(&sid, &values).unwrap();
+        let cks = cl.finish(&resp).unwrap();
+        let hk = host.finish(&init).unwrap();
+        (h.with_pake(&hk), cks.iter().map(|k| c.with_pake(k)).collect())
+    }
+
+    /// 控制端会把「每个候选各一份」的证明都发出来（它不知道对面有几个、是哪个）。
+    fn proofs(cw: &[SessionKeys]) -> Vec<String> {
+        cw.iter().map(|k| k.client_proof()).collect()
     }
 
     fn state_with(temp: Option<&str>) -> HostState {
@@ -1628,78 +1716,98 @@ mod tests {
 
     #[tokio::test]
     async fn permanent_password_does_not_consume_the_temp_code() {
-        let (c, h) = keys_pair().await;
         let s = state_with(Some("tE9mP2cO"));
-        match s.authenticate_proof(&h, &c.client_proof("aB3dE5fG")) {
-            AuthResult::Ok { used_temp_code, .. } => assert!(!used_temp_code),
+        let (h, cw) = keys_pair(&["aB3dE5fG", "tE9mP2cO"], "aB3dE5fG").await;
+        match s.authenticate(&h, &proofs(&cw)) {
+            AuthResult::Ok { used_temp_code, idx, .. } => {
+                assert!(!used_temp_code);
+                assert_eq!(idx, 0, "命中永久口令时序号应是第一个");
+            }
             AuthResult::Bad => panic!("永久密码被拒"),
         }
         assert!(s.snapshot().temp_code.is_some(), "用永久密码登录不该消耗临时码");
         // 临时码仍然可用
-        match s.authenticate_proof(&h, &c.client_proof("tE9mP2cO")) {
-            AuthResult::Ok { used_temp_code, .. } => assert!(used_temp_code),
+        let (h2, cw2) = keys_pair(&["aB3dE5fG", "tE9mP2cO"], "tE9mP2cO").await;
+        match s.authenticate(&h2, &proofs(&cw2)) {
+            AuthResult::Ok { used_temp_code, idx, .. } => {
+                assert!(used_temp_code);
+                assert_eq!(idx, 1, "命中临时码时序号应是第二个");
+            }
             AuthResult::Bad => panic!("临时码被拒"),
         }
     }
 
     #[tokio::test]
     async fn temp_code_is_single_use() {
-        let (c, h) = keys_pair().await;
         let s = state_with(Some("tE9mP2cO"));
-        let proof = c.client_proof("tE9mP2cO");
+        let (h, cw) = keys_pair(&["aB3dE5fG", "tE9mP2cO"], "tE9mP2cO").await;
+        let p = proofs(&cw);
         assert!(matches!(
-            s.authenticate_proof(&h, &proof),
+            s.authenticate(&h, &p),
             AuthResult::Ok { used_temp_code: true, .. }
         ));
         assert!(s.snapshot().temp_code.is_none(), "用过的临时码必须被清掉");
         // 第二次用同一个码必须失败
-        assert!(matches!(s.authenticate_proof(&h, &proof), AuthResult::Bad));
+        assert!(matches!(s.authenticate(&h, &p), AuthResult::Bad));
         // 永久密码不受影响
-        let perm = c.client_proof("aB3dE5fG");
-        assert!(matches!(s.authenticate_proof(&h, &perm), AuthResult::Ok { .. }));
+        let (h2, cw2) = keys_pair(&["aB3dE5fG"], "aB3dE5fG").await;
+        assert!(matches!(s.authenticate(&h2, &proofs(&cw2)), AuthResult::Ok { .. }));
     }
 
     #[tokio::test]
     async fn wrong_password_is_rejected_and_nothing_is_consumed() {
-        let (c, h) = keys_pair().await;
         let s = state_with(Some("tE9mP2cO"));
-        assert!(matches!(s.authenticate_proof(&h, &c.client_proof("wrongPass9")), AuthResult::Bad));
+        let (h, cw) = keys_pair(&["aB3dE5fG", "tE9mP2cO"], "wrongPass9").await;
+        assert!(matches!(s.authenticate(&h, &proofs(&cw)), AuthResult::Bad));
         assert!(s.snapshot().temp_code.is_some());
+    }
+
+    /// 证明条数必须和被控端的候选数一致：少给就拒，补齐就通过。
+    #[tokio::test]
+    async fn proof_count_must_match_candidate_count() {
+        let s = state_with(Some("tE9mP2cO"));
+        let (h, cw) = keys_pair(&["aB3dE5fG"], "aB3dE5fG").await;
+        let short = proofs(&cw);
+        assert!(
+            matches!(s.authenticate(&h, &short), AuthResult::Bad),
+            "只给 1 份而对面有 2 个候选，必须拒"
+        );
+        let mut padded = short.clone();
+        padded.push(short[0].clone());
+        assert!(matches!(s.authenticate(&h, &padded), AuthResult::Ok { .. }), "补齐 2 份应通过");
+        assert!(s.snapshot().temp_code.is_some(), "命中的是永久口令，不该吃掉临时码");
     }
 
     #[tokio::test]
     async fn no_temp_code_means_only_the_permanent_password_works() {
-        let (c, h) = keys_pair().await;
         let s = state_with(None);
-        assert!(matches!(
-            s.authenticate_proof(&h, &c.client_proof("aB3dE5fG")),
-            AuthResult::Ok { .. }
-        ));
-        assert!(matches!(s.authenticate_proof(&h, &c.client_proof("anything1")), AuthResult::Bad));
+        let (h, cw) = keys_pair(&["aB3dE5fG"], "aB3dE5fG").await;
+        assert!(matches!(s.authenticate(&h, &proofs(&cw)), AuthResult::Ok { .. }));
+        let (h2, cw2) = keys_pair(&["aB3dE5fG"], "anything1").await;
+        assert!(matches!(s.authenticate(&h2, &proofs(&cw2)), AuthResult::Bad));
     }
 
     /// 证明是**跟会话密钥绑死**的：别的会话（别的密钥）算出来的证明必须被拒，
     /// 否则中继把一次会话的 Auth 帧搬到另一次会话上就能冒充。
     #[tokio::test]
     async fn proof_from_another_session_is_rejected() {
-        let (c1, _h1) = keys_pair().await;
-        let (_c2, h2) = keys_pair().await;
+        let (_h1, cw1) = keys_pair(&["aB3dE5fG"], "aB3dE5fG").await;
+        let (h2, _cw2) = keys_pair(&["aB3dE5fG"], "aB3dE5fG").await;
         let s = state_with(None);
-        assert!(matches!(
-            s.authenticate_proof(&h2, &c1.client_proof("aB3dE5fG")),
-            AuthResult::Bad
-        ));
+        assert!(matches!(s.authenticate(&h2, &proofs(&cw1)), AuthResult::Bad));
     }
 
     /// 被控端返回的证明必须是**控制端能验的**那份（双向鉴权的另一半）。
     #[tokio::test]
     async fn host_proof_can_be_verified_by_the_client() {
-        let (c, h) = keys_pair().await;
         let s = state_with(None);
-        match s.authenticate_proof(&h, &c.client_proof("aB3dE5fG")) {
+        let (h, cw) = keys_pair(&["aB3dE5fG"], "aB3dE5fG").await;
+        match s.authenticate(&h, &proofs(&cw)) {
             AuthResult::Ok { host_proof, .. } => {
-                assert!(c.verify_host_proof("aB3dE5fG", &host_proof), "控制端应认被控端的证明");
-                assert!(!c.verify_host_proof("wrongPass9", &host_proof));
+                assert!(cw[0].matches_host_proof(&host_proof), "控制端应认被控端的证明");
+                // 另一个会话（口令不同 → 密钥不同）验不过同一份证明
+                let (_h2, other) = keys_pair(&["aB3dE5fG"], "wrongPass9").await;
+                assert!(!other[0].matches_host_proof(&host_proof));
             }
             AuthResult::Bad => panic!("永久密码被拒"),
         }
@@ -1763,16 +1871,19 @@ mod tests {
 
         // 常驻服务先起来（内存里没有临时码）
         let s = HostState::new(cfg.clone(), Some(p.clone()));
-        let (c, h) = keys_pair().await;
 
         // 另一个进程此时写进一个新码
         let mut on_disk = HostConfig::load(&p).unwrap();
         let fresh = on_disk.refresh_temp_code();
         on_disk.save(&p).unwrap();
 
-        // 新码必须能用，且用掉一次就失效（磁盘上也要被清掉）
-        match s.authenticate_proof(&h, &c.client_proof(&fresh)) {
-            AuthResult::Ok { used_temp_code, .. } => assert!(used_temp_code),
+        // 新码必须能用（此时候选是 [永久口令, 新码]），且用掉一次就失效
+        let (h, cw) = keys_pair(&["aB3dE5fG", &fresh], &fresh).await;
+        match s.authenticate(&h, &proofs(&cw)) {
+            AuthResult::Ok { used_temp_code, idx, .. } => {
+                assert!(used_temp_code);
+                assert_eq!(idx, 1);
+            }
             AuthResult::Bad => panic!("另一个进程写的临时码被拒 —— 常驻服务没看见配置变化"),
         }
         assert!(s.snapshot().temp_code.is_none(), "用掉的码必须从内存里清掉");
@@ -1780,11 +1891,11 @@ mod tests {
             HostConfig::load(&p).unwrap().temp_code.is_none(),
             "用掉的码必须落盘清掉，否则重启后又能用一次"
         );
-        // 再从磁盘读一遍也不能「复活」
-        assert!(matches!(s.authenticate_proof(&h, &c.client_proof(&fresh)), AuthResult::Bad));
+        // 再从磁盘读一遍也不能「复活」（候选数回到 1，同一组证明长度不对 → 拒）
+        assert!(matches!(s.authenticate(&h, &proofs(&cw)), AuthResult::Bad));
         // 永久密码照旧
-        let perm = c.client_proof("aB3dE5fG");
-        assert!(matches!(s.authenticate_proof(&h, &perm), AuthResult::Ok { .. }));
+        let (h2, cw2) = keys_pair(&["aB3dE5fG"], "aB3dE5fG").await;
+        assert!(matches!(s.authenticate(&h2, &proofs(&cw2)), AuthResult::Ok { .. }));
 
         let _ = std::fs::remove_file(&p);
     }
@@ -1802,16 +1913,17 @@ mod tests {
         cfg.password = "oldPass11".into();
         cfg.save(&p).unwrap();
         let s = HostState::new(cfg.clone(), Some(p.clone()));
-        let (c, h) = keys_pair().await;
 
         let mut on_disk = HostConfig::load(&p).unwrap();
         on_disk.password = "newPass22".into();
         on_disk.save(&p).unwrap();
 
-        assert!(matches!(s.authenticate_proof(&h, &c.client_proof("oldPass11")), AuthResult::Bad));
-        match s.authenticate_proof(&h, &c.client_proof("newPass22")) {
+        let (h_old, cw_old) = keys_pair(&["newPass22"], "oldPass11").await;
+        assert!(matches!(s.authenticate(&h_old, &proofs(&cw_old)), AuthResult::Bad));
+        let (h_new, cw_new) = keys_pair(&["newPass22"], "newPass22").await;
+        match s.authenticate(&h_new, &proofs(&cw_new)) {
             AuthResult::Ok { host_proof, .. } => {
-                assert!(c.verify_host_proof("newPass22", &host_proof), "被控端证明应跟着新口令走");
+                assert!(cw_new[0].matches_host_proof(&host_proof), "被控端证明应跟着新口令走");
             }
             AuthResult::Bad => panic!("外部改的新口令没生效 —— 常驻服务没看见配置变化"),
         }
