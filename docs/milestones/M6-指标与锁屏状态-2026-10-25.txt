@@ -1,0 +1,125 @@
+uulan · 系统指标与锁屏状态（H2C::Metrics / H2C::SystemState 两端接通）
+实测日期：2026-10-25（夜间批，05:00–06:40）
+基线提交：0c40b98 → 本轮 上机验证的二进制来自 337e0df
+
+────────────────────────────────────────────────────────────────
+一、为什么要做（这不是「新功能」，是补一个隐患）
+
+协议里这两个消息从 M1 就定义好了（`crates/uulan-protocol/src/msg.rs`），
+被控端的主循环里**一条都没发过** —— 两端的 match 里都只有 `Ok(_) => {}`。
+后果有两个，第二个是会出事的那种：
+
+1. 控制端看不到对面的负载（CPU/内存/网速），判断「卡是网络还是对面」全靠猜；
+2. 控制端不知道对面已经锁屏，**键鼠继续往锁屏里送**。
+
+第 2 条在真机上是能作数的：XTest 是 X 服务器级注入，**绕过锁屏的抓取**。
+本轮第一次上机就复现了 —— 门禁还没生效时 `--inject move:700,400` 真的把
+指针从 x:1599 y:0 挪到了 x:700 y:400，当时 `:0` 正被 `ukui-screensaver-dialog`
+锁着（`xdotool getwindowfocus getwindowname` 读到的就是它）。
+
+────────────────────────────────────────────────────────────────
+二、改了什么
+
+被控端（`crates/uulan-host/src/probe/`，新模块）
+- `parse_cpu_times` / `parse_meminfo` / `parse_net_dev`：`/proc` 三个文件的纯解析。
+  CPU 只累加前 8 列（user…steal；`guest`/`guest_nice` 已含在 user/nice 里），
+  idle = `idle + iowait`；内存用 `MemTotal - MemAvailable`（没有 MemAvailable 才退回
+  MemFree）；网卡跳过 `lo`（中继和被控同机时回环会把「网络负载」算成假大数）。
+- `cpu_usage` / `byte_rate`：两次采样的差分。任一拍缺数据、同一毫秒连拍、
+  计数器回绕（cur < prev）一律返回「不知道」而不是编一个数；
+  **第一拍没有基线就报 0**（语义同 `VideoCfg.actual_fps` 的 0 = 还没测出来）。
+- `looks_locked`：焦点窗口名**整串**匹配白名单（`ukui-screensaver-dialog` 等 15 个），
+  或以 `-screensaver-dialog` 结尾。刻意不做「标题里含 screensaver 就算锁屏」——
+  `Screensaver Preferences` 这种设置窗口会被误判，用户的键鼠就被无声掐掉了。
+- `probe/x11.rs`：Xlib 直连，不依赖 `xdotool`（最小安装的麒麟确实不带它）：
+  `XGetInputFocus` 拿焦点窗口，`XFetchName` 读 `WM_NAME`，空了再读 `_NET_WM_NAME`
+  （UTF8_STRING）。这条是用 `#[link(name="X11")]` 直接链的，和 XTest 后端同一个库。
+- `session.rs`：control_loop 加两条独立慢拍 —— 1 秒探锁屏（变了才发 `SystemState`）、
+  2 秒推 `Metrics`。锁屏时**在喂 Mapper 之前**丢输入（否则会留下「按下丢了、松开却
+  注入了」的半边状态），变锁那一刻把已按下的键松开，并按 2 秒节流回一条
+  `InputError`（说清原因，不然用户只看到「键鼠没反应」）。`caps` 里声明 `Cap::Metrics`。
+
+控制端（`crates/uulan-client`）
+- `control.rs`：`HostStatus`（原子量）+ `ControlLink::status()`；读循环处理
+  `Metrics`（cpu 夹在 0..100，NaN 归 0）与 `SystemState`（只在变化时打日志）。
+- `InputSender::send` 在锁屏时**直接短路**（返回 true —— 通道没坏，只是按状态不发），
+  非输入消息（剪贴板/文件/终端/Ping/Bye）照常走，锁屏时照样能传文件。
+- `window.rs`：标题加「被控端 CPU x% · 内存 a/b GB」，锁屏时追加「已锁屏（键鼠已暂停）」。
+- 新 `--status <秒>`：只连控制通道，每秒打一行
+  `locked=… has_state=… cpu=…% mem=…/…MB rtt=…ms metrics=… changes=…`。
+  存在的理由同 `--inject`：这两条消息必须能机器验证，不能靠人眼看窗口标题。
+- `inject.rs`：发键鼠前先等第一条状态（最多 500ms），锁屏时明说「按策略不发」。
+
+────────────────────────────────────────────────────────────────
+三、本机测试数字（Windows，cargo test --workspace）
+
+基线（本轮开工时 0c40b98）：353 passed / 0 failed / 1 ignored，0 警告
+本轮收工（337e0df）：        373 passed / 0 failed / 1 ignored，0 警告（+20）
+  · probe 11 条（解析、差分、回绕、锁屏名字的误判与漏判边界）
+  · protocol 1 条（`C2H::is_input` 只对注入类消息为真）
+  · 控制端 HostStatus 3 条（锁屏短路、指标夹取、首条状态必记变化）
+  · 被控端 2 条（锁屏即松开已按下的键、解锁不重放）
+  · 端到端 2 条（`tests/locked_host.rs`，真 server + 真会话 + 真 wire，
+    只把 `/proc` 与锁屏探针换成假来源）：
+      locked_host_reports_state_and_load_and_the_client_stops_injecting
+        → 控制端拿到 locked=true、mem 3072/8192MB、CPU≈60%（假来源给的差分）
+      host_itself_drops_input_while_locked_even_if_the_client_ignores_it
+        → 绕过控制端策略直接写 C2H 帧：第一帧必须是 SystemState、注入后端 0 条、
+          收到 InputError「已锁屏，键鼠未注入」
+cargo build --release：0 警告
+真麒麟 `cargo build --release -p uulan-server -p uulan-host`：31.6 s、0 警告
+
+────────────────────────────────────────────────────────────────
+四、真麒麟实测（192.168.223.15，mis-pc，Kylin V10 SP1，X11 1920x1080）
+
+装机：从 HEAD 打包 → 换源码（保留 target/）→ 编 server+host → `install.sh --userland
+--no-start` → `systemctl --user kill -s KILL uulan-host` 让 systemd 自己拉起。
+设备 ID 805747189 未变；`readlink /proc/<pid>/exe` = 前缀里的二进制，sha 前缀
+2cc924a2 与 `target/release/uulan-host` 一致。
+
+1) 状态与负载真的到了控制端（Windows 客户端 `--status 9`，` :0` 当时是锁屏）：
+   locked=true has_state=true cpu=0.8–0.9% mem=3792–3800/32025MB rtt=0ms metrics=5 changes=1
+   同一窗口的独立参照（在真机上用 python 按同样定义直接读 /proc/stat 两次差分）：
+     2.0s cpu=1.00% / 4.0s cpu=0.85% / 6.0s cpu=2.00% / 8.0s cpu=0.72%
+   → 同一量级、同样抖动，不是编的数。
+   内存口径对齐：`free -m` 总计 32025、可用 28215 ⇒ 32025-28215 = 3810MB，
+   与上报的 3792–3800MB 同（差值是采样时刻不同；注意这是「总量-可用」，
+   **不是** `free` 的「已用」列，后者不含 buff/cache）。
+
+2) 锁屏门禁真的挡住了注入（判据是指针位置 + 被控端自己的计数）：
+   - 门禁未生效的那一版（本轮第一次上机）：`--inject move:700,400` 之后
+     `xdotool getmouselocation` 由 x:1599 y:0 变成 x:700 y:400 —— **注入进锁屏了**。
+   - 修好之后，用**旧客户端**（前缀里的 15ca018b，根本不认锁屏状态，等于第三方脚本）
+     `--inject "move:300,200; click:left"`：
+       客户端侧：被控端报告输入注入失败 被控端已锁屏，键鼠未注入（已丢 1 条）
+       被控端日志：桌面状态探针已启用（锁屏时停止键鼠注入）
+                   被控端已锁屏：暂停键鼠注入（已按下的键已松开）
+                   会话开局的桌面状态（已先于任何输入告知控制端） locked=true has_desktop=true
+                   键鼠事件统计 events=0 inject_errors=0 dropped_locked=3
+       指针：注入前后都是 x:700 y:400 —— **一个像素都没动**。
+   - 新客户端（认状态那版）跑同一脚本：直接打「被控端处于锁屏：键鼠按策略不发」，
+     移动 0 / 点击 0，被控端那条会话里根本没收到输入（客户端就挡了）。
+
+3) M2 的老账照旧核对（画面还是那台机器的真桌面）：
+   1920x1080 @ 29.6 fps 解出、丢帧 0、首帧 241ms、被控端自报 30.00 fps、
+   平均码率 9.8 Mbps、与真机 `ffmpeg -f x11grab` 截图（1920x1080）
+   **相关系数 0.9991 / 平均绝对误差 0.54%**
+   （2026-10-22 的基线是 0.9982 / 0.71%，本轮不低于它，不是回归）
+
+────────────────────────────────────────────────────────────────
+五、仍未验 / 已知限制
+
+- **解锁后的状态切换没在真机上验**：这台机器的 `:0` 一直锁着，我既不能也不该在
+  无人值守的夜里去解锁（往锁屏里打字是明确禁止的）。所以
+  「locked=true → 解锁 → locked=false → 键鼠恢复」这条**只有本机端到端测试**
+  （`unlocking_does_not_replay_anything` + 端到端里 apply_state(false)）覆盖，
+  真机只验了 locked=true 一侧。下次有人在机器前，解锁后跑一次
+  `--status 5` 看到 has_state=true 且 locked=false 就闭环了。
+- **锁屏判定只认「焦点窗口名」**：UKUI 实测有效（`ukui-screensaver-dialog`）。
+  换一款锁屏程序、或者它改成自绘全屏而不改窗口名，就会漏判 —— 漏判的方向是
+  「照旧注入」而不是「误掐键鼠」，这是刻意的：宁可漏一次也不把用户的键鼠无声关掉。
+  白名单在 `probe::LOCK_WINDOW_NAMES`，加名字是改一张表。
+- `Metrics.rtt_ms` 恒为 0：RTT 是控制端侧的观测量（它自己算 Ping→Pong 往返），
+  被控端没有可比的时钟，所以如实填 0 而不是编一个数。控制端标题目前不显示 RTT。
+- 网速字段（net_rx/net_tx）被控端已经在发，控制端**还没显示**（窗口标题没放，
+  避免标题过长）；`--status` 的输出里也没有，需要时加一行即可。
