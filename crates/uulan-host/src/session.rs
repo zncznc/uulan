@@ -687,7 +687,37 @@ pub async fn run_with_sink(
     } else {
         info!("桌面状态探针未启用（合成源 / 非 X11 采集），不会发送 SystemState");
     }
+    // **会话开局先探一次，再进 control_loop。**
+    //
+    // 真机上踩到过：探测只挂在 1 秒的定时器上，控制端 `--inject` 的指令比它先到，
+    // 于是「锁屏时不许注入」的门禁形同不存在 —— XTest 是服务器级注入，**绕过锁屏的
+    // 抓取**，指针真的动了（截图记录：注入前 x:1599 y:0，注入后 x:700 y:400）。
+    // 所以这一拍必须在处理任何输入消息之前完成，并且顺手先把状态告诉控制端。
     let mut sent_state: Option<DesktopState> = None;
+    if let Some(p) = lock.as_ref() {
+        let p = p.clone();
+        let first = tokio::time::timeout(
+            SCREEN_PROBE_TIMEOUT,
+            tokio::task::spawn_blocking(move || p()),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .flatten();
+        if let Some(st) = first {
+            input.set_locked(st.locked);
+            let _ = out_tx.send(Out::Json(H2C::SystemState {
+                locked: st.locked,
+                has_desktop: st.has_desktop,
+            }));
+            sent_state = Some(st);
+            info!(
+                locked = st.locked,
+                has_desktop = st.has_desktop,
+                "会话开局的桌面状态（已先于任何输入告知控制端）"
+            );
+        }
+    }
 
     let outcome = control_loop(
         &mut in_rx,

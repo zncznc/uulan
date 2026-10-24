@@ -235,6 +235,16 @@ pub fn plan(steps: &[Step], screen_w: u32, screen_h: u32) -> Vec<Action> {
 pub async fn run(control: SecControl, steps: &[Step], screen_w: u32, screen_h: u32) -> Result<u64> {
     let link = ControlLink::start(control);
     let input = link.input();
+    // 先等被控端的桌面状态（它开局就发，正常是几毫秒）。
+    //
+    // 不等就会有一个真踩到过的窗口：注入跑在状态到达之前，于是键鼠进了锁屏。
+    // 被控端那边现在也会挡（那是权威的一侧），但脚本化验收要的是「一开始就不发」。
+    // 等不到（老版本被控端不发这条）就照旧往下走，不因为等不到而失败。
+    let status = link.status();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    while !status.snapshot().known && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let actions = plan(steps, screen_w, screen_h);
     let mut sent = 0u64;
     for a in &actions {
@@ -255,6 +265,11 @@ pub async fn run(control: SecControl, steps: &[Step], screen_w: u32, screen_h: u
 
     let st = link.stats();
     let si = st.snapshot();
+    let hs = status.snapshot();
+    if hs.known && hs.locked {
+        // 说清楚「为什么一条都没注入」：不然看图的人会以为是注入坏了。
+        println!("被控端处于锁屏：键鼠按策略不发（XTest 会绕过锁屏抓取，往锁屏里打字有风险）");
+    }
     println!(
         "已发送 {} 条输入帧（移动 {} / 按键 {} / 文本 {} / 点击 {} / 滚轮 {}；未送出 {}；被控端拒绝 {}）",
         sent, si.moves, si.keys, si.chars, si.buttons, si.wheels, si.dropped, si.host_errors
