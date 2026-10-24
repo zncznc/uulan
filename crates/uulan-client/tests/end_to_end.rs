@@ -111,6 +111,10 @@ async fn spawn_host(
                     screen_probe: None,
                     pty: None,   // 终端后端：None = 生产用的 portable-pty
                     fs_roots: None,
+                    // None = 读 /proc（生产）；测试可注入假来源。
+                    sys_source: None,
+                    // None = 按采集源自动决定（X11 → 读焦点窗口名）。
+                    lock_probe: None,
                 };
                 let a = addr.clone();
                 let dtx = done_tx.clone();

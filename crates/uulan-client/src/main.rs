@@ -52,6 +52,9 @@ struct Args {
     /// 脚本化键鼠注入（`--inject`）：只发输入、不收画面，跑完就退出。
     /// 存在的理由是「键鼠真的打进了被控端」必须能机器验证，不能靠人手点。
     inject: Option<String>,
+    /// 只看被控端状态（`--status <秒>`）：读控制通道上的 Metrics / SystemState，
+    /// 每秒打一行。存在的理由同 `--inject`：负载与锁屏也必须能机器验证。
+    status: Option<f64>,
 }
 
 const HELP: &str = "\
@@ -87,6 +90,7 @@ uulan-client —— uulan 内网远控的控制端
   --term-shell <path>         指定远端 shell，例：--term-shell /bin/bash
 
 键鼠注入（脚本化，做完就退出；不开窗口、不收画面）：
+  --status <秒>       只读被控端状态（CPU/内存/锁屏），每秒一行，跑完退出
   --inject \"<脚本>\"           沿真实链路把键鼠打进被控端，用来机器验证「真的打进去了」
                              步骤用 ; 分隔：move:X,Y（屏幕像素）/ movn:X,Y（0..1）
                              click:left|right|middle / down:left / up:left
@@ -126,6 +130,7 @@ fn parse_args() -> Result<Args> {
         term_size: None,
         term_shell: None,
         inject: None,
+        status: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -161,6 +166,14 @@ fn parse_args() -> Result<Args> {
                 a.term_size = Some(parse_size(&v)?);
             }
             "--term-shell" => a.term_shell = Some(it.next().context("--term-shell 需要一个路径")?),
+            "--status" => {
+                a.status = Some(
+                    it.next()
+                        .context("--status 需要一个秒数，例如 --status 8")?
+                        .parse()
+                        .context("--status 的秒数不是数字")?,
+                )
+            }
             "--inject" => {
                 a.inject = Some(it.next().context("--inject 需要一个脚本，例如 \"click:left\"")?)
             }
@@ -305,6 +318,8 @@ async fn main() -> Result<()> {
     if args.term {
         caps.push(Cap::Terminal);
     }
+    // 系统指标：控制端总要能显示（窗口标题 / --status），所以总是声明。
+    caps.push(Cap::Metrics);
 
     info!(server = %args.server, device = %args.device, "正在连接");
     let c = match connect::connect(&args.server, &args.device, &args.password, &args.name, caps).await
@@ -360,6 +375,40 @@ async fn main() -> Result<()> {
         let follow = args.term_size.is_none();
         let code = uulan_client::termx::run(c.control, opts, follow).await?;
         std::process::exit(code);
+    }
+
+    // 被控端状态：只读，不注入、不收画面。跑 N 秒、每秒一行，收尾打汇总。
+    //
+    // 这是 `H2C::Metrics` / `H2C::SystemState` 唯一的机器可验路径：窗口标题里的
+    // 「CPU 12% / 已锁屏」靠人眼看，而验收要的是能 grep 出来的数字。
+    if let Some(secs) = args.status {
+        drop(c.video);
+        let link = uulan_client::control::ControlLink::start(c.control);
+        let st = link.status();
+        let deadline = Instant::now() + Duration::from_secs_f64(secs);
+        println!("被控端状态：每秒一行（{secs} 秒）");
+        while Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let s = st.snapshot();
+            println!(
+                "locked={} has_state={} cpu={:.1}% mem={}/{}MB rtt={}ms metrics={} changes={}",
+                s.locked,
+                s.known,
+                s.cpu_pct_x100 as f64 / 100.0,
+                s.mem_used_mb,
+                s.mem_total_mb,
+                s.rtt_ms,
+                s.metrics_recv,
+                s.state_changes
+            );
+        }
+        let s = st.snapshot();
+        println!(
+            "状态汇总：指标 {} 条 / 状态变化 {} 次 / 锁屏丢弃键鼠 {} 条",
+            s.metrics_recv, s.state_changes, s.dropped_locked
+        );
+        link.close("状态查看结束").await;
+        return Ok(());
     }
 
     // 键鼠注入：只发输入，跑完就退。这是「XTest 真的把键鼠打进去了」的唯一机器可验路径 ——
@@ -450,7 +499,8 @@ async fn main() -> Result<()> {
             None
         };
 
-        let r = uulan_client::window::run(rx, stats, overlay, args.seconds, input);
+        let st = link.status();
+        let r = uulan_client::window::run(rx, stats, overlay, args.seconds, input, Some(st.clone()));
         // 道别：让被控端立刻收尾（松开按键、断开视频），而不是等 TCP 超时。
         // 统计要在 close 之前拿到（close 会消费掉 link）。
         let in_stats = link.stats();
@@ -463,6 +513,14 @@ async fn main() -> Result<()> {
         println!(
             "剪贴板同步：发送 {} / 接收 {}（本机写入失败 {}）",
             si.clips_sent, si.clips_recv, si.clip_errors
+        );
+        let hs = st.snapshot();
+        println!(
+            "被控端状态：指标 {} 条 / 状态变化 {} 次 / 锁屏时丢弃键鼠 {} 条{}",
+            hs.metrics_recv,
+            hs.state_changes,
+            hs.dropped_locked,
+            if hs.known && hs.locked { "（当前：已锁屏）" } else { "" }
         );
         watcher.shutdown();
         let s = watcher.snapshot();

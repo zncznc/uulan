@@ -14,6 +14,7 @@ pub mod capture;
 pub mod config;
 pub mod input;
 pub mod portmap;
+pub mod probe;
 pub mod session;
 pub mod term;
 

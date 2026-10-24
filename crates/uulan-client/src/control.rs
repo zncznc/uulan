@@ -12,7 +12,7 @@
 //! 而**丢一个松开事件就会让被控端的键卡住**。宁可多占几十 KB，也不能丢。
 
 use uulan_protocol::crypto::SecControl;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 
 use uulan_clip::{poll_outbound, ClipSync, Clipboard, POLL_INTERVAL};
 use uulan_protocol::frame::{read_frame, write_frame, FrameKind};
-use uulan_protocol::msg::{C2H, H2C};
+use uulan_protocol::msg::{C2H, H2C, Metrics};
 
 /// 上报与回报的计数。收工时打印，作为「输入真的发出去了」的机器可查证据。
 #[derive(Debug, Default)]
@@ -80,16 +80,104 @@ impl InputStats {
     }
 }
 
+/// 被控端上报的运行状态（`H2C::Metrics` / `H2C::SystemState`）。
+///
+/// 这两个消息以前**被控端一条都没发过**（协议里有、主循环里没人收），于是控制端
+/// 既看不到对面的负载，也不知道对面锁屏了 —— 键鼠继续往锁屏里送。
+///
+/// 原子量存整数：`cpu` 存「百分比 ×100」（`f32` 放进 `AtomicU64` 要 `to_bits`，
+/// 读的时候还得自己解释；×100 取整后误差 0.01%，对显示没有意义损失）。
+#[derive(Debug, Default)]
+pub struct HostStatus {
+    locked: AtomicBool,
+    /// 是否收到过 `SystemState`。没收到过时**不能**当作「没锁」去判断，
+    /// 但也不能当作「锁着」把键鼠掐掉（老版本被控端根本不发这条）。
+    known: AtomicBool,
+    cpu_x100: AtomicU64,
+    mem_used_mb: AtomicU64,
+    mem_total_mb: AtomicU64,
+    rtt_ms: AtomicU64,
+    /// 收到多少条 `Metrics`。
+    metrics_recv: AtomicU64,
+    /// 状态变化次数（每次 `SystemState` 变化 +1）。
+    state_changes: AtomicU64,
+    /// 因为「被控端锁屏」而没发出去的输入消息数。
+    dropped_locked: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HostStatusSnapshot {
+    pub locked: bool,
+    pub known: bool,
+    pub cpu_pct_x100: u64,
+    pub mem_used_mb: u64,
+    pub mem_total_mb: u64,
+    pub rtt_ms: u64,
+    pub metrics_recv: u64,
+    pub state_changes: u64,
+    pub dropped_locked: u64,
+}
+
+impl HostStatus {
+    pub fn locked(&self) -> bool {
+        self.locked.load(Ordering::Relaxed)
+    }
+
+    pub fn snapshot(&self) -> HostStatusSnapshot {
+        HostStatusSnapshot {
+            locked: self.locked(),
+            known: self.known.load(Ordering::Relaxed),
+            cpu_pct_x100: self.cpu_x100.load(Ordering::Relaxed),
+            mem_used_mb: self.mem_used_mb.load(Ordering::Relaxed),
+            mem_total_mb: self.mem_total_mb.load(Ordering::Relaxed),
+            rtt_ms: self.rtt_ms.load(Ordering::Relaxed),
+            metrics_recv: self.metrics_recv.load(Ordering::Relaxed),
+            state_changes: self.state_changes.load(Ordering::Relaxed),
+            dropped_locked: self.dropped_locked.load(Ordering::Relaxed),
+        }
+    }
+
+    fn apply_metrics(&self, m: &Metrics) {
+        let cpu = if m.cpu.is_finite() { m.cpu.clamp(0.0, 100.0) } else { 0.0 };
+        self.cpu_x100.store((cpu * 100.0) as u64, Ordering::Relaxed);
+        self.mem_used_mb.store(m.mem_used / (1024 * 1024), Ordering::Relaxed);
+        self.mem_total_mb.store(m.mem_total / (1024 * 1024), Ordering::Relaxed);
+        self.rtt_ms.store(m.rtt_ms as u64, Ordering::Relaxed);
+        self.metrics_recv.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 返回 `Some(变了没)`：第一次收到也算「变了」（要打一行日志）。
+    fn apply_state(&self, locked: bool, has_desktop: bool) -> bool {
+        let first = !self.known.swap(true, Ordering::Relaxed);
+        let prev = self.locked.swap(locked, Ordering::Relaxed);
+        if first || prev != locked {
+            self.state_changes.fetch_add(1, Ordering::Relaxed);
+        }
+        let _ = has_desktop;
+        first || prev != locked
+    }
+}
+
 /// 给窗口线程用的发送端（`send` 是同步的，窗口事件循环里可以直接调）。
 #[derive(Clone)]
 pub struct InputSender {
     tx: mpsc::UnboundedSender<C2H>,
     stats: Arc<InputStats>,
+    status: Arc<HostStatus>,
 }
 
 impl InputSender {
     /// 上报一条输入消息。返回 false 表示控制通道已经没了。
+    ///
+    /// 被控端锁屏时**在这里就短路**：被控端自己也会丢（那是权威的一侧），
+    /// 但控制端不该把每秒上百条鼠标移动白送过去。返回 `true` 是有意的 ——
+    /// 这条消息不是「通道坏了」，而是「按状态不发」，混成一个 `false` 会让
+    /// 窗口以为连接断了。
     pub fn send(&self, m: C2H) -> bool {
+        if m.is_input() && self.status.locked() {
+            self.status.dropped_locked.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         match &m {
             C2H::MouseMoveAbs { .. } | C2H::MouseMoveRel { .. } => {
                 self.stats.moves.fetch_add(1, Ordering::Relaxed);
@@ -121,6 +209,7 @@ impl InputSender {
 pub struct ControlLink {
     input: InputSender,
     stats: Arc<InputStats>,
+    status: Arc<HostStatus>,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -138,11 +227,14 @@ impl ControlLink {
     pub fn start_with_clipboard(control: SecControl, clipboard: Option<Box<dyn Clipboard>>) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<C2H>();
         let stats = Arc::new(InputStats::default());
+        let status = Arc::new(HostStatus::default());
         let st = stats.clone();
+        let status_rx = status.clone();
 
         let handle = tokio::spawn(async move {
             let (mut rd, mut wr) = control.into_split();
             let mut clip = clipboard;
+            let status = status_rx;
             let mut clip_sync = ClipSync::new();
             // 基线：连接这一刻本机剪贴板里已有的内容不算「新内容」，不推给对面。
             // 在任务开头就读一次（而不是等第一拍轮询），把「刚连上就复制」的窗口压到最小。
@@ -207,7 +299,23 @@ impl ControlLink {
                                 Ok(H2C::ClipOffer { len }) => {
                                     debug!(len, "被控端声明有新剪贴板内容（第一版只支持直接内容）");
                                 }
-                                Ok(H2C::Metrics(_)) => debug!("收到被控端指标"),
+                                Ok(H2C::Metrics(m)) => {
+                                    status.apply_metrics(&m);
+                                    debug!(cpu = m.cpu, mem_total = m.mem_total, "收到被控端指标");
+                                }
+                                Ok(H2C::SystemState { locked, has_desktop }) => {
+                                    // 变化才打日志，否则每秒一条会把窗口模式的终端刷满。
+                                    if status.apply_state(locked, has_desktop) {
+                                        if locked {
+                                            warn!(
+                                                has_desktop,
+                                                "被控端已锁屏：暂停发送键鼠（解锁后自动恢复）"
+                                            );
+                                        } else {
+                                            info!(has_desktop, "被控端已解锁：恢复发送键鼠");
+                                        }
+                                    }
+                                }
                                 Ok(_) => {}
                                 Err(e) => debug!(error = %e, "控制通道上收到无法解析的 JSON"),
                             },
@@ -233,10 +341,16 @@ impl ControlLink {
         });
 
         Self {
-            input: InputSender { tx, stats: stats.clone() },
+            input: InputSender { tx, stats: stats.clone(), status: status.clone() },
             stats,
+            status,
             handle,
         }
+    }
+
+    /// 被控端运行状态（CPU / 内存 / 锁屏）。窗口标题与收工统计都用它。
+    pub fn status(&self) -> Arc<HostStatus> {
+        self.status.clone()
     }
 
     pub fn input(&self) -> InputSender {
@@ -269,7 +383,11 @@ mod tests {
     fn stats_count_by_message_kind() {
         let s = Arc::new(InputStats::default());
         let (tx, _rx) = mpsc::unbounded_channel();
-        let sender = InputSender { tx, stats: s.clone() };
+        let sender = InputSender {
+            tx,
+            stats: s.clone(),
+            status: Arc::new(HostStatus::default()),
+        };
         assert!(sender.send(C2H::MouseMoveAbs { x: 0.5, y: 0.5 }));
         assert!(sender.send(C2H::Key { vk: 0x41, down: true, repeat: false }));
         assert!(sender.send(C2H::Ping { seq: 1, sent_ms: 0 }));
@@ -283,8 +401,76 @@ mod tests {
         let s = Arc::new(InputStats::default());
         let (tx, rx) = mpsc::unbounded_channel();
         drop(rx); // 写出任务没了
-        let sender = InputSender { tx, stats: s.clone() };
+        let sender = InputSender {
+            tx,
+            stats: s.clone(),
+            status: Arc::new(HostStatus::default()),
+        };
         assert!(!sender.send(C2H::Key { vk: 0x41, down: false, repeat: false }));
         assert_eq!(s.snapshot().dropped, 1);
+    }
+
+    #[test]
+    fn locked_host_stops_input_at_the_client_and_keeps_the_channel_healthy() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let st = Arc::new(HostStatus::default());
+        st.apply_state(true, true);
+        let sender = InputSender { tx, stats: Arc::new(InputStats::default()), status: st.clone() };
+
+        // 锁屏期间：输入类消息一律不发，但**返回 true**（通道没坏，别让窗口以为断线了）
+        assert!(sender.send(C2H::MouseMoveAbs { x: 0.5, y: 0.5 }));
+        assert!(sender.send(C2H::Key { vk: 0x41, down: true, repeat: false }));
+        assert!(rx.try_recv().is_err(), "锁屏时不该往控制通道里塞输入");
+        assert_eq!(st.snapshot().dropped_locked, 2);
+        assert_eq!(sender.stats.snapshot().total(), 0, "没发出去就不该算进上报计数");
+
+        // 非输入消息照常走：锁屏时还得能传文件/发剪贴板/道别
+        assert!(sender.send(C2H::Clip { text: "还在工作".into() }));
+        assert!(matches!(rx.try_recv(), Ok(C2H::Clip { .. })));
+
+        // 解锁后立刻恢复
+        st.apply_state(false, true);
+        assert!(sender.send(C2H::MouseMoveAbs { x: 0.1, y: 0.1 }));
+        assert!(matches!(rx.try_recv(), Ok(C2H::MouseMoveAbs { .. })));
+    }
+
+    #[test]
+    fn metrics_are_stored_and_clamped_for_display() {
+        let st = HostStatus::default();
+        assert_eq!(st.snapshot().metrics_recv, 0);
+        st.apply_metrics(&Metrics {
+            cpu: 1234.5,           // 脏数据（不该出现）：显示成 100%
+            mem_used: 3 * 1024 * 1024 * 1024,
+            mem_total: 8 * 1024 * 1024 * 1024,
+            net_rx: 1,
+            net_tx: 2,
+            rtt_ms: 7,
+        });
+        let s = st.snapshot();
+        assert_eq!(s.cpu_pct_x100, 10_000, "超过 100% 要夹住，别把标题撑爆");
+        assert_eq!((s.mem_used_mb, s.mem_total_mb), (3072, 8192));
+        assert_eq!(s.rtt_ms, 7);
+        assert_eq!(s.metrics_recv, 1);
+        // NaN 也不能让标题出现 "NaN%"
+        st.apply_metrics(&Metrics {
+            cpu: f32::NAN,
+            mem_used: 0,
+            mem_total: 0,
+            net_rx: 0,
+            net_tx: 0,
+            rtt_ms: 0,
+        });
+        assert_eq!(st.snapshot().cpu_pct_x100, 0);
+    }
+
+    #[test]
+    fn first_state_message_always_counts_as_a_change() {
+        let st = HostStatus::default();
+        assert!(!st.snapshot().known);
+        assert!(st.apply_state(false, true), "第一条 SystemState 要打日志");
+        assert!(!st.apply_state(false, true), "同状态不重复打日志");
+        assert!(st.apply_state(true, true));
+        assert_eq!(st.snapshot().state_changes, 2);
+        assert!(st.snapshot().locked);
     }
 }

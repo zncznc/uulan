@@ -85,6 +85,10 @@ async fn spawn_host(server: &str, cfg: HostConfig, home: PathBuf) -> String {
                     screen_probe: None,
                     pty: None,   // 终端后端：None = 生产用的 portable-pty
                     fs_roots: Some(FsRoots::new(home.clone(), true)),
+                    // None = 读 /proc（生产）；测试可注入假来源。
+                    sys_source: None,
+                    // None = 按采集源自动决定（X11 → 读焦点窗口名）。
+                    lock_probe: None,
                 };
                 let a = addr.clone();
                 tokio::spawn(async move {

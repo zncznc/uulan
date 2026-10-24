@@ -321,6 +321,10 @@ async fn run_forever(
                     fs_roots: None,
                     // None = 生产用的 portable-pty。
                     pty: None,
+                    // None = 读 /proc（生产）；测试可注入假来源。
+                    sys_source: None,
+                    // None = 按采集源自动决定（X11 → 读焦点窗口名）。
+                    lock_probe: None,
                 };
                 let conn_addr = state.snapshot().server.clone();
                 tokio::spawn(async move {

@@ -27,7 +27,7 @@ use anyhow::{anyhow, Context, Result};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use crate::control::InputSender;
+use crate::control::{HostStatus, InputSender};
 use crate::input::{fit_rect, key_action, key_messages, line_units, norm_point, vk_from_key, Mods,
                   Rect, WheelAccum};
 use crate::watch::{Frame, WatchStats, WatchStatsSnapshot};
@@ -50,6 +50,13 @@ pub struct Overlay {
     pub first_frame_ms: Option<u64>,
     /// 被控端上报的实测编码帧率（0 = 还没测出来）。
     pub host_fps: f32,
+    /// 被控端 CPU 占用（`H2C::Metrics`，0..100）。
+    pub cpu_pct: f32,
+    /// 被控端内存（MB）。`mem_total_mb == 0` = 还没收到过指标。
+    pub mem_used_mb: u64,
+    pub mem_total_mb: u64,
+    /// 被控端已锁屏 —— 标题上要写明「键鼠已暂停」，否则用户只会觉得「键鼠坏了」。
+    pub locked: bool,
 }
 
 impl Overlay {
@@ -68,6 +75,18 @@ impl Overlay {
         }
         if let Some(ms) = self.first_frame_ms {
             s.push_str(&format!(" · 首帧 {}ms", ms));
+        }
+        if self.mem_total_mb > 0 {
+            s.push_str(&format!(
+                " · 被控端 CPU {:.0}% · 内存 {:.1}/{:.1} GB",
+                self.cpu_pct,
+                self.mem_used_mb as f64 / 1024.0,
+                self.mem_total_mb as f64 / 1024.0
+            ));
+        }
+        if self.locked {
+            // 放在最后：锁屏是「现在为什么点不动」的直接答案，最该一眼看到。
+            s.push_str(" · 已锁屏（键鼠已暂停）");
         }
         s
     }
@@ -93,6 +112,8 @@ struct App {
     deadline: Option<std::time::Instant>,
     /// 键鼠上报通道。`None` = 只读模式（`--no-input`，或没有图形会话的被控端）。
     input: Option<InputSender>,
+    /// 被控端的运行状态（CPU / 内存 / 锁屏）。`None` = 老版本被控端不发这两条消息。
+    status: Option<std::sync::Arc<HostStatus>>,
     /// 当前修饰键状态。判断「这是快捷键还是文本输入」用。
     mods: Mods,
     /// 最近一帧的画面尺寸，用来把光标位置换算成画面坐标。
@@ -110,8 +131,10 @@ impl App {
         overlay: Overlay,
         deadline: Option<std::time::Instant>,
         input: Option<InputSender>,
+        status: Option<std::sync::Arc<HostStatus>>,
     ) -> Self {
         Self {
+            status,
             rx,
             stats,
             overlay,
@@ -278,6 +301,15 @@ impl App {
         self.overlay.dropped = s.dropped;
         self.overlay.first_frame_ms = (s.first_frame_ms > 0).then_some(s.first_frame_ms);
         self.overlay.host_fps = s.host_fps_x10 as f32 / 10.0;
+        if let Some(st) = self.status.as_ref() {
+            let h = st.snapshot();
+            self.overlay.cpu_pct = h.cpu_pct_x100 as f32 / 100.0;
+            self.overlay.mem_used_mb = h.mem_used_mb;
+            self.overlay.mem_total_mb = h.mem_total_mb;
+            // 没收到过 SystemState 就当作「没锁」：老版本被控端不发这条，
+            // 不能因为它不说话就把用户的键鼠标成暂停。
+            self.overlay.locked = h.known && h.locked;
+        }
         self.prev = s;
         self.overlay_since = std::time::Instant::now();
         window.set_title(&self.overlay.title(ww, wh));
@@ -417,12 +449,13 @@ pub fn run(
     overlay: Overlay,
     seconds: Option<f64>,
     input: Option<InputSender>,
+    status: Option<Arc<HostStatus>>,
 ) -> Result<()> {
     let event_loop = EventLoop::new().context("创建事件循环失败（没有可用的显示环境？）")?;
     // Poll：不睡等事件，保证有帧时能立刻画出来
     event_loop.set_control_flow(ControlFlow::Poll);
     let deadline = seconds.map(|s| std::time::Instant::now() + std::time::Duration::from_secs_f64(s));
-    let mut app = App::new(rx, stats, overlay, deadline, input);
+    let mut app = App::new(rx, stats, overlay, deadline, input, status);
     event_loop.run_app(&mut app).context("窗口事件循环异常退出")?;
     info!(painted = app.painted, input_sent = app.input_sent, "窗口已关闭");
     Ok(())
@@ -480,7 +513,7 @@ mod tests {
 
     fn app_with(frame: Option<Frame>) -> App {
         let (_tx, rx) = watch::channel(frame);
-        App::new(rx, Arc::new(WatchStats::default()), Overlay::default(), None, None)
+        App::new(rx, Arc::new(WatchStats::default()), Overlay::default(), None, None, None)
     }
 
     #[test]
@@ -523,6 +556,26 @@ mod tests {
         app.blit(&frame(100, 100, (0, 255, 0)), 10, 10);
         assert_eq!(app.buf.len(), 100);
         assert!(app.buf.iter().all(|p| *p == 0x0000_FF00), "应是满屏绿");
+    }
+
+    #[test]
+    fn title_shows_host_load_and_lock_state() {
+        let mut o = Overlay { host_name: "KIRIN".into(), screen: (1920, 1080), ..Default::default() };
+        // 还没收到指标：标题里不该冒出「CPU」「内存」这些空字段
+        assert!(!o.title(1280, 720).contains("CPU"));
+        assert!(!o.title(1280, 720).contains("已锁屏"));
+
+        o.cpu_pct = 12.4;
+        o.mem_used_mb = 3481;
+        o.mem_total_mb = 8192;
+        let t = o.title(1280, 720);
+        assert!(t.contains("CPU 12%"), "{t}");
+        assert!(t.contains("3.4/8.0 GB"), "{t}");
+
+        o.locked = true;
+        let t = o.title(1280, 720);
+        assert!(t.contains("已锁屏"), "{t}");
+        assert!(t.contains("键鼠已暂停"), "{t}");
     }
 
     #[test]

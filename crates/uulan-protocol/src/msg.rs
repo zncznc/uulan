@@ -107,6 +107,28 @@ pub enum C2H {
     Bye { reason: String },
 }
 
+impl C2H {
+    /// 这条消息是不是「键鼠输入」。
+    ///
+    /// 两端都要用它，所以它属于协议而不是各写一遍：
+    /// - **被控端**用它做锁屏门禁 —— 锁屏时只丢这几类，剪贴板/文件/终端/Ping 照样要通；
+    /// - **控制端**用它做同一个判断（锁屏时干脆不发），省一次无用的往返。
+    ///
+    /// 判漏一个（比如以后加了「触摸」却忘了写进来）的后果是：锁屏时那条消息会被
+    /// 放进 Mapper，于是解锁后可能出现卡住的按键。表驱动比 `matches!` 更容易被测试钉住。
+    pub fn is_input(&self) -> bool {
+        matches!(
+            self,
+            C2H::MouseMoveAbs { .. }
+                | C2H::MouseMoveRel { .. }
+                | C2H::MouseButton { .. }
+                | C2H::MouseWheel { .. }
+                | C2H::Key { .. }
+                | C2H::KeyChar(_)
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyInput {
     pub target: KeyTarget,
@@ -465,6 +487,32 @@ mod tests {
         assert_eq!(quality_preset(Quality::Auto).1, 0);
         // 档位越高质量要求越高（CQ 越小）
         assert!(quality_preset(Quality::Bluray).0 < quality_preset(Quality::Fast).0);
+    }
+
+    #[test]
+    fn only_injection_messages_count_as_input() {
+        // 是输入的（会被锁屏门禁挡住）
+        for m in [
+            C2H::MouseMoveAbs { x: 1.0, y: 2.0 },
+            C2H::MouseMoveRel { dx: 1, dy: 2 },
+            C2H::MouseButton { button: MouseButton::Left, down: true },
+            C2H::MouseWheel { dx: 0, dy: 120 },
+            C2H::Key { vk: 0x41, down: true, repeat: false },
+            C2H::KeyChar(KeyInput { target: KeyTarget::Char { ch: '中' }, down: true }),
+        ] {
+            assert!(m.is_input(), "{m:?} 应当算输入");
+        }
+        // 不是输入的：锁屏时必须照样能走（传文件、开终端、读剪贴板、心跳、道别）
+        for m in [
+            C2H::VideoSet(VideoSet::default()),
+            C2H::Clip { text: "x".into() },
+            C2H::ClipOffer { len: 1 },
+            C2H::Ping { seq: 1, sent_ms: 0 },
+            C2H::Bye { reason: "bye".into() },
+            C2H::Power { action: PowerAction::Lock },
+        ] {
+            assert!(!m.is_input(), "{m:?} 不该算输入");
+        }
     }
 
     #[test]

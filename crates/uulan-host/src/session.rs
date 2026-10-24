@@ -50,6 +50,7 @@ use crate::capture::CaptureInput;
 use crate::config::HostConfig;
 use crate::input::{default_sink, Inject, InputSink, Mapper};
 use crate::portmap::{PortMap, PortPolicy};
+use crate::probe::{self, DesktopState, LockProbe, MetricsSampler, SysSource};
 
 /// 实测帧率：按固定窗口统计编码器**真正产出**的 AU 数。
 ///
@@ -418,6 +419,16 @@ pub struct SessionParams {
     /// 注入的唯一理由是测试：本机没有可用的 PTY 路径，要验「开→写→切帧→退出→收尾」
     /// 这条链路只能塞一个内存假 shell（同 `clipboard` / `screen_probe` 的思路）。
     pub pty: Option<Box<dyn PtyFactory>>,
+    /// 系统指标的数据来源。`None` = `/proc`（生产）。
+    ///
+    /// 本机（Windows）没有 `/proc`，所以「差分 / 第一拍不编数」这些规则只能靠
+    /// 注入一份假数据来验 —— 同 `screen_probe` 的思路。
+    pub sys_source: Option<Arc<dyn SysSource>>,
+    /// 锁屏 / 桌面状态探针。`None` = 按采集源自动决定（X11 采集 → 读焦点窗口名）。
+    ///
+    /// 注入它才能验「锁屏后键鼠被丢掉、且是**在**进 Mapper 之前丢的」——
+    /// 本机没有 X11 桌面可锁。
+    pub lock_probe: Option<LockProbe>,
 }
 
 #[derive(Debug)]
@@ -666,6 +677,18 @@ pub async fn run_with_sink(
     let mut clip_sync = ClipSync::new();
     let mut clip_stats = ClipStats::default();
 
+    // 系统指标：默认读 `/proc`；测试可注入假来源。
+    let mut metrics =
+        MetricsSampler::new(params.sys_source.take().unwrap_or_else(|| Arc::new(probe::ProcSource)));
+    // 锁屏探针：默认按采集源自动决定；测试注入闭包。
+    let lock = params.lock_probe.take().or_else(|| probe::production_lock_probe(&params.capture));
+    if lock.is_some() {
+        info!("桌面状态探针已启用（锁屏时停止键鼠注入）");
+    } else {
+        info!("桌面状态探针未启用（合成源 / 非 X11 采集），不会发送 SystemState");
+    }
+    let mut sent_state: Option<DesktopState> = None;
+
     let outcome = control_loop(
         &mut in_rx,
         &out_tx,
@@ -677,6 +700,9 @@ pub async fn run_with_sink(
         &fs_tx,
         &pm_tx,
         &term_tx,
+        &mut metrics,
+        &lock,
+        &mut sent_state,
     )
     .await;
 
@@ -686,6 +712,7 @@ pub async fn run_with_sink(
     info!(
         events = input.events,
         inject_errors = input.errors,
+        dropped_locked = input.dropped_locked,
         "键鼠事件统计"
     );
     let (over, empty, same) = clip_sync.skipped();
@@ -761,6 +788,9 @@ where
     if clip_available {
         caps.push(Cap::Clipboard);
     }
+    // 系统指标：Linux 上读 `/proc`，别的平台读不到就发 0 —— 但**消息本身**总是发，
+    // 所以能力位可以如实声明（控制端据此才敢显示那几项）。
+    caps.push(Cap::Metrics);
     // 端口映射不依赖平台（就是 tokio 的 TcpStream），所以总是可用。
     caps.push(Cap::PortMap);
     // 终端：`portable-pty` 两端都能编；起不来（比如配置里的 shell 不存在）会回 TermError，
@@ -838,6 +868,16 @@ const INPUT_ERROR_REPORT_EVERY: Duration = Duration::from_millis(2000);
 
 /// 屏幕尺寸探测周期（只看「变了没有」，1 秒足够灵敏又不浪费）。
 const SCREEN_POLL_INTERVAL: Duration = Duration::from_millis(1000);
+/// 系统指标（CPU / 内存 / 网速）推送周期。
+///
+/// 2 秒是权衡：控制端的窗口标题每秒刷一次，指标比它慢一拍就会跳着变；
+/// 而每 2 秒读三次 `/proc` 的代价可以忽略（几百微秒）。
+const METRICS_PUSH_EVERY: Duration = Duration::from_secs(2);
+/// 锁屏 / 桌面状态探测周期。
+///
+/// 1 秒：锁屏是「用户一锁就要立刻停止注入」的事，晚一秒就可能把口令打进别的窗口。
+/// 代价是每秒一次 `XOpenDisplay` + 读焦点窗口名（几毫秒，在阻塞线程池里跑）。
+const SYSTEM_STATE_POLL_EVERY: Duration = Duration::from_secs(1);
 /// 一次探测最多等多久。xdpyinfo 正常是几毫秒；卡住就当作「没变」。
 const SCREEN_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -896,12 +936,50 @@ struct InputLoop {
     events: u64,
     /// 注入失败次数（含被节流没上报的）。
     errors: u64,
+    /// 因为「被控端锁屏」而被丢掉的输入消息数。
+    ///
+    /// 丢掉是**在进 [`Mapper`] 之前**做的：那样 Mapper 的按下状态始终与真实注入一致，
+    /// 不会出现「按下被丢掉、松开却注入了」这种半边状态。
+    dropped_locked: u64,
+    /// 当前是否锁屏（由 [`InputLoop::set_locked`] 维护）。
+    locked: bool,
     last_report: Option<Instant>,
 }
 
 impl InputLoop {
     fn new(mapper: Mapper, sink: Box<dyn InputSink>, size_rx: watch::Receiver<Screen>) -> Self {
-        Self { mapper, sink, size_rx, events: 0, errors: 0, last_report: None }
+        Self {
+            mapper,
+            sink,
+            size_rx,
+            events: 0,
+            errors: 0,
+            dropped_locked: 0,
+            locked: false,
+            last_report: None,
+        }
+    }
+
+    /// 锁屏状态变了。
+    ///
+    /// 变成「锁着」的那一刻要把已经按下的键**松开**：控制端此刻可能正按着 Ctrl，
+    /// 而接下来的释放事件会被我们丢掉 —— 不主动松开就会在解锁后留下一个卡住的修饰键。
+    fn set_locked(&mut self, locked: bool) {
+        if self.locked == locked {
+            return;
+        }
+        self.locked = locked;
+        if locked {
+            let batch = self.mapper.release_all();
+            if !batch.is_empty() {
+                if let Err(e) = self.sink.apply(&batch) {
+                    debug!(error = %e, "锁屏时释放按键失败");
+                }
+            }
+            info!("被控端已锁屏：暂停键鼠注入（已按下的键已松开）");
+        } else {
+            info!("被控端已解锁：恢复键鼠注入");
+        }
     }
 
     /// 分辨率变了就同步给 Mapper。**必须在换算坐标之前调**，否则这一条消息会按旧尺寸落点。
@@ -943,6 +1021,27 @@ impl InputLoop {
         send_out(out, H2C::InputError { message: e })
     }
 
+    /// 锁屏期间丢掉的输入**也要让控制端知道**，否则用户只会觉得「键鼠没反应」。
+    ///
+    /// 复用它自己的节流（2 秒一条），但计数是独立的：`errors` 表示「注入失败」，
+    /// 这里表示「按策略没注入」—— 两者的排查方向完全不同，不能混成一个数。
+    fn report_dropped_locked(&mut self, out: &mpsc::UnboundedSender<Out>) -> Result<(), String> {
+        let due = self
+            .last_report
+            .map(|t| t.elapsed() >= INPUT_ERROR_REPORT_EVERY)
+            .unwrap_or(true);
+        if !due {
+            return Ok(());
+        }
+        self.last_report = Some(Instant::now());
+        send_out(
+            out,
+            H2C::InputError {
+                message: format!("被控端已锁屏，键鼠未注入（已丢 {} 条）", self.dropped_locked),
+            },
+        )
+    }
+
     /// 会话收尾：松开所有还按着的键/按钮，恢复 X 的全局状态（autorepeat、键盘映射）。
     async fn finish(&mut self) {
         let batch = self.mapper.release_all();
@@ -972,9 +1071,17 @@ async fn control_loop(
     fs_tx: &mpsc::Sender<FsOp>,
     pm_tx: &mpsc::Sender<PortMapOp>,
     term_tx: &mpsc::Sender<TermOp>,
+    metrics: &mut MetricsSampler,
+    lock: &Option<LockProbe>,
+    sent_state: &mut Option<DesktopState>,
 ) -> Result<Closed, String> {
     let mut tick = tokio::time::interval(POLL_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // 系统指标 / 锁屏状态：两条独立的慢拍，别和 500ms 的剪贴板轮询挤在一起。
+    let mut metrics_tick = tokio::time::interval(METRICS_PUSH_EVERY);
+    metrics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut state_tick = tokio::time::interval(SYSTEM_STATE_POLL_EVERY);
+    state_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // 基线：会话建立这一刻被控端剪贴板里已有的内容不算「新内容」，
     // 不推给控制端 —— 否则一连上就把对面正在用的剪贴板换掉。
     // 代价说明：X11 上这一读是同步的（最多 400ms 等所有者回应），但只在会话开头做一次，
@@ -1001,6 +1108,14 @@ async fn control_loop(
                         debug!("控制连接上收到意外的 Blob 帧，已忽略");
                     }
                     In::Msg(msg) => {
+                        // 锁屏门禁**必须放在喂 Mapper 之前**（见 dropped_locked 的注释）。
+                        // 只挡输入类消息：剪贴板、文件、终端、Ping、Bye 在锁屏时照样要工作，
+                        // 否则用户连「解锁前先传个文件」都做不到。
+                        if msg.is_input() && input.locked {
+                            input.dropped_locked += 1;
+                            input.report_dropped_locked(out)?;
+                            continue;
+                        }
                         // 先同步屏幕尺寸，再换算坐标：换分辨率后的第一条消息也不会落偏。
                         input.sync_screen();
                         match msg {
@@ -1112,6 +1227,43 @@ async fn control_loop(
                             }
                         }
                     }
+                }
+            }
+            _ = state_tick.tick() => {
+                // 锁屏 / 有没有桌面。探测失败（None）当作「不知道」：既不改状态也不发消息，
+                // 绝不用一次失败去掐掉用户的键鼠。
+                if let Some(p) = lock.as_ref() {
+                    let p = p.clone();
+                    let probed = tokio::time::timeout(
+                        SCREEN_PROBE_TIMEOUT,
+                        tokio::task::spawn_blocking(move || p()),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .flatten();
+                    if let Some(st) = probed {
+                        if *sent_state != Some(st) {
+                            input.set_locked(st.locked);
+                            info!(locked = st.locked, has_desktop = st.has_desktop, "桌面状态变化，通知控制端");
+                            if send_out(
+                                out,
+                                H2C::SystemState { locked: st.locked, has_desktop: st.has_desktop },
+                            )
+                            .is_err()
+                            {
+                                return Ok(Closed::Eof);
+                            }
+                            *sent_state = Some(st);
+                        }
+                    }
+                }
+            }
+            _ = metrics_tick.tick() => {
+                let m = metrics.sample(Instant::now());
+                debug!(cpu = m.cpu, mem_used = m.mem_used, mem_total = m.mem_total, "推送系统指标");
+                if send_out(out, H2C::Metrics(m)).is_err() {
+                    return Ok(Closed::Eof);
                 }
             }
             _ = tick.tick() => {
@@ -1592,6 +1744,59 @@ fn parse_size_from_spec(spec: &str) -> Option<Screen> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 记录型 sink：断言「被控端打算注入什么」，不需要真 X11。
+    struct Recorder(Arc<std::sync::Mutex<Vec<Inject>>>);
+
+    impl InputSink for Recorder {
+        fn name(&self) -> &'static str {
+            "recorder"
+        }
+        fn apply(&mut self, batch: &[Inject]) -> Result<(), String> {
+            self.0.lock().unwrap().extend_from_slice(batch);
+            Ok(())
+        }
+    }
+
+    fn input_loop(rec: Arc<std::sync::Mutex<Vec<Inject>>>) -> InputLoop {
+        let (_tx, rx) = watch::channel(Screen { w: 320, h: 240 });
+        let sink: Box<dyn InputSink> = Box::new(Recorder(rec));
+        InputLoop::new(Mapper::new(320, 240), sink, rx)
+    }
+
+    #[test]
+    fn locking_the_host_releases_held_keys_and_stops_further_injection() {
+        let rec = Arc::new(std::sync::Mutex::new(Vec::<Inject>::new()));
+        let mut il = input_loop(rec.clone());
+
+        // 正常状态下按下 Ctrl（0x11 = VK_CONTROL）：应当注入一条按下
+        let batch = il.mapper.key(0x11, true, false);
+        il.sink.apply(&batch).unwrap();
+        assert_eq!(rec.lock().unwrap().len(), 1, "按下应当被注入");
+
+        // 锁屏：已按下的键要立刻松开（否则解锁后就是一个卡住的 Ctrl）
+        il.set_locked(true);
+        let got = rec.lock().unwrap().clone();
+        assert_eq!(got.len(), 2, "锁屏那一刻应当补一条松开：{got:?}");
+        assert!(matches!(got[1], Inject::Key { down: false, .. }), "{got:?}");
+        assert!(il.locked);
+        assert_eq!(il.mapper.release_all().len(), 0, "键已经放开过了，不该再有残留");
+
+        // 判据：会话里那条门禁用的正是 `is_input() && locked`
+        assert!(C2H::Key { vk: 0x41, down: true, repeat: false }.is_input());
+        assert!(!C2H::Clip { text: "锁屏时文件/剪贴板照样要通".into() }.is_input());
+    }
+
+    #[test]
+    fn unlocking_does_not_replay_anything() {
+        let rec = Arc::new(std::sync::Mutex::new(Vec::<Inject>::new()));
+        let mut il = input_loop(rec.clone());
+        il.set_locked(true);
+        il.set_locked(false);
+        assert!(rec.lock().unwrap().is_empty(), "锁/解锁本身不产生注入指令");
+        // 解锁后照常注入（门禁只看当前状态，不记仇）
+        assert!(il.mapper.mouse_abs(0.5, 0.5).is_some(), "解锁后位置注入照常");
+    }
 
     #[test]
     fn ct_eq_matches_normal_equality() {
