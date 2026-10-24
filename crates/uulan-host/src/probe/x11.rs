@@ -21,7 +21,11 @@ use std::ptr;
 
 use super::{looks_locked, DesktopState};
 
-enum Display {}
+// **复用**输入后端那个不透明 `Display*`：同一个 `XOpenDisplay` 在同一个 crate 里
+// 声明两次、各自带一个 `Display` 类型，rustc 会报「signature doesn't match the
+// previous declaration」（它们是同一个符号）。两个模块各写一份就得是同一个类型。
+use crate::input::x11::Display;
+
 type Window = c_ulong;
 type Atom = c_ulong;
 
@@ -29,11 +33,11 @@ type Atom = c_ulong;
 const REVERT_TO_PARENT: c_int = 2;
 const FALSE: c_int = 0;
 
+
 #[link(name = "X11")]
 extern "C" {
     fn XOpenDisplay(name: *const c_char) -> *mut Display;
     fn XCloseDisplay(dpy: *mut Display) -> c_int;
-    fn XSync(dpy: *mut Display, discard: c_int) -> c_int;
     fn XFree(data: *mut std::os::raw::c_void) -> c_int;
     fn XGetInputFocus(dpy: *mut Display, focus: *mut Window, revert: *mut c_int) -> c_int;
     fn XFetchName(dpy: *mut Display, w: Window, name: *mut *mut c_char) -> c_int;
@@ -81,7 +85,7 @@ unsafe fn focus_is_a_locker(dpy: *mut Display) -> bool {
     if focus == 0 || focus == 1 {
         return false;
     }
-    XSync(dpy, FALSE);
+    // `XGetInputFocus` 本身就是带回包的请求（已经同步过了），不必再 XSync。
     let name = window_name(dpy, focus).unwrap_or_default();
     looks_locked(&name)
 }
