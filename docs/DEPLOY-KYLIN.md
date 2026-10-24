@@ -261,18 +261,22 @@ Error: 期望 Pong，收到 Incoming {...}
 
 ---
 
-## 7. 还没做的（下一步）
+## 7. 功能状态（以 `docs/DESIGN.md` 的里程碑表为准，这里只是现场速查）
 
 | 功能 | 状态 |
 |---|---|
-| 窗口界面（winit + softbuffer） | ✅ 已完成（默认开窗口，`--headless` 保留） |
-| 键鼠注入（XTest） | ✅ 两端已接线，本机全链路测试通过；**真机未验** |
-| 键鼠注入（uinput 兜底） | 未做（X11 会话走 XTest 已够，uinput 只有 Wayland/无 X 时才需要） |
-| 剪贴板双向 | ✅ 文本已实现（Win32 + X11 后端，本机全链路 + 真 Win32 剪贴板实测）；**X11 一侧真机未验** |
-| 文件传输 / 终端 / 端口映射 | 未做 |
-| 分辨率变化后重建解码器 | 未做（`xdpyinfo` 只在启动时探测一次） |
-| `actual_fps` 按秒滑动平均 | 未做，目前恒为 0 |
-| systemd 开机自启 | 未做 |
+| 窗口界面（winit + softbuffer） | ✅ 已完成（默认开窗口，`--headless` 保留）；真机 `painted=933/870` 实测 |
+| 键鼠注入（XTest） | ✅ **真机已验**（2026-10-23）：`--inject` 打到真 `:0`，`xdotool getmouselocation` 读数精确，键位/按钮/配对全对；`XAutoRepeat` 已还原 |
+| 键鼠注入（uinput 兜底） | 仍未做（X11 会话走 XTest 已够；只有 Wayland/无 X 时才需要） |
+| 剪贴板双向 | ✅ 文本双向（Win32 + X11）；**真机 X11 与外部 X 客户端双向互通已验**。整链 Windows↔麒麟在无人值守会话里验不了（cron 没有交互式剪贴板） |
+| 文件传输 | ✅ 真二进制 6 MiB 往返 sha256 一致 |
+| 端口映射 | ✅ 真二进制 256 KiB 单流 + 两条并发流逐字节一致 |
+| 终端（PTY） | ✅ 本机真 PTY + **真麒麟**（`/dev/ptmx`、termios、winsize、退出码、SIGHUP→SIGKILL） |
+| 分辨率变化后重建解码器 | ✅ 两端都做了，本机全链路实测（真机分辨率热切未验） |
+| `actual_fps` | ✅ 被控端 1 秒窗口 `FpsMeter`，每 2 秒用 `VideoCfg.actual_fps` 推（真机自报 30.0 fps） |
+| 端到端加密 + PAKE | ✅ 强制加密（协议 v3 / 加密层 v2）；主动 MITM 既解不开也撞不了口令 |
+| systemd 自启（用户态装） | ✅ `enabled`+`active`+`Linger=yes`，`kill -s KILL` 后自动拉起；**整机重启后的自启仍未验** |
+| root 系统装（/opt/uulan） | 未验（真机 `sudo` 要口令） |
 
 ## 8. 输入注入（M3）在麒麟上的编译与验证
 

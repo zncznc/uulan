@@ -1,0 +1,109 @@
+M6 加固收尾：PAKE（CPace）—— 主动 MITM 的中继再也拿不到口令、也解不开流量
+================================================================================
+2026-10-24 夜间批（22:00 起）  提交 4c799d6
+环境：真麒麟 V10 SP1 x86_64（海光 C86），X11 1920x1080，:0 处于 UKUI 锁屏态
+      中继+被控端 = systemd 用户单元（~/.local/uulan/bin，设备 ID 805747189）
+      控制端 = ① Windows 10 上从 HEAD 编的 uulan-client ② 麒麟本机编的 uulan-client
+
+------------------------------------------------------------
+一、开工前的基线（HEAD = 43ba05e，PAKE 之前）
+------------------------------------------------------------
+从 HEAD 打包 → 真机换源码（保留 target/）→ 只编 server+host → install 进前缀 →
+systemctl --user kill -s KILL 两个单元 → 重新上线（NRestarts 计数前进）：
+
+  Windows 控制端 12s headless：
+    解出 354 帧 / 丢帧 0 / 首帧 232ms / 29.5 fps（控制端）/ 被控端自报 30.20 fps
+    平均码率 9791 kbps
+  与真机 x11grab 截图逐像素比对：相关系数 0.9980 / 平均绝对误差 0.71%
+（与 2026-10-22 的 0.9982 / 0.71%、29.1 fps 同一水平 —— 说明这一轮开始前没有回归。）
+
+------------------------------------------------------------
+二、这一轮做了什么
+------------------------------------------------------------
+M6 只剩最后一项：**主动 MITM 的中继能拿口令证明离线撞字典**。根因是不认证的 X25519
+握手 —— 中继各连各的握手，同时拿到两份主密钥，于是它既能解密全部流量，又拿着
+HMAC 证明去离线校验每个口令猜测。
+
+改成 CPace（balanced PAKE，Ristretto255）：
+
+  控制端                                            被控端
+    G = H2G(DSI‖sid‖口令)                             G_i = H2G(DSI‖sid‖候选_i)
+    Ya = G^x      --PakeInit{ya}-->                    （每个候选各一个点）
+                  <--PakeResp{yb_0..yb_n}--           Yb_i = G_i^y
+    K_i = Yb_i^x                                      K = Ya^y
+  会话密钥 = HKDF(X25519 共享点 ‖ K)                  同左（只有命中的那个 i 相等）
+
+关键决定：
+1. **零新依赖**：只用 `curve25519-dalek`（本来就在依赖树里，是 x25519-dalek 的底层）
+   的 Ristretto255 与 `from_uniform_bytes`（官方哈希到群）。内网离线打包不多带任何东西。
+2. **sid = 加密握手的转录哈希**：不绑的话，两次会话的点可以互相剪接。
+3. **多候选不改协议形态**：被控端有「永久口令 + 临时码」两个候选，PAKE 之后证明里
+   不再含口令、也没法拿口令逐个试算 —— 所以改成「控制端把每个候选次序各算一把密钥、
+   各给一份证明」，被控端拿自己那一个共享点核对，命中序号由 `AuthOk.idx` 回传。
+   `Auth` 从 `proof: String` 变成 `proofs: Vec<String>`，条数必须等于候选数（否则直接拒）。
+4. **鉴权通过后三通道原地换密钥**：控制通道用 `rekey()`（换密钥 + 计数器归零，
+   新密钥下同一个计数器值不会撞 nonce）；**绝不能**重建 `SecConn` —— 同一把密钥重建
+   会让计数器归零，那是 nonce 重用。视频/bulk 还没开始用，直接用最终密钥建。
+5. 版本：`PROTO_VERSION 2→3`、`CRYPTO_VERSION 1→2`。旧端在 `CryptoHello` 阶段
+   就被 `BadVersion` 挡掉，不会出现「一半新一半旧」的半加密状态（实测：先用旧客户端
+   连新服务端 → `ProtoMismatch 服务端协议 v3，控制端 v2`）。
+
+------------------------------------------------------------
+三、本机验证（可重复）
+------------------------------------------------------------
+  cargo test --workspace        350 passed / 0 failed（基线 344；新增 6 条）
+                                零警告；cargo build --release 零警告
+  cargo check -p uulan-host -p uulan-fs -p uulan-bulk --target x86_64-unknown-linux-gnu
+                                零警告（cfg(linux) 的 XTest 后端仍被类型检查）
+  bash scripts/verify-window-e2e.sh      painted=933 / 收到 AU 1850 / 解出 1809 / 丢帧 0
+                                         首帧 255ms（真 server + 真 host + 真 wire + 真窗口）
+  bash scripts/verify-files-e2e.sh       OK（6 MiB 往返 sha256 一致）
+  bash scripts/verify-portmap-e2e.sh     OK（262144 字节单流 + 两条并发流逐字节一致）
+  bash scripts/verify-term-e2e.sh        OK（真 PTY + 真 shell，退出码原样回来）
+  bash scripts/verify-clipboard-e2e.sh   SKIP（本 cron 会话里剪贴板不是文本）
+
+新增/改写的单测（都在 uulan-protocol 与 uulan-host）：
+  - proofs_are_directional_and_do_not_cross（两个方向的证明不能互相冒用）
+  - wrong_password_yields_unrelated_keys_and_unverifiable_proofs（错口令 → 密钥本身不同，
+    证明验不过 —— 这正是「中继无法离线校验猜测」的根）
+  - proof_matches_the_right_candidate_slot（命中第 2 个候选也能用，临时码走这条）
+  - session_keys_mix_in_the_pake_secret（PAKE 密钥参与派生）
+  - generator_depends_on_password_and_sid / points_reject_garbage_and_identity
+  - proof_count_must_match_candidate_count（组数不对直接拒；补齐就通过）
+既有测试全部改成走真 PAKE API（`keys_pair(cands, client_pw)` 在内存里跑真握手 + 真 PAKE）。
+
+------------------------------------------------------------
+四、真机验收（PAKE 版，本次实测）
+------------------------------------------------------------
+① Windows 控制端，永久口令，12s headless：
+   解出 355 帧 / 丢帧 0 / 首帧 227ms / 29.6 fps / 被控端自报 30.00 fps / 9782 kbps
+   与真机 x11grab 截图比对：**相关系数 0.9982 / 平均绝对误差 0.71%**
+   （与 PAKE 之前的 0.9980 / 0.71% 同一水平 ⇒ 密钥派生改动没影响画面通路）
+
+② 麒麟本机编出来的控制端（同一条真链路）：
+   解出 356 帧 / 丢帧 0 / 首帧 256ms / 29.6 fps / 被控端自报 30.00 fps / 9768 kbps
+
+③ 错口令：`被控端拒绝：密码不正确`，被控端 journal 记 `鉴权失败 failures=1`，
+   临时码未被消耗（配置里仍在）。
+
+④ 临时码（**另一个进程**写的码，走热加载 + PAKE 候选序号 1）：
+   - `uulan-host --new-temp-code`（短命进程写 host.json）
+   - 第一次用新码：连上，29.2 fps，journal `鉴权通过 used_temp_code=true cred_slot=1`
+   - 同一个码第二次：`密码不正确`，journal `鉴权失败 failures=1`
+   - 永久口令随后仍可用：`鉴权通过 used_temp_code=false cred_slot=0`，29.0 fps
+   （这四条同时成立，才说明「命中第几个候选」这条新链路真的通了。）
+
+⑤ 日志脱敏没被这次改动破坏：`journalctl --user -u uulan-host` 最近 2 小时 122 行里
+   `password_hits=0`（口令/临时码都不落日志；只落 `cred_slot` 这个序号）。
+
+------------------------------------------------------------
+五、仍然没验 / 已知限制（照实写）
+------------------------------------------------------------
+- **PAKE 实现是本仓库自己写的**（`crates/uulan-protocol/src/pake.rs`），没有第三方审计。
+  用到的都是成熟原语（Ristretto255 哈希到群、常数标量乘、SHA-512/256 域分隔），
+  但「自研密码学」这件事本身要写进现场文档，别当成经过审计的东西卖。
+- **只做平衡式 CPace**：双方都要知道口令。不做「恶意被控端」这类更强模型。
+- **锁定策略不变**：PAKE 把「离线撞」变成「在线撞」，口令强度与 `AUTH_MAX_FAILURES`
+  仍然决定实际强度（临时码 8 位随机 + 5 次即锁）。
+- 整机重启后的自启、root 系统装（/opt/uulan）仍是老样子：**未验**（本机 sudo 要口令，
+  重启需要人到场登录）。
