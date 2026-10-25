@@ -138,6 +138,7 @@ struct PropertyEvent {
 
 #[link(name = "X11")]
 extern "C" {
+    fn XInitThreads() -> c_int;
     fn XOpenDisplay(name: *const c_char) -> *mut Display;
     fn XCloseDisplay(dpy: *mut Display) -> c_int;
     fn XFlush(dpy: *mut Display) -> c_int;
@@ -209,6 +210,26 @@ fn intern(dpy: *mut Display, name: &str) -> Atom {
     unsafe { XInternAtom(dpy, c.as_ptr(), 0) }
 }
 
+/// 让 Xlib 变成线程安全的（进程内只需一次，必须早于**任何** Xlib 调用）。
+///
+/// 为什么必须做：被控端允许并发会话。上一条会话在别的线程上收尾（`XCloseDisplay`、
+/// `XChangeKeyboardMapping` 还原映射），下一条已经在开新连接（`XTestQueryExtension`）——
+/// 没调 `XInitThreads` 时 Xlib 没有内部锁，两个线程同时进 Xlib 是未定义行为。
+/// 真机实测过后果：`free(): invalid pointer` → SIGABRT，systemd 把被控端整个拉起来
+/// （NRestarts +1，控制端那一头看到的就是「接回失败」）。
+///
+/// 放在 `uulan-clip` 里，是因为被控端与控制端都依赖它、且两边都要开 X 显示；
+/// 每个 crate 各放一个 `Once` 的话，两个 `Once` 之间仍可能并发进 Xlib。
+pub fn init_xlib() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // 返回值 0 = 这个 Xlib 实现没有线程锁（老到不该出现在现场）。
+        if unsafe { XInitThreads() } == 0 {
+            info!("XInitThreads 返回 0：Xlib 未启用线程锁，并发会话下可能不安全");
+        }
+    });
+}
+
 struct Atoms {
     clipboard: Atom,
     primary: Atom,
@@ -260,6 +281,7 @@ unsafe impl Send for X11Clipboard {}
 impl X11Clipboard {
     /// 连上 X 显示（`None` = `$DISPLAY`），准备读写剪贴板。
     pub fn open(display: Option<&str>) -> Result<Self, String> {
+        init_xlib();
         let cname = match display {
             Some(s) if !s.is_empty() => {
                 Some(CString::new(s).map_err(|e| format!("显示名 {s:?} 含非法字符：{e}"))?)
@@ -541,6 +563,7 @@ fn service_thread(
     stop: Arc<AtomicBool>,
     rx: mpsc::Receiver<OwnerCmd>,
 ) {
+    init_xlib();
     let cname = match display_name.as_str() {
         "$DISPLAY" => None,
         s => CString::new(s).ok(),

@@ -105,6 +105,9 @@ unsafe impl Send for X11Sink {}
 impl X11Sink {
     /// 连上 X 显示（`None` = 用 `$DISPLAY`）并检查 XTest 扩展。
     pub fn open(display: Option<&str>) -> Result<Self, String> {
+        // 先装 Xlib 线程锁：被控端允许并发会话，上一条在收尾（Drop 里 XCloseDisplay）
+        // 而这一条已经在 open —— 没有这把锁就是 UB（真机上崩过 free(): invalid pointer）。
+        uulan_clip::x11::init_xlib();
         let cname = match display {
             Some(s) if !s.is_empty() => Some(
                 CString::new(s).map_err(|e| format!("显示名 {s:?} 含非法字符：{e}"))?,

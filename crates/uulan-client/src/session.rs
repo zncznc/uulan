@@ -32,6 +32,8 @@ use tracing::{info, warn};
 use crate::connect::{self, ClientError, Connected, HostInfo};
 use crate::control::{ControlLink, HostStatus, InputSender, InputStats};
 use crate::watch::{Frame, VideoWatcher, WatchError, WatchStats, WatchStatsSnapshot};
+use uulan_protocol::crypto::CryptoError;
+use uulan_protocol::frame::FrameError;
 use uulan_protocol::msg::Cap;
 use uulan_protocol::rv::ErrCode;
 use uulan_protocol::rvclient::RvError;
@@ -350,6 +352,13 @@ impl Reconnect {
 pub fn worth_retrying(e: &ClientError) -> bool {
     match e {
         ClientError::Rv(RvError::Io(_)) | ClientError::Rv(RvError::Timeout(_)) => true,
+        // 握手途中链路被切断：加密层/帧层报的 **io** 错。真机上见到的原样是
+        // 「加密: 帧: io: early eof」—— 被控端从 SIGSTOP 里回来时，中继把那条还没握完的
+        // 连接收掉了。这不是「对面明确表态」，值得再等一拍。
+        // 反过来，解密失败 / 版本不匹配 / 未知帧型是确定性的，重试一百次也一样，不许放过。
+        ClientError::Frame(FrameError::Io(_)) => true,
+        ClientError::Crypto(CryptoError::Io(_)) => true,
+        ClientError::Crypto(CryptoError::Frame(FrameError::Io(_))) => true,
         // 中继还在重启（连得上但服务端内部没准备好）、设备还没重新注册、
         // 会合票据过期（我们重连得太慢）—— 三种都是「再等一拍」。
         ClientError::Rv(RvError::Server { code, .. }) => {
@@ -605,6 +614,23 @@ mod tests {
         let e = ClientError::Rejected("密码不正确".into());
         assert!(r.retry(Some(&e)).is_none());
         assert_eq!(r.used(), 0, "被拒的情况不该消耗重连次数");
+    }
+
+    #[test]
+    fn a_transport_break_mid_handshake_is_worth_retrying() {
+        // 真机上抓到的原样：被控端从 SIGSTOP 回来时，中继把还没握完的连接收掉，
+        // 控制端看到的是「加密: 帧: io: early eof」。当成「对面拒绝」就再也不接了。
+        let eof = || io::Error::new(io::ErrorKind::UnexpectedEof, "early eof");
+        assert!(worth_retrying(&ClientError::Frame(FrameError::Io(eof()))));
+        assert!(worth_retrying(&ClientError::Crypto(CryptoError::Io(eof()))));
+        assert!(worth_retrying(&ClientError::Crypto(CryptoError::Frame(FrameError::Io(
+            eof()
+        )))));
+
+        // 确定性的失败仍然一次都不重试（解密失败 = 口令/密钥不对，未知帧型 = 协议不匹配）
+        assert!(!worth_retrying(&ClientError::Crypto(CryptoError::Decrypt)));
+        assert!(!worth_retrying(&ClientError::Frame(FrameError::UnknownKind(0x7f))));
+        assert!(!worth_retrying(&ClientError::Crypto(CryptoError::BadVersion(1))));
     }
 
     #[test]

@@ -61,6 +61,9 @@ extern "C" {
 /// 探一次：`(locked, has_desktop)`。`display` 形如 `:0` / `:0.0`。
 pub fn system_state(display: &str) -> Option<DesktopState> {
     let name = CString::new(display).ok()?;
+    // 探针每秒开一次显示、用完就关；它和别的会话的 X 调用在同一个进程里，
+    // 必须先把 Xlib 的线程锁装上（见 uulan_clip::x11::init_xlib 的说明）。
+    uulan_clip::x11::init_xlib();
     unsafe {
         let dpy = XOpenDisplay(name.as_ptr());
         if dpy.is_null() {
