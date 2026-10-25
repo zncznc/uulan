@@ -499,7 +499,16 @@ pub async fn drive(live: Arc<Live>, plan: Plan, first: Connected) {
                 if s.decoded > 0 && since.elapsed() >= Duration::from_secs(2) {
                     rc.recovered();
                 }
-                format!("画面流结束（本次会话解出 {} 帧）", s.decoded)
+                if s.silent_s > 0 {
+                    // 半开连接判死：这条会话不是「对面道别」结束的，是看门狗掐掉的。
+                    // 原因要原样带进标题/日志，否则现场只看到「画面流结束」，像正常收尾。
+                    format!(
+                        "视频通道静默 {} 秒（连接半开？），本次会话解出 {} 帧",
+                        s.silent_s, s.decoded
+                    )
+                } else {
+                    format!("画面流结束（本次会话解出 {} 帧）", s.decoded)
+                }
             }
             Err(e) if !e.retryable() => {
                 live.mark_finished(e.why());

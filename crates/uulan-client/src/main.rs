@@ -729,9 +729,15 @@ async fn watch_session(
                 }
             },
             _ = sleep => {
-                if deadline.is_some() {
-                    done = true;
-                    break;
+                // 这里只是「醒来再核一次 deadline」，**不能**因为醒了就当成跑完了：
+                // 原来写成 `if deadline.is_some() { done = true }`，于是任何 5 秒没有新帧
+                // （半开连接、被控端冻住）都会被当成「到点了、正常收工」—— 既不重连、
+                // 也不说原因，`--seconds` 一给就静默截断。
+                if let Some(d) = deadline {
+                    if Instant::now() >= d {
+                        done = true;
+                        break;
+                    }
                 }
             }
         }
@@ -808,8 +814,15 @@ async fn run_headless(
                     fresh_frames = rep.snap.decoded > 0;
                     if !args.json {
                         println!(
-                            "本次会话：解出 {} 帧 / 丢帧 {} / 首帧 {}ms",
-                            rep.snap.decoded, rep.snap.dropped, rep.snap.first_frame_ms
+                            "本次会话：解出 {} 帧 / 丢帧 {}{} / 首帧 {}ms",
+                            rep.snap.decoded,
+                            rep.snap.dropped,
+                            if rep.snap.silent_s > 0 {
+                                format!(" / 静默 {}s（半开？）", rep.snap.silent_s)
+                            } else {
+                                String::new()
+                            },
+                            rep.snap.first_frame_ms
                         );
                     }
                     report = Some(rep);
@@ -881,6 +894,7 @@ async fn run_headless(
                            "dropped": totals.dropped, "decoded": totals.decoded,
                            "first_frame_ms": s.first_frame_ms, "ended": s.ended,
                            "resizes": s.resizes,
+                           "silent_s": s.silent_s,
                            "host_fps": s.host_fps_x10 as f32 / 10.0 },
                 "sessions": sessions,
                 "reconnects": reconnects,

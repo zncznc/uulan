@@ -42,9 +42,25 @@ pub enum WatchError {
     Media(#[from] uulan_media::MediaError),
     #[error("被控端在报送画面参数前就断开了")]
     NoVideoCfg,
+    #[error("等了 {0:?} 没收到画面参数（被控端不应答，连接可能已半开）")]
+    NoVideoCfgTimeout(Duration),
     #[error("被控端拒绝推流：{0}")]
     HostRefused(String),
 }
+
+/// 视频通道「多久没有任何帧」就判定为半开。
+///
+/// 为什么必须有这条：TCP 半开时 `read_frame` **不会**返回 EOF/错误，它就永远等下去。
+/// 中继被冻结、被交换机悄悄丢掉、被控端机器休眠 —— 现象都是「画面定格、程序看起来正常」，
+/// 没有超时的话控制端会一直挂着，永远不会走到断线接回。
+///
+/// 15 秒的两头：被控端 30 fps 推流、每 2 秒一次 `VideoCfg`，正常运行时静默远小于 1 秒，
+/// 所以 15 秒不会误判；而 15 秒又足够短，用户能感觉到「卡住了 → 自己接回来」。
+pub const SILENCE_LIMIT: Duration = Duration::from_secs(15);
+
+/// 等第一条 `VideoCfg` 的上限。握手成功不等于被控端会推流：
+/// 被控端此刻可能已经冻住，那时 `start_into` 会卡在这一步，后面的静默看门狗**还没起来**。
+const VIDEO_CFG_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 累计统计。用原子量，让三个任务不必互相加锁。
 #[derive(Debug, Default)]
@@ -75,6 +91,13 @@ pub struct WatchStats {
     pub ended: AtomicBool,
     /// 因为被控端换分辨率而重建解码器的次数。
     pub resizes: AtomicU64,
+    /// 从视频通道读到的**任意**帧数（AU / Ping / VideoCfg 都算）。
+    ///
+    /// 存在的唯一理由：半开连接的判据。AU 会因为编码器卡住而不涨，`VideoCfg` 却还在每 2 秒来一次 ——
+    /// 用「任何帧」当心跳，才能把「连接死了」和「编码器卡了」分开。
+    pub frames: AtomicU64,
+    /// 静默看门狗判死时记录的静默秒数（0 = 会话正常收尾，没被判死）。
+    pub silent_s: AtomicU64,
     /// 最新一条 `VideoCfg` 报的画幅宽 / 高（换过分辨率之后就是新值）。
     pub cfg_w: AtomicU64,
     pub cfg_h: AtomicU64,
@@ -93,6 +116,8 @@ pub struct WatchStatsSnapshot {
     pub last_ts_us: u64,
     pub ended: bool,
     pub resizes: u64,
+    /// 视频通道静默被判死的秒数（0 = 没判死）。
+    pub silent_s: u64,
     pub cfg_w: u32,
     pub cfg_h: u32,
 }
@@ -111,6 +136,7 @@ impl WatchStats {
             last_ts_us: self.last_ts_us.load(Ordering::Relaxed),
             ended: self.ended.load(Ordering::Relaxed),
             resizes: self.resizes.load(Ordering::Relaxed),
+            silent_s: self.silent_s.load(Ordering::Relaxed),
             cfg_w: self.cfg_w.load(Ordering::Relaxed) as u32,
             cfg_h: self.cfg_h.load(Ordering::Relaxed) as u32,
         }
@@ -205,7 +231,12 @@ impl VideoWatcher {
         // 先同步等到 VideoCfg —— 没有它就不知道解码输出的帧尺寸。
         let mut pending: Vec<(u64, Vec<u8>)> = Vec::new();
         let info = loop {
-            let f = read_frame(&mut read_half).await?;
+            let f = match tokio::time::timeout(VIDEO_CFG_TIMEOUT, read_frame(&mut read_half)).await {
+                Ok(r) => r?,
+                // 取消一次读帧在这里是安全的：一旦超时这条会话就整体收尾、socket 跟着丢掉，
+                // 不存在「半条记录留在流里、下一个人接着读」的后续。
+                Err(_) => return Err(WatchError::NoVideoCfgTimeout(VIDEO_CFG_TIMEOUT)),
+            };
             debug!(kind = ?f.kind, len = f.payload.len(), "视频通道收到帧（等画面参数）");
             match f.kind {
                 // 画面参数是以 Json 帧发过来的（payload 里的 type 是 video_cfg）。
@@ -369,6 +400,61 @@ enum PumpEnd {
     Closed,
 }
 
+/// 「视频通道已经多久没来帧了」的纯逻辑。
+///
+/// 不碰时钟也不碰网络：`now` 与帧计数都由调用方给，于是「刚好到点 / 差一点 / 还在涨」
+/// 三种情况都能在本机用假时间钉住，不必真睡 15 秒。半开连接是**没法**在本机复现的
+/// （TCP 不报错），所以判据本身必须是纯函数，否则这条逻辑只能到真机上靠运气验证。
+#[derive(Debug)]
+pub struct SilenceWatch {
+    limit: Duration,
+    last_frames: u64,
+    /// 最后一次「帧数变了」的时刻 —— 判定的基准，不是会话开始时刻。
+    last_progress: Instant,
+}
+
+impl SilenceWatch {
+    pub fn new(limit: Duration, now: Instant) -> Self {
+        Self { limit, last_frames: 0, last_progress: now }
+    }
+
+    /// 喂一个观测：帧数变了就重置基准；没变就累积，到上限返回 `Some(已沉默多久)`。
+    ///
+    /// `limit` 为 0 表示关掉看门狗。判死返回的是**已沉默时长**而不是 `true`：
+    /// 日志里写「静默 17 秒」比「超时了」有用得多。
+    pub fn observe(&mut self, now: Instant, frames: u64) -> Option<Duration> {
+        if frames != self.last_frames {
+            self.last_frames = frames;
+            self.last_progress = now;
+            return None;
+        }
+        if self.limit.is_zero() {
+            return None;
+        }
+        let silent = now.saturating_duration_since(self.last_progress);
+        if silent >= self.limit {
+            Some(silent)
+        } else {
+            None
+        }
+    }
+}
+
+/// 把 [`SilenceWatch`] 变成一条能放进 `select!` 的 future：每秒看一次。
+///
+/// 为什么不在 `read_frame` 外面套 `timeout`：`read_frame` 不是 cancel-safe 的
+/// （取消在「读完帧头、还没读帧体」时会把流状态弄乱）。所以看门狗只**观测**，
+/// 真要收尾时由总管 abort 收帧任务并丢掉 socket —— 那时再乱的流也无所谓了。
+async fn silence_probe(w: &mut SilenceWatch, stats: &WatchStats) -> Duration {
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tick.tick().await;
+        if let Some(silent) = w.observe(Instant::now(), stats.frames.load(Ordering::Relaxed)) {
+            return silent;
+        }
+    }
+}
+
 /// 总管：一代解码流水线跑完 → 若要换分辨率，杀旧解码器、起新解码器，接着跑。
 ///
 /// ```text
@@ -398,6 +484,8 @@ async fn supervise(
     let mut reuse = Some(first);
     // socket 的两个半端在换代之间交接：pump 任务结束后把所有权带回来。
     let mut halves = Some((r, w));
+    // 静默看门狗跨代共用：换分辨率时那 0.3–1 秒的停顿不该重置（也不会，15 秒远大于它）。
+    let mut silence = SilenceWatch::new(SILENCE_LIMIT, Instant::now());
     loop {
         let (fw, fh) = (info.w, info.h);
         let mut decoder = match reuse.take() {
@@ -504,6 +592,23 @@ async fn supervise(
                 stats.ended.store(true, Ordering::Relaxed);
                 return;
             }
+            // 视频通道静默太久：TCP 半开时读不会返回任何东西，只能靠「多久没来帧」判死。
+            // 这是把会话从「画面定格、程序看着正常」里救出来的唯一一条路。
+            silent = silence_probe(&mut silence, &stats) => {
+                pump.abort();
+                decoded.abort();
+                feed.abort();
+                let _ = decoder.kill().await;
+                stats.silent_s.store(silent.as_secs(), Ordering::Relaxed);
+                stats.ended.store(true, Ordering::Relaxed);
+                warn!(
+                    silent_s = silent.as_secs(),
+                    limit_s = SILENCE_LIMIT.as_secs(),
+                    aus = stats.aus.load(Ordering::Relaxed),
+                    "视频通道静默超时（连接半开？），本会话收尾"
+                );
+                return;
+            }
         };
 
         match end {
@@ -564,6 +669,8 @@ async fn pump_generation(
                 break PumpEnd::Closed;
             }
         };
+        // 任何一帧都算「通道还活着」—— 静默看门狗看的就是这个计数。
+        stats.frames.fetch_add(1, Ordering::Relaxed);
 
         match f.kind {
             FrameKind::VideoAu => {
@@ -663,5 +770,53 @@ mod tests {
         let s = WatchStats::default();
         apply_video_cfg(&s, &cfg(100, 100, -5.0), (100, 100));
         assert_eq!(s.host_fps(), 0.0);
+    }
+
+    fn at(ms: u64) -> Instant {
+        // 基准必须是**同一个** `Instant`（`OnceLock`），否则每次调用都从「现在」重新加偏移，
+        // 「正好 15 秒」这种边界会被调用之间的微秒差推来推去，测试偶尔红。
+        static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        *BASE.get_or_init(Instant::now) + Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn silence_watch_counts_from_the_last_frame_not_from_the_start() {
+        let t0 = at(0);
+        let mut w = SilenceWatch::new(Duration::from_secs(15), t0);
+        // 10 秒时来了一帧：基准挪到 10 秒
+        assert!(w.observe(at(10_000), 7).is_none());
+        // 20 秒：才静默 10 秒，别判死
+        assert!(w.observe(at(20_000), 7).is_none(), "不能从会话开始算，要从最后一帧算");
+        // 25 秒：正好 15 秒 —— 边界算「到点」
+        let silent = w.observe(at(25_000), 7).expect("到点就该判死");
+        assert_eq!(silent.as_secs(), 15);
+    }
+
+    #[test]
+    fn a_single_frame_per_second_keeps_the_watchdog_quiet() {
+        // 正常推流（30 fps、每 2 秒一次 VideoCfg）时永远不该触发
+        let t0 = at(0);
+        let mut w = SilenceWatch::new(Duration::from_secs(15), t0);
+        for i in 1..60u64 {
+            let n = i * 3;
+            assert!(w.observe(at(i * 1_000), n).is_none(), "第 {i} 秒不该判死");
+        }
+    }
+
+    #[test]
+    fn zero_limit_disables_the_watchdog() {
+        // 排障时希望能关掉（现场要「连接死了也照旧占着」）
+        let t0 = at(0);
+        let mut w = SilenceWatch::new(Duration::ZERO, t0);
+        assert!(w.observe(at(600_000), 0).is_none());
+    }
+
+    #[test]
+    fn silence_is_reported_in_seconds_for_the_log() {
+        // 日志里要写「静默 17 秒」，所以返回的是时长而不是 bool
+        let t0 = at(0);
+        let mut w = SilenceWatch::new(Duration::from_secs(15), t0);
+        let silent = w.observe(at(17_400), 0).expect("该判死");
+        assert_eq!(silent.as_secs(), 17);
     }
 }
