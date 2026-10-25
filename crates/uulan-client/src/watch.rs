@@ -166,6 +166,8 @@ pub struct Frame {
 pub struct VideoWatcher {
     info: HostVideoCfg,
     rx: watch::Receiver<Option<Frame>>,
+    /// 「这条会话还活着吗」通道，见 [`VideoWatcher::wait_end`]。
+    alive: watch::Receiver<u8>,
     stats: Arc<WatchStats>,
     started: Instant,
     /// 收帧/喂流/重建解码器的总管任务句柄。
@@ -180,9 +182,21 @@ impl VideoWatcher {
     /// 等被控端报出画面参数，然后拉起整条解码流水线。
     ///
     /// `ffmpeg` 为 `None` 时走 PATH。
-    pub async fn start(
+    pub async fn start(video: SecConn, ffmpeg: Option<PathBuf>) -> Result<Self, WatchError> {
+        // 自己开一条帧通道。headless 用它即可：没人跨会话读它。
+        let (tx, _rx) = watch::channel::<Option<Frame>>(None);
+        Self::start_into(video, ffmpeg, tx).await
+    }
+
+    /// 同 [`VideoWatcher::start`]，但把「最新一帧」推进**调用方给的**通道。
+    ///
+    /// 窗口模式要跨会话活着，所以帧通道必须由调用方（会话槽）持有、跨会话不变；
+    /// 否则每次重连窗口手里那个接收端就指向一条再也没人写的通道 —— 画面永久冻住，
+    /// 而且看统计数字一切正常（AU 在进、解码器在出），只有屏幕不动。
+    pub async fn start_into(
         video: SecConn,
         ffmpeg: Option<PathBuf>,
+        latest_tx: watch::Sender<Option<Frame>>,
     ) -> Result<Self, WatchError> {
         // 先拆两半：等画面参数这一步可能要往视频通道回心跳（Pong），
         // 而 `read_frame` 不能和写共用同一个对象（它不是 cancel-safe 的，
@@ -252,8 +266,14 @@ impl VideoWatcher {
         let stats = Arc::new(WatchStats::default());
         // 首帧的 VideoCfg 里也带实测帧率（刚开播通常是 0，编码器重启时可能已经有值）。
         apply_video_cfg(&stats, &info, (info.w, info.h));
-        let (latest_tx, latest_rx) = watch::channel::<Option<Frame>>(None);
+        let latest_rx = latest_tx.subscribe();
         let started = Instant::now();
+        // 这条通道只干一件事：让上层知道「这条会话结束了」。
+        //
+        // 为什么不用帧通道判结束：窗口模式下帧通道的发送端由会话槽长期持有，
+        // 它永远不会「全掉」，`next_frame()` 于是永远等下去。这里的发送端只活在
+        // 总管任务里 —— 任务一返回（正常收尾、解码器起不来、被 abort），它就被丢掉。
+        let (alive_tx, alive_rx) = watch::channel(0u8);
 
         let sup = tokio::spawn(supervise(
             read_half,
@@ -265,11 +285,13 @@ impl VideoWatcher {
             stats.clone(),
             latest_tx,
             started,
+            alive_tx,
         ));
 
         Ok(Self {
             info,
             rx: latest_rx,
+            alive: alive_rx,
             stats,
             started,
             tasks: vec![sup],
@@ -307,6 +329,20 @@ impl VideoWatcher {
             let v = self.rx.borrow_and_update().clone();
             if let Some(f) = v {
                 return Some(f);
+            }
+        }
+    }
+
+    /// 等这条会话结束：视频通道关闭 / 解码流水线退出 / 任务被 abort。
+    ///
+    /// 和 [`VideoWatcher::next_frame`] 返回 `None` 的区别：`next_frame` 判断的是
+    /// 「帧通道还有没有人写」，而窗口模式下帧通道由会话槽持有、永远有人写。
+    /// 跨会话复用时必须用这个。
+    pub async fn wait_end(&mut self) {
+        // 没人会 send：这条通道的语义就是「发送端还在 = 会话还在」。
+        while self.alive.changed().await.is_ok() {
+            if *self.alive.borrow_and_update() == 1 {
+                break;
             }
         }
     }
@@ -356,6 +392,8 @@ async fn supervise(
     stats: Arc<WatchStats>,
     latest_tx: watch::Sender<Option<Frame>>,
     started: Instant,
+    // 只为了「活到本任务返回」而存在，见 VideoWatcher::wait_end。
+    _alive: watch::Sender<u8>,
 ) {
     let mut reuse = Some(first);
     // socket 的两个半端在换代之间交接：pump 任务结束后把所有权带回来。

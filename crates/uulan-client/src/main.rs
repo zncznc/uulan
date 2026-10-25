@@ -10,15 +10,17 @@
 //!   uulan-client ... --headless --json         # 以 JSON 打印统计，便于脚本消费
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use tracing::info;
 
 use uulan_client::connect::{self, ClientError};
-use uulan_protocol::rvclient::RvError;
-use uulan_client::watch::VideoWatcher;
+use uulan_client::session;
+use uulan_client::watch::WatchStatsSnapshot;
 use uulan_protocol::msg::Cap;
+use uulan_protocol::rvclient::RvError;
 
 struct Args {
     server: String,
@@ -59,6 +61,9 @@ struct Args {
     /// 连接阶段的重试次数（默认 3，0 = 不重试）。**只在「连不上」时重试**，
     /// 口令错/被锁定这类「被拒」绝不重试 —— 那是自己往锁定计数里加数。
     connect_retry: u32,
+    /// 会话中途断线后最多连续重连几次（默认 8，0 = 断线即退出）。
+    /// 与 `connect_retry` 是两件事：那是「一开始就没连上」，这是「连上了又断」。
+    reconnect: u32,
 }
 
 const HELP: &str = "\
@@ -82,6 +87,9 @@ uulan-client —— uulan 内网远控的控制端
   --json              以 JSON 输出统计（仅 --headless 下生效）
   --connect-retry <N> 连接阶段最多重试 N 次（默认 3；0 = 连一次就报错退出）
                       只在「连不上」时重试；口令错/被锁直接报错，不重试
+  --reconnect <N>     会话中途断线后最多连续重连 N 次（默认 8；0 = 断线即退出）
+                      退避 1/2/4/8/15 秒；口令错、协议不匹配这类不重试
+                      中继重启（升级）后窗口会自己接回来，不用重开
 
 文件操作（做完就退出，不开窗口、不收画面）：
   --ls <远程路径>            列目录（`:/` = 此电脑，`~/` = 家目录）
@@ -112,7 +120,7 @@ uulan-client —— uulan 内网远控的控制端
                              不加 --seconds 就一直转发，Ctrl-C 结束
   -h, --help          显示本帮助
 
-退出码：0 正常；1 被控端拒绝（密码错/离线）；2 用法错。
+退出码：0 正常；1 被控端拒绝（密码错/离线）；2 用法错；4 断线后重连放弃。
 ";
 
 fn parse_args() -> Result<Args> {
@@ -138,6 +146,7 @@ fn parse_args() -> Result<Args> {
         inject: None,
         status: None,
         connect_retry: DEFAULT_CONNECT_RETRY,
+        reconnect: DEFAULT_RECONNECT,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -183,6 +192,13 @@ fn parse_args() -> Result<Args> {
             }
             "--inject" => {
                 a.inject = Some(it.next().context("--inject 需要一个脚本，例如 \"click:left\"")?)
+            }
+            "--reconnect" => {
+                a.reconnect = it
+                    .next()
+                    .context("--reconnect 需要一个次数，例如 --reconnect 5")?
+                    .parse()
+                    .context("--reconnect 的次数不是数字")?
             }
             "--connect-retry" => {
                 a.connect_retry = it
@@ -291,6 +307,12 @@ fn parse_size(s: &str) -> Result<(u16, u16)> {
 /// 那两种情况几秒内就恢复。以前控制端一撞上就直接 exit 1，用户只能手点第二次。
 const DEFAULT_CONNECT_RETRY: u32 = 3;
 
+/// 会话中途断线后默认最多连续重连几次。
+///
+/// 8 次按 1/2/4/8/15 秒退避算下来 ≈ 2 分钟：足够跨过「中继重启 + 被控端重新注册」
+/// （真机实测 2–3 秒），又不至于让一台已经关机的机器把窗口挂一整天。
+const DEFAULT_RECONNECT: u32 = 8;
+
 /// 连接阶段的重试间隔（秒）：1、2、4、8，之后一直是 8。
 ///
 /// 和会话中途的「自动接回」不是一回事：这里只是把「多试几次」的等待定死。
@@ -371,16 +393,18 @@ async fn main() -> Result<()> {
 
     // 能力列表必须如实：声明了没实现的能力，被控端会准备好对应通道，
     // 而控制端点了没反应 —— 那种 bug 最难查。剪贴板只在真有后端时才声明。
-    let clipboard: Option<Box<dyn uulan_clip::Clipboard>> =
-        if args.no_clipboard || args.no_input {
-            if args.no_clipboard {
-                println!("剪贴板同步已按 --no-clipboard 关闭");
-            }
-            None
-        } else {
-            Some(uulan_clip::default_clipboard(None))
-        };
-    let clip_ok = clipboard.as_ref().map(|c| c.available()).unwrap_or(false);
+    //
+    // 这里这个后端只用来**探一下能不能用**（比如没有 DISPLAY 的 X11 就不可用），
+    // 探完就丢：真正的后端每条会话各建一个（见 `session::open`）。跨会话复用会把
+    // 「上一次会话还是剪贴板所有者」的状态带进新会话。
+    let clip_ok = if args.no_clipboard || args.no_input {
+        if args.no_clipboard {
+            println!("剪贴板同步已按 --no-clipboard 关闭");
+        }
+        false
+    } else {
+        uulan_clip::default_clipboard(None).available()
+    };
     let mut caps: Vec<Cap> = vec![];
     if clip_ok {
         caps.push(Cap::Clipboard);
@@ -535,19 +559,29 @@ async fn main() -> Result<()> {
     }
 
     let started = Instant::now();
-    let mut watcher = VideoWatcher::start(c.video, args.ffmpeg.clone())
-        .await
-        .context("启动视频解码失败")?;
 
-    let info = watcher.info().clone();
+    // 会话配置：窗口模式与 headless 共用同一份 —— 重连就是「拿同一份参数再握一次手」。
+    let plan = session::Plan {
+        server: args.server.clone(),
+        device: args.device.clone(),
+        password: args.password.clone(),
+        client_name: args.name.clone(),
+        caps: caps.clone(),
+        ffmpeg: args.ffmpeg.clone(),
+        clipboard: clip_ok,
+        no_input: args.no_input,
+        max_reconnects: args.reconnect,
+    };
 
     // ── 窗口模式 ──────────────────────────────────────────────────────────
-    // winit 的事件循环**必须占住主线程**，而画面接收/解码跑在 tokio 里。
-    // 所以这里把当前这个 async 主函数（它已在 tokio 的多线程运行时上）整体搬到
-    // 后台线程去跑，主线程腾出来给窗口。`rx` 是 watch 通道，天然跨线程。
+    // winit 的事件循环**必须占住主线程**，所以画面接收/解码/重连全扔到 tokio 的 worker 上。
+    // 窗口与那条会话之间只隔着 `session::Live` 这一个槽：断线重连时窗口不重建、不闪，
+    // 也不需要知道握手又走了一遍。
+    //
+    // `#[tokio::main]` 的 async 主体本来就跑在主线程，所以这里**直接同步调用**事件循环，
+    // 不要再 spawn 线程（winit 0.30 会硬性拒绝在其他线程创建事件循环）。
     if !args.headless {
-        let rx = watcher.subscribe();
-        let stats = watcher.stats();
+        let live = Arc::new(session::Live::new());
         let overlay = uulan_client::window::Overlay {
             host_name: format!("{}({})", c.host.name, c.host.os),
             screen: (c.host.screen.w, c.host.screen.h),
@@ -558,31 +592,13 @@ async fn main() -> Result<()> {
             c.host.name, c.host.os, c.host.version, c.host.screen.w, c.host.screen.h
         );
 
-        // winit 的事件循环**必须在主线程上**（winit 0.30 会硬性拒绝在其他线程创建：
-        // “Initializing the event loop outside of the main thread is a significant
-        //  cross-platform compatibility hazard”）。而 `#[tokio::main]` 的 async 主体
-        // 本来就跑在主线程，所以这里**直接同步调用**，不要再 spawn 线程。
-        //
-        // 主线程被事件循环占住不影响画面：收流、喂解码器、取帧都是 tokio 任务，
-        // 跑在多线程运行时的 worker 上。
-        //
-        // 键鼠就从这条控制连接上报：`ControlLink` 里一半任务写、一半任务读，
-        // 窗口线程只管往无界队列里塞消息（同步调用，不会卡住事件循环）。
-        let link = uulan_client::control::ControlLink::start_with_clipboard(c.control, clipboard);
-        let input = if c.host.has_desktop && !args.no_input {
-            Some(link.input())
-        } else {
-            println!("只读模式：不上报键鼠（--no-input 或被控端没有图形会话）");
-            None
-        };
+        let sup = tokio::spawn(session::drive(live.clone(), plan.clone(), c));
+        let r = uulan_client::window::run(live.clone(), overlay, args.seconds);
+        // 窗口关了（用户点的 / 到了 --seconds / 不再重连）：会话循环连同解码器一起收掉。
+        sup.abort();
 
-        let st = link.status();
-        let r = uulan_client::window::run(rx, stats, overlay, args.seconds, input, Some(st.clone()));
-        // 道别：让被控端立刻收尾（松开按键、断开视频），而不是等 TCP 超时。
-        // 统计要在 close 之前拿到（close 会消费掉 link）。
-        let in_stats = link.stats();
-        link.close("控制端关闭窗口").await;
-        let si = in_stats.snapshot();
+        // 收工统计在 abort 之后读：abort 只杀任务，原子量里的计数还在。
+        let si = live.input_stats().snapshot();
         println!(
             "输入上报：移动 {} / 按键 {} / 文本 {} / 点击 {} / 滚轮 {}（未送出 {}；被控端拒绝 {}）",
             si.moves, si.keys, si.chars, si.buttons, si.wheels, si.dropped, si.host_errors
@@ -591,7 +607,7 @@ async fn main() -> Result<()> {
             "剪贴板同步：发送 {} / 接收 {}（本机写入失败 {}）",
             si.clips_sent, si.clips_recv, si.clip_errors
         );
-        let hs = st.snapshot();
+        let hs = live.status().snapshot();
         println!(
             "被控端状态：指标 {} 条 / 状态变化 {} 次 / 锁屏时丢弃键鼠 {} 条{}",
             hs.metrics_recv,
@@ -599,41 +615,81 @@ async fn main() -> Result<()> {
             hs.dropped_locked,
             if hs.known && hs.locked { "（当前：已锁屏）" } else { "" }
         );
-        watcher.shutdown();
-        let s = watcher.snapshot();
+        println!(
+            "会话：建立 {} 条 / 断线接回 {} 次{}",
+            live.sessions(),
+            live.reconnects(),
+            if live.phase() == session::Phase::Finished {
+                format!("（已停止重连：{}）", live.note())
+            } else {
+                String::new()
+            }
+        );
+        let t = live.totals_now();
+        let last = live.stats().snapshot();
         println!(
             "窗口已关闭。收到 AU {} / 关键帧 {} / 解出帧 {} / 丢帧 {} / 首帧 {}ms / 被控端实测 {:.0} fps / 重建解码器 {} 次",
-            s.aus,
-            s.keyframes,
-            s.decoded,
-            s.dropped,
-            s.first_frame_ms,
-            s.host_fps_x10 as f32 / 10.0,
-            s.resizes
+            t.aus,
+            t.keyframes,
+            t.decoded,
+            t.dropped,
+            last.first_frame_ms,
+            last.host_fps_x10 as f32 / 10.0,
+            last.resizes
         );
-        return r.context("窗口退出异常");
+        r.context("窗口退出异常")?;
+        if live.phase() == session::Phase::Finished {
+            // 连不回来了：非 0 退出，脚本/自动化才不会把「画面冻着」当成成功。
+            eprintln!("会话没能接回：{}", live.note());
+            std::process::exit(4);
+        }
+        return Ok(());
     }
 
-    if !args.json {
+    // ── headless ──────────────────────────────────────────────────────────
+    run_headless(&args, &plan, c, started).await
+}
+
+/// 一个会话的统计（收工报告用）。
+struct Report {
+    snap: WatchStatsSnapshot,
+    elapsed: Duration,
+    kbps: f64,
+    video: uulan_protocol::msg::HostVideoCfg,
+}
+
+/// 收一个会话的帧，直到画面断开或到时限。
+///
+/// 返回 `(统计, 是否该收工)`：`true` 表示「到了 `--frames` / `--seconds`」——
+/// 那是用户要求的结束，不该再去重连。
+async fn watch_session(
+    args: &Args,
+    deadline: Option<Instant>,
+    o: &mut session::Open,
+    count: &mut u64,
+    last_frame: &mut Option<uulan_client::watch::Frame>,
+    show_cfg: bool,
+) -> (Report, bool) {
+    if show_cfg && !args.json {
+        let info = o.watcher.info();
         println!(
             "画面：{}x{} {} {} fps（编码器 {}）",
             info.w, info.h, info.codec, info.fps, info.encoder
         );
     }
-
-    let deadline = args.seconds.map(|s| started + Duration::from_secs_f64(s));
-    let mut count = 0u64;
+    let mut done = false;
     // 只留最后一帧在内存里，退出时落盘 —— 每帧都写盘的话 1080p 一帧 6 MB，
     // 30fps 下就是 180 MB/s 的无用 IO。
-    let mut last_frame: Option<uulan_client::watch::Frame> = None;
     loop {
         if let Some(n) = args.frames {
-            if count >= n {
+            if *count >= n {
+                done = true;
                 break;
             }
         }
         if let Some(d) = deadline {
             if Instant::now() >= d {
+                done = true;
                 break;
             }
         }
@@ -645,22 +701,23 @@ async fn main() -> Result<()> {
             None => tokio::time::sleep(Duration::from_secs(3600)),
         };
         tokio::select! {
-            f = watcher.next_frame() => match f {
+            f = o.watcher.next_frame() => match f {
                 Some(frame) => {
-                    count += 1;
+                    *count += 1;
                     if args.save_frame.is_some() {
-                        last_frame = Some(frame.clone());
+                        *last_frame = Some(frame.clone());
                     }
-                    if !args.json && (count == 1 || count % 30 == 0) {
-                        let s = watcher.snapshot();
+                    if !args.json && (*count == 1 || *count % 30 == 0) {
+                        let s = o.watcher.snapshot();
                         println!(
-                            "第 {count} 帧：{}x{} 首帧 {}ms 丢包 {} 已解 {} 码率 {:.0} kbps",
+                            "第 {} 帧：{}x{} 首帧 {}ms 丢包 {} 已解 {} 码率 {:.0} kbps",
+                            *count,
                             frame.width,
                             frame.height,
                             s.first_frame_ms,
                             s.dropped,
                             s.decoded,
-                            watcher.stats().bitrate_kbps(watcher.elapsed()),
+                            o.watcher.stats().bitrate_kbps(o.watcher.elapsed()),
                         );
                     }
                 }
@@ -673,8 +730,122 @@ async fn main() -> Result<()> {
             },
             _ = sleep => {
                 if deadline.is_some() {
+                    done = true;
                     break;
                 }
+            }
+        }
+    }
+    let snap = o.watcher.snapshot();
+    let elapsed = o.watcher.elapsed();
+    let kbps = o.watcher.stats().bitrate_kbps(elapsed);
+    let video = o.watcher.info().clone();
+    (Report { snap, elapsed, kbps, video }, done)
+}
+
+/// headless 会话循环：和窗口模式同一套「断了就退避重连」，只是没有窗口可画。
+async fn run_headless(
+    args: &Args,
+    plan: &session::Plan,
+    first: connect::Connected,
+    started: Instant,
+) -> Result<()> {
+    let deadline = args.seconds.map(|s| started + Duration::from_secs_f64(s));
+    let host = first.host.clone();
+    let mut count = 0u64;
+    let mut last_frame: Option<uulan_client::watch::Frame> = None;
+    let mut rc = session::Reconnect::new(plan.max_reconnects);
+    let mut next = Some(first);
+    let mut sessions = 0u32;
+    let mut reconnects = 0u32;
+    let mut totals = session::Totals::default();
+    let mut report: Option<Report> = None;
+
+    loop {
+        let mut finished = false;
+        let mut opened = false;
+        let mut err: Option<ClientError> = None;
+        let mut fresh_frames = false;
+
+        // 1) 拿一条连接。第一条是 main 已经握好的那只手。
+        let conn = match next.take() {
+            Some(c) => Some(c),
+            None => match connect::connect(
+                &plan.server,
+                &plan.device,
+                &plan.password,
+                &plan.client_name,
+                plan.caps.clone(),
+            )
+            .await
+            {
+                Ok(c) => {
+                    reconnects += 1;
+                    if !args.json {
+                        println!("已接回被控端（第 {reconnects} 次重连）");
+                    }
+                    Some(c)
+                }
+                Err(e) => {
+                    eprintln!("接回失败：{e}");
+                    err = Some(e);
+                    None
+                }
+            },
+        };
+
+        // 2) 跑这一条会话
+        if let Some(c) = conn {
+            match session::open(None, plan, c).await {
+                Ok(mut o) => {
+                    sessions += 1;
+                    opened = true;
+                    let (rep, done) =
+                        watch_session(args, deadline, &mut o, &mut count, &mut last_frame, sessions == 1)
+                            .await;
+                    o.link.close("控制端准备重连").await;
+                    totals.add(&rep.snap);
+                    fresh_frames = rep.snap.decoded > 0;
+                    if !args.json {
+                        println!(
+                            "本次会话：解出 {} 帧 / 丢帧 {} / 首帧 {}ms",
+                            rep.snap.decoded, rep.snap.dropped, rep.snap.first_frame_ms
+                        );
+                    }
+                    report = Some(rep);
+                    finished = done;
+                }
+                Err(e) if !e.retryable() => {
+                    // 对面明确拒绝：重连没用，直接把话原样交给用户。
+                    bail!("{}", e.why());
+                }
+                Err(e) => eprintln!("{}", e.why()),
+            }
+        }
+
+        if finished {
+            break;
+        }
+        // 3) 接得回去吗
+        if fresh_frames {
+            rc.recovered();
+        }
+        match rc.retry(err.as_ref()) {
+            Some(d) => {
+                eprintln!(
+                    "{} 秒后尝试接回（第 {}/{} 次）",
+                    d.as_secs(),
+                    rc.used(),
+                    plan.max_reconnects
+                );
+                tokio::time::sleep(d).await;
+            }
+            None => {
+                if !opened && report.is_none() {
+                    bail!("没能建立起会话（见上面的错误）");
+                }
+                eprintln!("不再重连");
+                break;
             }
         }
     }
@@ -691,23 +862,28 @@ async fn main() -> Result<()> {
         }
     }
 
-    let s = watcher.snapshot();
-    let elapsed = watcher.elapsed();
-    let kbps = watcher.stats().bitrate_kbps(elapsed);
+    let Some(rep) = report else {
+        bail!("没能建立起会话（见上面的错误）");
+    };
+    let s = rep.snap;
+    let elapsed = rep.elapsed;
+    let kbps = rep.kbps;
 
     if args.json {
         println!(
             "{}",
             serde_json::json!({
-                "host": { "name": c.host.name, "os": c.host.os, "version": c.host.version,
-                          "screen": { "w": c.host.screen.w, "h": c.host.screen.h } },
-                "video": { "w": info.w, "h": info.h, "codec": info.codec, "fps": info.fps,
-                           "encoder": info.encoder },
-                "stats": { "aus": s.aus, "keyframes": s.keyframes, "bytes": s.bytes,
-                           "dropped": s.dropped, "decoded": s.decoded,
+                "host": { "name": host.name, "os": host.os, "version": host.version,
+                          "screen": { "w": rep.video.w, "h": rep.video.h } },
+                "video": { "w": rep.video.w, "h": rep.video.h, "codec": rep.video.codec,
+                           "fps": rep.video.fps, "encoder": rep.video.encoder },
+                "stats": { "aus": totals.aus, "keyframes": totals.keyframes, "bytes": totals.bytes,
+                           "dropped": totals.dropped, "decoded": totals.decoded,
                            "first_frame_ms": s.first_frame_ms, "ended": s.ended,
                            "resizes": s.resizes,
                            "host_fps": s.host_fps_x10 as f32 / 10.0 },
+                "sessions": sessions,
+                "reconnects": reconnects,
                 "rendered": count,
                 "elapsed_s": elapsed.as_secs_f64(),
                 "bitrate_kbps": kbps,
@@ -715,23 +891,26 @@ async fn main() -> Result<()> {
         );
     } else {
         println!("────────────── 统计 ──────────────");
-        println!("  收到 AU    : {}", s.aus);
-        println!("  关键帧     : {}", s.keyframes);
-        println!("  解出帧     : {}（本进程渲染 {}）", s.decoded, count);
-        println!("  解码丢帧   : {}", s.dropped);
+        println!("  收到 AU    : {}", totals.aus);
+        println!("  关键帧     : {}", totals.keyframes);
+        println!("  解出帧     : {}（本进程渲染 {}）", totals.decoded, count);
+        println!("  解码丢帧   : {}", totals.dropped);
         println!("  首帧延迟   : {} ms", s.first_frame_ms);
-        println!("  压缩字节   : {}", s.bytes);
+        println!("  压缩字节   : {}", totals.bytes);
         println!("  平均码率   : {:.0} kbps", kbps);
         println!("  持续时长   : {:.1} s", elapsed.as_secs_f64());
         if elapsed.as_secs_f64() > 0.0 {
-            println!("  实测帧率   : {:.1} fps（控制端解出）", s.decoded as f64 / elapsed.as_secs_f64());
+            println!(
+                "  实测帧率   : {:.1} fps（控制端解出）",
+                totals.decoded as f64 / elapsed.as_secs_f64()
+            );
         }
         println!("  被控端帧率 : {:.2} fps（对面自己数的编码帧率）", s.host_fps_x10 as f32 / 10.0);
         println!("  当前画幅   : {}x{}（最新一条画面参数）", s.cfg_w, s.cfg_h);
         println!("  解码器重建 : {} 次（被控端换过分辨率）", s.resizes);
+        println!("  会话       : 建立 {} 条 / 断线接回 {} 次", sessions, reconnects);
     }
 
-    watcher.shutdown();
     Ok(())
 }
 

@@ -158,6 +158,14 @@ impl HostStatus {
     }
 }
 
+#[cfg(test)]
+impl InputSender {
+    /// 单测用的构造：通道由调用方给，统计从零开始。
+    pub fn for_test(tx: mpsc::UnboundedSender<C2H>, status: Arc<HostStatus>) -> Self {
+        Self { tx, stats: Arc::new(InputStats::default()), status }
+    }
+}
+
 /// 给窗口线程用的发送端（`send` 是同步的，窗口事件循环里可以直接调）。
 #[derive(Clone)]
 pub struct InputSender {
@@ -225,8 +233,20 @@ impl ControlLink {
     /// 三件事（等上报 → 读回报 → 定时轮询剪贴板）都是「有就干、没有就等」，
     /// 拆成多个任务反而要额外加锁去抢同一个写半边。
     pub fn start_with_clipboard(control: SecControl, clipboard: Option<Box<dyn Clipboard>>) -> Self {
+        Self::start_with(control, clipboard, Arc::new(InputStats::default()))
+    }
+
+    /// 同上，但计数用**调用方给的**那一份。
+    ///
+    /// 为什么需要：控制端断线重连之后每条会话都是新的 `ControlLink`，
+    /// 而「这次操控一共发了多少条键鼠」是跨会话的量。窗口模式的会话槽持有一份
+    /// 累积的 [`InputStats`]，每条会话往里加。
+    pub fn start_with(
+        control: SecControl,
+        clipboard: Option<Box<dyn Clipboard>>,
+        stats: Arc<InputStats>,
+    ) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<C2H>();
-        let stats = Arc::new(InputStats::default());
         let status = Arc::new(HostStatus::default());
         let st = stats.clone();
         let status_rx = status.clone();

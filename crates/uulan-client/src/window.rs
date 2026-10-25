@@ -7,6 +7,10 @@
 //! 窗口的绘制挂在 `AboutToWait` 上——那是 winit 0.30 里「该画一帧了」的位置，
 //! 配合 `ControlFlow::Poll` 形成连续的渲染循环。
 //!
+//! 窗口**不知道「重连」这回事**：帧通道、统计、输入口都放在 [`Live`]（会话槽）里，
+//! 跨会话不变；断线时槽里只是把输入口摘掉、把标题改成「正在接回」，
+//! 而窗口继续画它手上的最新一帧（残影比黑屏更像「正在恢复」）。
+//!
 //! 两个线程之间只共享两样东西，都是无锁的：
 //! - `watch::Receiver<Option<Frame>>`：tokio 侧不停写「最新一帧」，窗口侧每次绘制
 //!   取当前值。**用 watch 而不是队列是有意的**：远控要的是「最新画面」，
@@ -27,9 +31,9 @@ use anyhow::{anyhow, Context, Result};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use crate::control::{HostStatus, InputSender};
 use crate::input::{fit_rect, key_action, key_messages, line_units, norm_point, vk_from_key, Mods,
                   Rect, WheelAccum};
+use crate::session::{Live, Phase};
 use crate::watch::{Frame, WatchStats, WatchStatsSnapshot};
 use uulan_protocol::msg::{C2H, MouseButton as ProtoButton};
 use winit::application::ApplicationHandler;
@@ -57,6 +61,10 @@ pub struct Overlay {
     pub mem_total_mb: u64,
     /// 被控端已锁屏 —— 标题上要写明「键鼠已暂停」，否则用户只会觉得「键鼠坏了」。
     pub locked: bool,
+    /// 会话阶段（重连中 / 已停止重连）。画面冻住时这是标题上唯一的解释。
+    pub phase: Phase,
+    /// 阶段说明（断线原因 / 第几次重连）。
+    pub note: String,
 }
 
 impl Overlay {
@@ -88,13 +96,21 @@ impl Overlay {
             // 放在最后：锁屏是「现在为什么点不动」的直接答案，最该一眼看到。
             s.push_str(" · 已锁屏（键鼠已暂停）");
         }
+        // 断线/重连中排在锁屏之后：画面不动的时候，先解释「为什么不动」。
+        if !self.phase.label().is_empty() {
+            s.push_str(&format!(" · {}", self.phase.label()));
+            if !self.note.is_empty() {
+                s.push_str(&format!("（{}）", self.note));
+            }
+        }
         s
     }
 }
 
 struct App {
+    /// 会话槽：帧 / 统计 / 输入口 / 状态都从它读，跨会话不变。
+    live: Arc<Live>,
     rx: watch::Receiver<Option<Frame>>,
-    stats: Arc<WatchStats>,
     overlay: Overlay,
     /// 缩放后的位图（0RGB），大小 = 窗口物理尺寸。
     buf: Vec<u32>,
@@ -110,10 +126,6 @@ struct App {
     overlay_since: std::time::Instant,
     /// 到点自动关窗（自测/脚本化验证用；None = 一直开着）。
     deadline: Option<std::time::Instant>,
-    /// 键鼠上报通道。`None` = 只读模式（`--no-input`，或没有图形会话的被控端）。
-    input: Option<InputSender>,
-    /// 被控端的运行状态（CPU / 内存 / 锁屏）。`None` = 老版本被控端不发这两条消息。
-    status: Option<std::sync::Arc<HostStatus>>,
     /// 当前修饰键状态。判断「这是快捷键还是文本输入」用。
     mods: Mods,
     /// 最近一帧的画面尺寸，用来把光标位置换算成画面坐标。
@@ -125,18 +137,11 @@ struct App {
 }
 
 impl App {
-    fn new(
-        rx: watch::Receiver<Option<Frame>>,
-        stats: Arc<WatchStats>,
-        overlay: Overlay,
-        deadline: Option<std::time::Instant>,
-        input: Option<InputSender>,
-        status: Option<std::sync::Arc<HostStatus>>,
-    ) -> Self {
+    fn new(live: Arc<Live>, overlay: Overlay, deadline: Option<std::time::Instant>) -> Self {
+        let rx = live.frames();
         Self {
-            status,
+            live,
             rx,
-            stats,
             overlay,
             buf: Vec::new(),
             window: None,
@@ -148,7 +153,6 @@ impl App {
             prev: WatchStatsSnapshot::default(),
             overlay_since: std::time::Instant::now(),
             deadline,
-            input,
             mods: Mods::default(),
             frame_sz: None,
             wheel: WheelAccum::default(),
@@ -164,7 +168,8 @@ impl App {
     }
 
     fn send_input(&mut self, m: C2H) {
-        if let Some(i) = &self.input {
+        // 断线期间 `input()` 是 None：消息直接丢掉，不算「发出去了」。
+        if let Some(i) = self.live.input() {
             if i.send(m) {
                 self.input_sent += 1;
             }
@@ -251,6 +256,10 @@ impl App {
         let frame = self.rx.borrow_and_update().clone();
         if let Some(f) = &frame {
             if Some(f.at) == self.last_frame_at {
+                // 没有新帧（断线重连中，或被控端画面静止）：位图不用重画，
+                // 但**标题要照旧刷** —— 否则「已断线，正在接回」这句永远不会出现在窗口上，
+                // 用户只看到一个冻住的画面，以为程序挂了。
+                self.maybe_update_title(&window, size.width, size.height);
                 return;
             }
             self.blit(f, size.width, size.height);
@@ -280,19 +289,30 @@ impl App {
             return;
         }
         self.painted += 1;
+        self.maybe_update_title(&window, size.width, size.height);
+    }
 
-        // 标题每秒刷一次，避免每帧 set_title 触发窗口系统重排
-        if self.last_title.elapsed() >= std::time::Duration::from_millis(1000) {
-            self.last_title = std::time::Instant::now();
-            self.update_overlay(&window, size.width, size.height);
+    /// 标题每秒刷一次，避免每帧 `set_title` 触发窗口系统重排。
+    fn maybe_update_title(&mut self, window: &Window, ww: u32, wh: u32) {
+        if self.last_title.elapsed() < std::time::Duration::from_millis(1000) {
+            return;
         }
+        self.last_title = std::time::Instant::now();
+        self.update_overlay(window, ww, wh);
     }
 
     /// 每秒刷一次标题。`WatchStatsSnapshot` 里没有 fps/kbps 字段，
     /// 用两次采样之间的**增量**算瞬时值 —— 累计平均在长时间会话里会越算越钝，
     /// 看不出「刚刚掉到 5 fps」这种事。
     fn update_overlay(&mut self, window: &Window, ww: u32, wh: u32) {
-        let s = self.stats.snapshot();
+        // 重连之后被控端可能换了机器名 / 换了分辨率：每次刷新都从会话槽重取。
+        if let Some(h) = self.live.host() {
+            self.overlay.host_name = format!("{}({})", h.name, h.os);
+            self.overlay.screen = (h.screen.w, h.screen.h);
+        }
+        self.overlay.phase = self.live.phase();
+        self.overlay.note = self.live.note();
+        let s = self.live.stats().snapshot();
         let el = self.overlay_since.elapsed().as_secs_f64().max(1e-6);
         let d_decoded = s.decoded.saturating_sub(self.prev.decoded) as f64;
         let d_bytes = s.bytes.saturating_sub(self.prev.bytes) as f64;
@@ -301,7 +321,9 @@ impl App {
         self.overlay.dropped = s.dropped;
         self.overlay.first_frame_ms = (s.first_frame_ms > 0).then_some(s.first_frame_ms);
         self.overlay.host_fps = s.host_fps_x10 as f32 / 10.0;
-        if let Some(st) = self.status.as_ref() {
+        {
+            // 每次刷新都重取：重连会把状态换成新会话的。
+            let st = self.live.status();
             let h = st.snapshot();
             self.overlay.cpu_pct = h.cpu_pct_x100 as f32 / 100.0;
             self.overlay.mem_used_mb = h.mem_used_mb;
@@ -425,6 +447,13 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // 会话槽说「不再重连了」：窗口没有画面来源，留着只是个冻住的图。
+        // 关窗而不是挂着，是为了让脚本拿到一个确定的退出（退出码由 main 决定）。
+        if self.live.phase() == Phase::Finished {
+            info!(reason = %self.live.note(), "不再重连，关闭窗口");
+            event_loop.exit();
+            return;
+        }
         // 到点自动收工 —— 没有这个，脚本化验证就只能靠人去点关闭按钮。
         if let Some(d) = self.deadline {
             if std::time::Instant::now() >= d {
@@ -443,19 +472,12 @@ impl ApplicationHandler for App {
 ///
 /// **必须在主线程调用**（winit 的硬性要求）。tokio 运行时应该已经跑在别的线程上，
 /// 这里的 `rx` 就是从那边 `VideoWatcher::subscribe()` 拿到的；`input` 为 `None` 就是只读模式。
-pub fn run(
-    rx: watch::Receiver<Option<Frame>>,
-    stats: Arc<WatchStats>,
-    overlay: Overlay,
-    seconds: Option<f64>,
-    input: Option<InputSender>,
-    status: Option<Arc<HostStatus>>,
-) -> Result<()> {
+pub fn run(live: Arc<Live>, overlay: Overlay, seconds: Option<f64>) -> Result<()> {
     let event_loop = EventLoop::new().context("创建事件循环失败（没有可用的显示环境？）")?;
     // Poll：不睡等事件，保证有帧时能立刻画出来
     event_loop.set_control_flow(ControlFlow::Poll);
     let deadline = seconds.map(|s| std::time::Instant::now() + std::time::Duration::from_secs_f64(s));
-    let mut app = App::new(rx, stats, overlay, deadline, input, status);
+    let mut app = App::new(live, overlay, deadline);
     event_loop.run_app(&mut app).context("窗口事件循环异常退出")?;
     info!(painted = app.painted, input_sent = app.input_sent, "窗口已关闭");
     Ok(())
@@ -512,8 +534,10 @@ mod tests {
     }
 
     fn app_with(frame: Option<Frame>) -> App {
-        let (_tx, rx) = watch::channel(frame);
-        App::new(rx, Arc::new(WatchStats::default()), Overlay::default(), None, None, None)
+        let live = Arc::new(Live::new());
+        // 会话槽的帧通道是 `Live` 自己建的：喂一帧进去，窗口那边就能读到。
+        let _ = live.frames_tx().send(frame);
+        App::new(live, Overlay::default(), None)
     }
 
     #[test]

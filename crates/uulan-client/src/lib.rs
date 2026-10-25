@@ -14,6 +14,7 @@ pub mod control;
 pub mod forward;
 pub mod fsx;
 pub mod inject;
+pub mod session;
 pub mod termx;
 pub mod input;
 pub mod watch;
