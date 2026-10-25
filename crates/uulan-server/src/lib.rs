@@ -39,6 +39,17 @@ const RELAY_WAIT_TTL: Duration = Duration::from_secs(30);
 /// 清理任务的节拍。
 const SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 
+/// 一台被控端「多久没消息就不算在线」。
+///
+/// 为什么需要它：注册表原来只靠「推送通道关了没有」判在线。网络被切成半开
+/// （拔网线、机器休眠、NAT 表项掉了）时那条 TCP 连接在服务端仍然是「开着」的，
+/// 于是这台早就不在的机器会长时间显示在线 —— 控制端点上去要等到握手 15 秒超时
+/// 才知道没人应答，而且它每次重连都会先撞一遍。
+///
+/// 45 秒 = 被控端心跳（10 秒一次）连丢四次的量级：偶尔丢一两拍不会误判，
+/// 真的没消息了也能在一分钟内从列表里下去。
+const DEVICE_STALE_TTL: Duration = Duration::from_secs(45);
+
 /// 一台已上线的被控端。
 struct Device {
     name: String,
@@ -158,6 +169,14 @@ impl Server {
         }
     }
 
+    /// 这台设备是不是已经「沉默太久」了。
+    ///
+    /// 抽成纯函数（`now` 由调用方给）是为了能在单测里把时间往后推 —— 真去睡 45 秒
+    /// 的测试没人会跑。
+    fn device_is_stale(last_seen: Instant, now: Instant) -> bool {
+        now.saturating_duration_since(last_seen) > DEVICE_STALE_TTL
+    }
+
     fn sweep(&self) {
         let now = Instant::now();
 
@@ -184,14 +203,26 @@ impl Server {
         });
         drop(sessions);
 
-        // 控制连接断了但没人来清理的情况：靠 mpsc 的 closed() 判断。
+        // 控制连接断了但没人来清理的情况：靠 mpsc 的 closed() 判断；半开连接靠 last_seen。
         let mut devices = self.inner.devices.lock().unwrap();
         devices.retain(|id, d| {
             let alive = !d.tx.is_closed();
             if !alive {
                 info!(device_id = %id, "被控端离线");
+                return false;
             }
-            alive
+            if Self::device_is_stale(d.last_seen, now) {
+                // 只摘「在线状态」，**不动已有会话**：正在被控的那条 relay 通路不经过这张表，
+                // 摘掉注册只是让**新的**连接看到「离线」，不会把在场的人踢下线。
+                warn!(
+                    device_id = %id,
+                    silent_s = now.saturating_duration_since(d.last_seen).as_secs(),
+                    ttl_s = DEVICE_STALE_TTL.as_secs(),
+                    "被控端超过时限没有任何消息（半开连接？），按离线处理"
+                );
+                return false;
+            }
+            true
         });
     }
 
@@ -611,4 +642,74 @@ pub async fn read_relay_ready(stream: &mut TcpStream) -> Result<Channel> {
 pub async fn send_frame(stream: &mut TcpStream, frame: &Frame) -> Result<()> {
     write_frame(stream, frame.kind, &frame.payload).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 造一台「`age` 秒之前有过消息」的设备，并把接收端**留在调用方手里**：
+    /// 留着它，推送通道就是「开着的」—— 这正是半开连接的样子（服务端看不出对端没了）。
+    fn device_with_age(age: Duration) -> (Device, mpsc::UnboundedReceiver<ToEndpoint>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        // 用 `checked_sub` 而不是 `-`：`Instant` 的零点是系统定的（Windows 上是开机时刻），
+        // 开机不足 `age` 时直接相减会 panic。
+        let last_seen = Instant::now()
+            .checked_sub(age)
+            .expect("系统运行时间比这个测试的 age 还短（开机一分钟之后再跑）");
+        (
+            Device { name: "test".into(), tx, last_seen, reg_token: None, conn: 1 },
+            rx,
+        )
+    }
+
+    #[test]
+    fn silence_past_the_ttl_counts_as_stale() {
+        let now = Instant::now();
+        assert!(!Server::device_is_stale(now, now), "刚说完话的不算");
+        assert!(
+            !Server::device_is_stale(now, now + DEVICE_STALE_TTL),
+            "刚好等于 TTL 还不算（边界是「超过」）"
+        );
+        assert!(Server::device_is_stale(
+            now,
+            now + DEVICE_STALE_TTL + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn sweep_drops_a_half_open_registration_and_keeps_the_live_one() {
+        let s = Server::new(None).expect("建服务器句柄失败");
+        let (silent, _silent_rx) = device_with_age(DEVICE_STALE_TTL + Duration::from_secs(5));
+        let (fresh, _fresh_rx) = device_with_age(Duration::from_secs(1));
+        {
+            let mut d = s.inner.devices.lock().unwrap();
+            d.insert("111111111".into(), silent);
+            d.insert("222222222".into(), fresh);
+        }
+        assert_eq!(s.online_count(), 2);
+
+        s.sweep();
+
+        let d = s.inner.devices.lock().unwrap();
+        assert!(
+            !d.contains_key("111111111"),
+            "半开连接（推送通道还开着、但一直没消息）必须按离线摘掉"
+        );
+        assert!(
+            d.contains_key("222222222"),
+            "还在心跳的设备绝不能被误判 —— 那会把在线用户踢出列表"
+        );
+    }
+
+    #[test]
+    fn a_registration_with_a_closed_channel_is_offline_regardless_of_age() {
+        // 老路径不能因为新规则而退化：通道关了就是离线，不用等 TTL
+        let s = Server::new(None).expect("建服务器句柄失败");
+        let (dev, rx) = device_with_age(Duration::from_secs(1));
+        drop(rx);
+        s.inner.devices.lock().unwrap().insert("333333333".into(), dev);
+        s.sweep();
+        assert_eq!(s.online_count(), 0);
+    }
 }

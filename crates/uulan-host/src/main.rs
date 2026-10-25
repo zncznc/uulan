@@ -25,7 +25,10 @@ use uulan_protocol::rv::{Role, ToEndpoint};
 use uulan_protocol::rvclient::{RelaySet, RvConn};
 
 /// 向中继发心跳的间隔。远小于服务端的设备超时，避免被误判离线。
-const PING_INTERVAL: Duration = Duration::from_secs(30);
+/// 心跳间隔。10 秒是刻意压低的：中继靠「多久没消息」判半开连接（`DEVICE_STALE_TTL`
+/// 45 秒），心跳太稀就会把仍然活着的机器判成离线。一条 Ping 几十字节，10 秒一次
+/// 在内网里可以忽略。
+const PING_INTERVAL: Duration = Duration::from_secs(10);
 
 /// 一次性临时码的轮换周期（DESIGN 里定的是「每小时」）。
 const TEMP_CODE_ROTATE: Duration = Duration::from_secs(3600);
