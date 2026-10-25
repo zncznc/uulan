@@ -86,7 +86,7 @@ fn test_config(server: &str) -> HostConfig {
 async fn spawn_locked_host(server: &str, cfg: HostConfig, out: Arc<Mutex<Vec<Inject>>>) -> String {
     let mut conn = RvConn::connect(server).await.expect("被控端连不上中继");
     let (device_id, _) = conn
-        .host_register(None, cfg.name.clone())
+        .host_register(None, cfg.name.clone(), None)
         .await
         .expect("注册失败");
     let state = Arc::new(HostState::new(cfg.clone(), None));

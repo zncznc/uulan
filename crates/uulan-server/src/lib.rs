@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -44,6 +45,18 @@ struct Device {
     /// 向这台被控端的控制连接推送消息。被控端断开时 send 失败 → 视为离线。
     tx: mpsc::UnboundedSender<ToEndpoint>,
     last_seen: Instant,
+    /// 注册令牌的哈希（`None` = 这台机器是旧版本，没给令牌）。
+    ///
+    /// 只在「这个 device_id 已经有人注册着」时用得上：出示的哈希与表里一致才认作
+    /// 同一台机器重连。没有它，重连只能被当成「别人来占位」而换个新 ID ——
+    /// 现场就是「中继重启一次，设备 ID 变了」。
+    reg_token: Option<String>,
+    /// 这条注册的流水号。
+    ///
+    /// 同一台设备重连时，旧连接的读循环迟早也会结束 —— 它结束时若按 device_id 盲删，
+    /// 就会把**刚上线的新注册**一起删掉（现象：重连成功、随即显示离线）。
+    /// 所以收尾要看「表里那条还是不是我这条」。
+    conn: u64,
 }
 
 /// 一条已配对或等待配对的 relay 通道。
@@ -64,6 +77,8 @@ struct Session {
 
 struct Inner {
     devices: Mutex<HashMap<String, Device>>,
+    /// 注册流水号的发号器（只为区分「同一 ID 的不同连接」，不是对外的东西）。
+    next_conn: AtomicU64,
     sessions: Mutex<HashMap<String, Session>>,
     book: Mutex<DeviceBook>,
     state_path: Option<PathBuf>,
@@ -93,6 +108,7 @@ impl Server {
         Ok(Self {
             inner: Arc::new(Inner {
                 devices: Mutex::new(HashMap::new()),
+                next_conn: AtomicU64::new(1),
                 sessions: Mutex::new(HashMap::new()),
                 book: Mutex::new(book),
                 state_path,
@@ -190,8 +206,8 @@ impl Server {
         let msg: ToServer = first.decode_json().context("首帧不是合法的会合消息")?;
 
         match msg {
-            ToServer::HostRegister { device_id, name, proto } => {
-                self.handle_host_register(stream, peer, device_id, name, proto).await
+            ToServer::HostRegister { device_id, name, proto, reg_token } => {
+                self.handle_host_register(stream, peer, device_id, name, proto, reg_token).await
             }
             ToServer::ClientConnect { device_id, client_name, proto } => {
                 self.handle_client_connect(stream, peer, device_id, client_name, proto).await
@@ -219,7 +235,9 @@ impl Server {
         device_id: Option<String>,
         name: String,
         proto: u32,
+        reg_token: Option<String>,
     ) -> Result<()> {
+        let presented = reg_token.as_deref().map(uulan_protocol::rv::reg_token_hash);
         if proto != PROTO_VERSION {
             send_error(&mut stream, ErrCode::ProtoMismatch, &format!("服务端协议 v{PROTO_VERSION}，被控端 v{proto}")).await;
             return Ok(());
@@ -230,10 +248,38 @@ impl Server {
         let id = {
             let devices = self.inner.devices.lock().unwrap();
             // 用 as_ref + cloned：Option::filter 会吃掉所有权，后面还要用 device_id 判非法值。
+            //
+            // 「这个 ID 能不能给我」有三种情形：
+            //  · 空着 → 照收；
+            //  · 已经有人注册，但**对方出示的注册令牌哈希与表里那条一致** → 同一台机器
+            //    重连，照收并替换旧注册（旧连接的推送通道被丢弃 → 它读到 EOF 自行退出）；
+            //  · 已经有人注册、令牌对不上或没给 → 不能顶掉别人，分配新 ID。
+            //
+            // 第三条是原有的安全边界（`rvclient.rs` 里那条「在线设备的 ID 不能被后来者
+            // 顶掉」把它钉住了），第一条是重连能不能拿回自己身份的关键。以前只有第一、
+            // 第三条，于是被控端每次重连都可能被换成一个新 ID 并写回 host.json ——
+            // 现场手里那个设备 ID 当场失效。
+            let mut refused_busy = None;
             let requested = device_id
                 .as_ref()
-                .filter(|d| is_valid_device_id(d) && !devices.contains_key(d.as_str()))
+                .filter(|d| is_valid_device_id(d))
+                .filter(|d| match devices.get(d.as_str()) {
+                    None => true,
+                    Some(cur) => {
+                        let same = match (cur.reg_token.as_deref(), presented.as_deref()) {
+                            (Some(a), Some(b)) => a == b,
+                            _ => false,
+                        };
+                        if !same {
+                            refused_busy = Some((*d).clone());
+                        }
+                        same
+                    }
+                })
                 .cloned();
+            if let Some(busy) = &refused_busy {
+                warn!(%peer, device_id = %busy, "这个设备 ID 已有人注册且注册令牌不符，改为分配新 ID");
+            }
             let stale = device_id.as_deref().filter(|d| !is_valid_device_id(d));
             if let Some(bad) = stale {
                 warn!(%peer, bad_id = %bad, "被控端给的 device_id 不合法，改为分配新 ID");
@@ -251,19 +297,31 @@ impl Server {
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel::<ToEndpoint>();
+        let conn_no = self.inner.next_conn.fetch_add(1, Ordering::Relaxed);
 
         {
             let mut devices = self.inner.devices.lock().unwrap();
             if let Some(old) = devices.insert(
                 id.clone(),
-                Device { name: name.clone(), tx: tx.clone(), last_seen: Instant::now() },
+                Device {
+                    name: name.clone(),
+                    tx: tx.clone(),
+                    last_seen: Instant::now(),
+                    reg_token: presented.clone(),
+                    conn: conn_no,
+                },
             ) {
-                // 同一台设备重复上线（比如上次异常退出后残留）：踢掉旧的推送通道。
+                // 同一台设备重新上线（重连 / 上次异常退出后残留）：踢掉旧的推送通道。
+                // 旧连接的读循环随后读到 EOF 自行退出，表里只留新注册。
                 drop(old);
-                warn!(device_id = %id, "同一 device_id 重复注册，旧连接已被替换");
+                warn!(device_id = %id, "同一 device_id 重新注册（重连），旧注册已被替换");
             }
             self.inner.book.lock().unwrap().remember(&id, &name);
         }
+        // 注册表里的 tx 是唯一剩下的发送端（下面 push 任务的 rx 才能收到「没有发送端了」
+        // → 旧连接被替换时 push 退出、写半边关闭、对端读到 EOF）。留着这个局部 tx 的话，
+        // 旧注册永远关不掉，表里就会挂着一个谁也连不到的死设备。
+        drop(tx);
         self.persist_book();
         info!(device_id = %id, %peer, name = %name, "被控端上线");
 
@@ -311,8 +369,17 @@ impl Server {
         }
 
         push.abort();
-        self.inner.devices.lock().unwrap().remove(&id);
-        info!(device_id = %id, "被控端控制连接断开");
+        {
+            // **只摘自己这一条**：重连时旧连接的收尾不能把新注册踢掉。
+            let mut devices = self.inner.devices.lock().unwrap();
+            let mine = devices.get(&id).map(|d| d.conn == conn_no).unwrap_or(false);
+            if mine {
+                devices.remove(&id);
+                info!(device_id = %id, "被控端控制连接断开");
+            } else {
+                info!(device_id = %id, "旧控制连接收尾（该 ID 已由新连接接管，不动注册表）");
+            }
+        }
         Ok(())
     }
 

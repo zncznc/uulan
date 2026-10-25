@@ -100,13 +100,17 @@ impl RvConn {
     }
 
     /// 被控端注册。返回 `(device_id, 是否由服务端新分配)`。
+    /// 注册进中继。`reg_token` 是这台机器的注册令牌（见 [`ToServer::HostRegister`]）：
+    /// 带着它，重连时服务端才会把这个 device_id 还给**同一台机器**。
     pub async fn host_register(
         &mut self,
         device_id: Option<String>,
         name: String,
+        reg_token: Option<String>,
     ) -> Result<(String, bool), RvError> {
         let asked = device_id.clone();
-        self.send(&ToServer::HostRegister { device_id, name, proto: PROTO_VERSION }).await?;
+        self.send(&ToServer::HostRegister { device_id, name, proto: PROTO_VERSION, reg_token })
+            .await?;
         match self.recv_ok().await? {
             ToEndpoint::HostWelcome { device_id, .. } => {
                 // 服务端在「给的 ID 不合法或已被占用」时会换一个新的。

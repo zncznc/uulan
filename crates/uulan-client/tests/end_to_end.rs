@@ -81,7 +81,7 @@ async fn spawn_host(
 ) -> (String, tokio::sync::watch::Receiver<u32>) {
     let mut conn = RvConn::connect(server).await.expect("被控端连不上中继");
     let (device_id, _) = conn
-        .host_register(None, cfg.name.clone())
+        .host_register(None, cfg.name.clone(), None)
         .await
         .expect("注册失败");
 

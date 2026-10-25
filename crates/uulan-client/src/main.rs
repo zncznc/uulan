@@ -16,6 +16,7 @@ use anyhow::{bail, Context, Result};
 use tracing::info;
 
 use uulan_client::connect::{self, ClientError};
+use uulan_protocol::rvclient::RvError;
 use uulan_client::watch::VideoWatcher;
 use uulan_protocol::msg::Cap;
 
@@ -55,6 +56,9 @@ struct Args {
     /// 只看被控端状态（`--status <秒>`）：读控制通道上的 Metrics / SystemState，
     /// 每秒打一行。存在的理由同 `--inject`：负载与锁屏也必须能机器验证。
     status: Option<f64>,
+    /// 连接阶段的重试次数（默认 3，0 = 不重试）。**只在「连不上」时重试**，
+    /// 口令错/被锁定这类「被拒」绝不重试 —— 那是自己往锁定计数里加数。
+    connect_retry: u32,
 }
 
 const HELP: &str = "\
@@ -76,6 +80,8 @@ uulan-client —— uulan 内网远控的控制端
   --no-input          只读模式：不上报键鼠（排障、旁观时用）
   --no-clipboard      不同步剪贴板（不希望本机剪贴板被对面改写时用）
   --json              以 JSON 输出统计（仅 --headless 下生效）
+  --connect-retry <N> 连接阶段最多重试 N 次（默认 3；0 = 连一次就报错退出）
+                      只在「连不上」时重试；口令错/被锁直接报错，不重试
 
 文件操作（做完就退出，不开窗口、不收画面）：
   --ls <远程路径>            列目录（`:/` = 此电脑，`~/` = 家目录）
@@ -131,6 +137,7 @@ fn parse_args() -> Result<Args> {
         term_shell: None,
         inject: None,
         status: None,
+        connect_retry: DEFAULT_CONNECT_RETRY,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -176,6 +183,13 @@ fn parse_args() -> Result<Args> {
             }
             "--inject" => {
                 a.inject = Some(it.next().context("--inject 需要一个脚本，例如 \"click:left\"")?)
+            }
+            "--connect-retry" => {
+                a.connect_retry = it
+                    .next()
+                    .context("--connect-retry 需要一个次数，例如 --connect-retry 5")?
+                    .parse()
+                    .context("--connect-retry 的次数不是数字")?
             }
             "--ls" => {
                 let p = it.next().context("--ls 需要一个远程路径")?;
@@ -271,6 +285,70 @@ fn parse_size(s: &str) -> Result<(u16, u16)> {
     Ok((cols, rows))
 }
 
+/// 连接阶段默认重试几次。
+///
+/// 现场最常见的「连不上」不是口令错，而是中继正在升级重启、被控端刚被拉起 ——
+/// 那两种情况几秒内就恢复。以前控制端一撞上就直接 exit 1，用户只能手点第二次。
+const DEFAULT_CONNECT_RETRY: u32 = 3;
+
+/// 连接阶段的重试间隔（秒）：1、2、4、8，之后一直是 8。
+///
+/// 和会话中途的「自动接回」不是一回事：这里只是把「多试几次」的等待定死。
+fn connect_retry_delay(attempt: u32) -> Duration {
+    const STEPS: [u64; 4] = [1, 2, 4, 8];
+    let i = (attempt.saturating_sub(1) as usize).min(STEPS.len() - 1);
+    Duration::from_secs(STEPS[i])
+}
+
+/// 这个错误值不值得再试一次？
+///
+/// 只有「**没连上**」才值得：中继正在重启、被控端刚被拉起、网络还没通 —— 几秒后就好。
+/// 其余一律不重试，理由分两类：
+///
+/// * **被拒**（口令错 / 被锁 / 被控端说忙）：重试等于自己往被控端的失败计数器里加数，
+///   把「一个字打错」升级成「等一分钟」。
+/// * **说得清的结果**（设备 ID 不在线 / ID 不合法 / 协议版本不匹配 / 帧解析错）：
+///   再试一百次也是同一个答案，只会让人多等 7 秒才看到真话。
+fn is_retryable(e: &ClientError) -> bool {
+    match e {
+        ClientError::Rv(RvError::Io(_)) | ClientError::Rv(RvError::Timeout(_)) => true,
+        // 会话级握手超时：被控端可能正被别的会话占着 CPU，给一次机会。
+        ClientError::Timeout => true,
+        _ => false,
+    }
+}
+
+/// 连被控端，连不上就按 [`connect_retry_delay`] 重试，最多 `--connect-retry` 次。
+///
+/// 什么算「连不上」见 [`is_retryable`]。
+async fn connect_with_retry(
+    args: &Args,
+    caps: &[Cap],
+) -> Result<connect::Connected, ClientError> {
+    let mut attempt: u32 = 0;
+    loop {
+        match connect::connect(&args.server, &args.device, &args.password, &args.name, caps.to_vec())
+            .await
+        {
+            Ok(c) => return Ok(c),
+            Err(e) => {
+                if !is_retryable(&e) || attempt >= args.connect_retry {
+                    return Err(e);
+                }
+                attempt += 1;
+                let wait = connect_retry_delay(attempt);
+                // 走 stderr：`--term` 模式下 stdout 是远端字节流，一个字都不能掺。
+                eprintln!(
+                    "连接失败：{e}（{} 秒后重试，第 {attempt}/{} 次）",
+                    wait.as_secs(),
+                    args.connect_retry
+                );
+                tokio::time::sleep(wait).await;
+            }
+        }
+    }
+}
+
 fn default_client_name() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
@@ -322,8 +400,7 @@ async fn main() -> Result<()> {
     caps.push(Cap::Metrics);
 
     info!(server = %args.server, device = %args.device, "正在连接");
-    let c = match connect::connect(&args.server, &args.device, &args.password, &args.name, caps).await
-    {
+    let c = match connect_with_retry(&args, &caps).await {
         Ok(c) => c,
         Err(ClientError::Rejected(why)) => {
             eprintln!("被控端拒绝：{why}");
@@ -705,6 +782,34 @@ mod tests {
         let p = dir.join(format!("pwtest-{}-{}", std::process::id(), name));
         std::fs::write(&p, content).expect("写临时口令文件");
         p
+    }
+
+    /// 连接阶段的重试间隔：先小步、再封顶，且极值不溢出。
+    #[test]
+    fn connect_retry_backoff_starts_small_and_caps() {
+        let seq: Vec<u64> = (1..=6).map(|i| connect_retry_delay(i).as_secs()).collect();
+        assert_eq!(seq, vec![1, 2, 4, 8, 8, 8]);
+        assert!(seq.windows(2).all(|w| w[0] <= w[1]));
+        assert_eq!(connect_retry_delay(u32::MAX).as_secs(), 8);
+        // 默认值必须是「会重试」而不是 0 —— --connect-retry 默认不重试的话，
+        // 这个改动在现场等于没做（中继重启那几秒还是会报错退出）。
+        assert!(DEFAULT_CONNECT_RETRY >= 1);
+    }
+
+    /// 重试分类：只有「连不上」才重试。这条钉住的是**用户等待时间**：
+    /// 设备 ID 打错、口令打错，都不该让人多等 7 秒才看到真话。
+    #[test]
+    fn only_transport_failures_are_retryable() {
+        use uulan_protocol::rv::ErrCode;
+        assert!(is_retryable(&ClientError::Rv(RvError::Io(std::io::Error::other("refused")))));
+        assert!(is_retryable(&ClientError::Timeout));
+        // 能说清原因的，一律不重试
+        assert!(!is_retryable(&ClientError::Rejected("密码不正确".into())));
+        assert!(!is_retryable(&ClientError::Rv(RvError::Server {
+            code: ErrCode::Offline,
+            message: "设备不在线".into()
+        })));
+        assert!(!is_retryable(&ClientError::Unexpected("握手期间被控端断开".into())));
     }
 
     #[test]

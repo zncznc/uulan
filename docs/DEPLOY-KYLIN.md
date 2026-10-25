@@ -747,3 +747,31 @@ printf 'echo TERM-OK-$((6*7)); exit 3\n' | \
 
 **仍未验**：`:0` 被 UKUI 锁屏挡着，麒麟控制端「往应用里打字/拖拽」没验；
 麒麟↔麒麟的剪贴板整链没验（cron 会话没有交互式剪贴板）。
+## 16. 中继重启 / 网络抖动时会发生什么（2026-10-25 真机实测）
+
+从这一版起，**被控端不再因为中继断开而退出**：它会按 1/2/4/8/15/30 秒（封顶）退避重连，
+重连成功后拿回**同一个设备 ID**。现场要核的就是这三件事：
+
+```bash
+# 1) 进程没被 systemd 重启过：MainPID 与 NRestarts 在「中继被 KILL」前后不变
+systemctl --user show -p MainPID -p NRestarts --value uulan-host
+# 2) 还是那个设备 ID
+python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.config/uulan/host.json')))['device_id'])"
+# 3) journal 里有重连轨迹（不是一屏凭据块）
+journalctl --user -u uulan-host -n 20 --no-pager | grep -E "重连|上线"
+```
+
+实测（麒麟真机，中继连续被 KILL 5 次）：host 的 `MainPID` 与 `NRestarts` 一次都没变，
+每次都在 2–3 秒内以 `805747189` 重新上线；重连后取帧 29.6 fps / 丢帧 0 / 相关系数 0.9981。
+详见 `docs/milestones/断线重连-2026-10-25.txt`。
+
+两个配套变化，升级时要知道：
+
+- **`host.json` 多了一个字段 `reg_token`**（注册令牌，与口令无关的随机值）。
+  老配置在第一次启动新版本时自动补上并落盘，**设备 ID / 口令 / 临时码一个都不会变**
+  （重装前后只有 sha256 变了，那是多了这个字段）。两个进程同批升级即可。
+- **控制端连接阶段会自动重试**（`--connect-retry N`，默认 3 次，间隔 1/2/4/8 秒），
+  只对「连不上」重试。想恢复旧行为：`--connect-retry 0`。
+
+**还没做**：控制端**会话中途**的自动接回 —— 会话里中继掉线时客户端按「画面流结束」退出
+（退出码 0）。要接回得重构窗口事件循环（只建一次 + 会话槽可替换），属于下一项工作。

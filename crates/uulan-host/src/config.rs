@@ -37,6 +37,14 @@ pub struct HostConfig {
     #[serde(default)]
     pub temp_code: Option<String>,
 
+    /// 注册令牌：证明「我是这台机器」，好在中继重启/网络抖动后拿回同一个设备 ID。
+    ///
+    /// **它不是访问口令**：与口令无关的独立随机值，中继只存它的 SHA-256。泄漏只意味着
+    /// 别人能占用这个设备 ID（连不进来，也解不开任何通道）。老配置文件里没有它 ——
+    /// [`HostConfig::load_or_create`] 会补一个并落盘。
+    #[serde(default)]
+    pub reg_token: String,
+
     /// 是否允许他人用「设备 ID + 验证码」发起协助（对应 UU 的远程协助开关）。
     #[serde(default)]
     pub assist_enabled: bool,
@@ -129,6 +137,7 @@ impl Default for HostConfig {
             device_id: None,
             password: gen_password(),
             temp_code: None,
+            reg_token: gen_password(),
             assist_enabled: false,
             capture: CaptureInput::default(),
             draw_mouse: false,
@@ -164,8 +173,18 @@ impl HostConfig {
     /// 读配置；文件不存在就用默认值并把新配置写下去（含新生成的密码）。
     pub fn load_or_create(path: &Path) -> Result<Self, ConfigError> {
         if path.exists() {
-            let cfg = Self::load(path)?;
+            let mut cfg = Self::load(path)?;
+            // 老配置（这个字段出现之前生成的）没有注册令牌：补一个并立刻落盘，
+            // 否则每次重启都会换新令牌，重连时服务端认不出「还是这台机器」。
+            let mut migrated = false;
+            if cfg.reg_token.trim().is_empty() {
+                cfg.reg_token = gen_password();
+                migrated = true;
+            }
             cfg.check()?;
+            if migrated {
+                cfg.save(path)?;
+            }
             return Ok(cfg);
         }
         let cfg = Self::default();

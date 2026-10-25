@@ -57,7 +57,7 @@ fn test_config(server: &str) -> HostConfig {
 /// 起一个被控端，返回设备 ID。
 async fn spawn_host(server: &str, cfg: HostConfig) -> String {
     let mut conn = RvConn::connect(server).await.expect("被控端连不上中继");
-    let (device_id, _) = conn.host_register(None, cfg.name.clone()).await.expect("注册失败");
+    let (device_id, _) = conn.host_register(None, cfg.name.clone(), None).await.expect("注册失败");
 
     let state = std::sync::Arc::new(HostState::new(cfg.clone(), None));
     let screen = session::resolve_screen(&cfg.capture, &cfg).await;

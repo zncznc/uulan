@@ -38,7 +38,7 @@ async fn spawn_server() -> Result<String> {
 async fn host_keeps_its_device_id_across_restarts() -> Result<()> {
     let addr = spawn_server().await?;
     let mut c = RvConn::connect(&addr).await?;
-    let (id, fresh) = c.host_register(None, "麒麟-01".into()).await?;
+    let (id, fresh) = c.host_register(None, "麒麟-01".into(), None).await?;
     assert!(fresh, "首次注册必须标记为「服务端新分配」");
     assert_eq!(id.len(), 9);
 
@@ -47,7 +47,7 @@ async fn host_keeps_its_device_id_across_restarts() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let mut c2 = RvConn::connect(&addr).await?;
-    let (id2, fresh2) = c2.host_register(Some(id.clone()), "麒麟-01".into()).await?;
+    let (id2, fresh2) = c2.host_register(Some(id.clone()), "麒麟-01".into(), None).await?;
     assert_eq!(id2, id, "重启用自己的 ID 必须拿回同一个，否则用户手上的 ID 天天变");
     assert!(!fresh2, "复用已有 ID 时不应标记为新分配");
     Ok(())
@@ -62,11 +62,11 @@ async fn host_keeps_its_device_id_across_restarts() -> Result<()> {
 async fn live_duplicate_registration_does_not_steal_the_id() -> Result<()> {
     let addr = spawn_server().await?;
     let mut c = RvConn::connect(&addr).await?;
-    let (id, _) = c.host_register(None, "麒麟-01".into()).await?;
+    let (id, _) = c.host_register(None, "麒麟-01".into(), None).await?;
 
     // c 仍然在线：第二个连接拿同一个 ID 来注册
     let mut c2 = RvConn::connect(&addr).await?;
-    let (id2, fresh2) = c2.host_register(Some(id.clone()), "冒名者".into()).await?;
+    let (id2, fresh2) = c2.host_register(Some(id.clone()), "冒名者".into(), None).await?;
     assert_ne!(id2, id, "在线设备的 ID 不能被后来者顶掉");
     assert!(fresh2, "被分配了新 ID，应当标记为新分配");
 
@@ -78,11 +78,38 @@ async fn live_duplicate_registration_does_not_steal_the_id() -> Result<()> {
     Ok(())
 }
 
+/// 带着**同一个注册令牌**重连（旧连接还在线）时，服务端必须把原来的 ID 还回来。
+///
+/// 这条是生产路径：`uulan-host` 断线重连时就是这么注册的。没有它，中继重启一次
+/// 设备 ID 就会变一次，现场手里的「设备 ID + 口令」当场作废。
+#[tokio::test]
+async fn host_with_its_reg_token_reclaims_a_live_id() -> Result<()> {
+    let addr = spawn_server().await?;
+    let mut c = RvConn::connect(&addr).await?;
+    let token = Some("machine-token-1".to_string());
+    let (id, fresh) = c.host_register(None, "麒麟-01".into(), token.clone()).await?;
+    assert!(fresh);
+
+    // c 没断：同一台机器（同一令牌）重新注册
+    let mut c2 = RvConn::connect(&addr).await?;
+    let (id2, fresh2) = c2.host_register(Some(id.clone()), "麒麟-01".into(), token).await?;
+    assert_eq!(id2, id, "带同一令牌的重连必须拿回自己的 ID");
+    assert!(!fresh2, "拿回自己的 ID 不该标记为「服务端新分配」");
+
+    // 换一台机器（不同令牌）来抢同一个 ID：必须被挡，拿新 ID。
+    let mut c3 = RvConn::connect(&addr).await?;
+    let (id3, fresh3) =
+        c3.host_register(Some(id.clone()), "冒名者".into(), Some("machine-token-2".to_string())).await?;
+    assert_ne!(id3, id, "令牌不符的注册不能顶掉别人的 ID");
+    assert!(fresh3);
+    Ok(())
+}
+
 #[tokio::test]
 async fn invalid_device_id_comes_back_fresh() -> Result<()> {
     let addr = spawn_server().await?;
     let mut c = RvConn::connect(&addr).await?;
-    let (id, fresh) = c.host_register(Some("012345678".into()), "x".into()).await?;
+    let (id, fresh) = c.host_register(Some("012345678".into()), "x".into(), None).await?;
     assert!(fresh, "非法 ID 必须被换掉");
     assert!(!id.starts_with('0'));
     Ok(())
@@ -122,7 +149,7 @@ async fn ping_round_trips() -> Result<()> {
 async fn query_reports_online_and_offline() -> Result<()> {
     let addr = spawn_server().await?;
     let mut host = RvConn::connect(&addr).await.context("被控端连接失败")?;
-    let (id, _) = host.host_register(None, "麒麟-01".into()).await.context("注册失败")?;
+    let (id, _) = host.host_register(None, "麒麟-01".into(), None).await.context("注册失败")?;
 
     let mut c = RvConn::connect(&addr).await.context("查询连接建立失败")?;
     c.send(&ToServer::Query { device_id: id.clone() })
@@ -155,7 +182,7 @@ async fn two_endpoints_pair_three_channels_and_exchange_application_frames() -> 
 
     // 被控端上线
     let mut host = RvConn::connect(&addr).await?;
-    let (device_id, _) = host.host_register(None, "麒麟-01".into()).await?;
+    let (device_id, _) = host.host_register(None, "麒麟-01".into(), None).await?;
 
     // 控制端请求连接
     let mut client = RvConn::connect(&addr).await?;
@@ -249,7 +276,7 @@ async fn two_endpoints_pair_three_channels_and_exchange_application_frames() -> 
 async fn first_dialer_survives_a_delay() -> Result<()> {
     let addr = spawn_server().await?;
     let mut host = RvConn::connect(&addr).await?;
-    let (device_id, _) = host.host_register(None, "麒麟-01".into()).await?;
+    let (device_id, _) = host.host_register(None, "麒麟-01".into(), None).await?;
 
     let mut client = RvConn::connect(&addr).await?;
     let (session, _, _) = client.client_connect(&device_id, "c").await?;

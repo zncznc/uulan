@@ -174,7 +174,26 @@ async fn main() -> Result<()> {
     let screen = session::resolve_screen(&cfg.capture, &cfg).await;
     let state = Arc::new(HostState::new(cfg.clone(), Some(cfg_path.clone())));
 
+    // Ctrl-C 只装一次：以前它装在「一条中继连接的寿命」里，重连循环会把信号处理
+    // 反复装一堆（每个空洞一样地等 ctrl_c，只有第一个会真的返回）。
+    tokio::spawn(async {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("收到 Ctrl-C，退出");
+        std::process::exit(0);
+    });
+
     run_forever(state, ffmpeg, cfg, screen, encoder, args.once).await
+}
+
+/// 重连退避：1、2、4、8、15、30 秒，之后一直是 30 秒。
+///
+/// 上限 30 秒是有意的：中继升级/重启只要几秒，退避太狠会让现场白等；
+/// 而无限指数增长在网络长期不通时会变成「几小时才试一次」，等于再也回不来。
+/// 内网里被控端数量少、单机一条连接，所以不加抖动（抖动只让测试变不确定）。
+fn reconnect_delay(attempt: u32) -> Duration {
+    const STEPS: [u64; 6] = [1, 2, 4, 8, 15, 30];
+    let i = (attempt.saturating_sub(1) as usize).min(STEPS.len() - 1);
+    Duration::from_secs(STEPS[i])
 }
 
 /// 口令能不能落到 stdout？
@@ -210,7 +229,12 @@ fn print_credentials(cfg: &HostConfig, cfg_path: &std::path::Path, explicit: boo
     println!("──────────────────────────────────────────────");
 }
 
-/// 连中继、注册、常驻待连。
+/// 连中继、注册、常驻待连；**中继断了就退避重连，不退出进程**。
+///
+/// 以前这里是一条命：中继一断就 `return Err`，全靠 systemd 的 `Restart=always` 把进程
+/// 重新拉起来。手工 `run.sh host` 跑的时候没有 systemd，中继重启一次被控端就再也不上线；
+/// 而且「重启进程」会重新走一遍注册 —— 那一步正好撞上服务端还没回收旧注册，
+/// 于是设备 ID 被改掉（见 `uulan-server` 的 handle_host_register）。
 async fn run_forever(
     state: Arc<HostState>,
     ffmpeg: PathBuf,
@@ -219,39 +243,84 @@ async fn run_forever(
     encoder: Encoder,
     once: bool,
 ) -> Result<()> {
+    let mut attempt: u32 = 0;
+    loop {
+        match serve_relay(&state, &ffmpeg, &cfg, screen, encoder, once, &mut attempt).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if once {
+                    // --once 是自测语义：一轮结束就退，别把脚本吊在重连里。
+                    return Err(e);
+                }
+                attempt = attempt.saturating_add(1);
+                let wait = reconnect_delay(attempt);
+                warn!(
+                    error = %e,
+                    step = attempt,
+                    retry_in_s = wait.as_secs_f32(),
+                    "与中继的连接断了，稍后重连（进程不退出，设备 ID 不变）"
+                );
+                tokio::time::sleep(wait).await;
+            }
+        }
+    }
+}
+
+/// 一条中继连接的寿命：连接 → 注册 → 待连 → 有人连进来就开会话 → 直到连接断掉。
+///
+/// 断掉就把错误交回 [`run_forever`] 去退避重连。`attempt` 在**注册成功后清零**，
+/// 否则一次长时间在线的连接之后再断，第一次退避就是 30 秒。
+async fn serve_relay(
+    state: &Arc<HostState>,
+    ffmpeg: &PathBuf,
+    cfg: &HostConfig,
+    screen: Screen,
+    encoder: Encoder,
+    once: bool,
+    attempt: &mut u32,
+) -> Result<()> {
+    // 上一代注册成功过（计数被清零）就说明这是重连，别再把凭据块打一遍。
+    let first = *attempt == 0;
     let mut conn = RvConn::connect(&cfg.server).await.with_context(|| {
         format!("连不上中继 {}（确认 uulan-server 在跑、地址和防火墙都对）", cfg.server)
     })?;
 
     let stored = state.device_id();
-    let (device_id, fresh) = conn.host_register(stored.clone(), cfg.name.clone()).await?;
+    // 带上注册令牌：重连时中继凭它把**同一个** device_id 还给这台机器
+    // （没令牌就只能给个新的，现场手里的 ID 会失效）。
+    let (device_id, fresh) = conn
+        .host_register(stored.clone(), cfg.name.clone(), Some(cfg.reg_token.clone()))
+        .await?;
     if fresh {
         info!(device_id = %device_id, "中继分配了新的设备 ID，已保存");
     } else {
         info!(device_id = %device_id, "已用原有设备 ID 上线");
     }
     state.set_device_id(&device_id);
+    // 注册成功 = 中继通了：退避计数归零。放在这里而不是连接成功时，
+    // 是因为「连上但注册被拒」那种情况不适合当已恢复。
+    *attempt = 0;
 
     let settings = VideoSettings::from_config(&state.snapshot());
     // 上面的横幅是在连中继**之前**打的，首次运行时还不知道设备 ID（要连上才分配），
     // 于是会出现「设备 ID:（首次连上中继后分配）」这种先吊胃口的提示。
     // 这里补一条完整的凭据块，用户只需要看这一处。
-    println!("──────────────────────────────────────────────");
-    println!("  已上线，等待控制端连接");
-    println!("  设备 ID : {device_id}");
-    if secrets_allowed(false) {
-        println!("  访问密码: {}", state.snapshot().password);
+    //
+    // 只在**第一条**连接上打：重连是常态（中继升级、网络抖一下），每次都刷一屏凭据块
+    // 会把 journal 里真正有用的东西挤走。重连只留一行 info。
+    if first {
+        println!("──────────────────────────────────────────────");
+        println!("  已上线，等待控制端连接");
+        println!("  设备 ID : {device_id}");
+        if secrets_allowed(false) {
+            println!("  访问密码: {}", state.snapshot().password);
+        } else {
+            println!("  访问密码: （已隐藏 —— 输出不是终端；在终端里跑 `uulan-host --show` 查看）");
+        }
+        println!("──────────────────────────────────────────────");
     } else {
-        println!("  访问密码: （已隐藏 —— 输出不是终端；在终端里跑 `uulan-host --show` 查看）");
+        info!(device_id = %device_id, "已重新上线（重连成功），等待控制端连接");
     }
-    println!("──────────────────────────────────────────────");
-
-    // Ctrl-C 单独一个任务：不能用 select! 和读端一起等，否则读端会被反复取消。
-    tokio::spawn(async {
-        let _ = tokio::signal::ctrl_c().await;
-        info!("收到 Ctrl-C，退出");
-        std::process::exit(0);
-    });
 
     // 读写彻底分开。
     //
@@ -298,7 +367,9 @@ async fn run_forever(
         let msg = match reader.recv().await {
             Ok(m) => m,
             Err(e) => {
-                warn!(error = %e, "与中继的连接断了");
+                // 不用在这里再 warn：外层重连循环会带着同一个 error 打一条带退避时间的。
+                // 两条并排出现只是把 journal 弄脏（真机日志里一眼能看到重复）。
+                tracing::debug!(error = %e, "与中继的连接断了");
                 heartbeat.abort();
                 rotator.abort();
                 return Err(e.into());
@@ -363,4 +434,22 @@ async fn run_forever(
 async fn build_relay(addr: &str, session_id: &str) -> Result<RelaySet> {
     let c = RvConn::connect(addr).await?;
     Ok(c.relay_open_all(session_id, Role::Host).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 退避序列必须是「先小步、再封顶」：中继只是重启几秒，第一次不该等太久；
+    /// 长期不通时也不能退到几小时一次。
+    #[test]
+    fn reconnect_backoff_starts_small_and_caps() {
+        let seq: Vec<u64> = (1..=8).map(|i| reconnect_delay(i).as_secs()).collect();
+        assert_eq!(seq, vec![1, 2, 4, 8, 15, 30, 30, 30]);
+        // 单调不减（防止以后改表时写乱）
+        assert!(seq.windows(2).all(|w| w[0] <= w[1]));
+        // 极端值：attempt 从 1 起算，但 u32::MAX 也不能溢出/回绕成 0 秒
+        assert_eq!(reconnect_delay(u32::MAX).as_secs(), 30);
+        assert!(reconnect_delay(1) > Duration::ZERO);
+    }
 }

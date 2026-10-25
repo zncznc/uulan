@@ -91,7 +91,7 @@ async fn reader_delivers_pong_and_incoming_in_order_without_error() -> Result<()
     .await?;
 
     let mut conn = RvConn::connect(&addr).await?;
-    let (id, _) = conn.host_register(None, "麒麟-01".into()).await?;
+    let (id, _) = conn.host_register(None, "麒麟-01".into(), None).await?;
     assert_eq!(id, "123456789");
 
     let (mut reader, mut writer) = conn.into_split();
@@ -134,7 +134,7 @@ async fn heartbeat_write_does_not_steal_the_readers_bytes() -> Result<()> {
     .await?;
 
     let mut conn = RvConn::connect(&addr).await?;
-    conn.host_register(None, "麒麟-01".into()).await?;
+    conn.host_register(None, "麒麟-01".into(), None).await?;
     let (mut reader, mut writer) = conn.into_split();
 
     // 先连发几次心跳（只写），再读 —— 读端应当仍能拿到完整的那一条 Incoming。
@@ -163,7 +163,7 @@ async fn error_push_is_reported_as_a_message_not_a_fatal_error() -> Result<()> {
     .await?;
 
     let mut conn = RvConn::connect(&addr).await?;
-    conn.host_register(None, "麒麟-01".into()).await?;
+    conn.host_register(None, "麒麟-01".into(), None).await?;
     let (mut reader, _writer) = conn.into_split();
 
     match reader.recv().await? {

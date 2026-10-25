@@ -1,0 +1,135 @@
+uulan · 断线重连（被控端 ↔ 中继）· 2026-10-25 夜间批
+
+────────────────────────────────────────────────────────────────
+一、为什么做这个
+
+真机上的升级路径就是「重装 + 重启服务」。中继（uulan-server）一重启，被控端（uulan-host）
+与它之间那条会合连接就断。旧实现里 run_forever **直接 return Err**：进程退出，
+全靠 systemd 的 Restart=always 重新拉起来。两个后果都是现场会碰到的：
+
+1. 手工 `run.sh host` 跑起来的机器没有 systemd —— 中继重启一次，这台机器就再也不上线；
+2. 「重新拉起」等于「重新注册」，而服务端那边旧注册可能还没被读端回收，
+   handle_host_register 里那条「这个 ID 已有人注册就换一个新 ID」会把**自己的 ID**
+   当成别人的，分配一个新 ID；uulan-host 又把它写回 host.json。
+   现场手里那个「设备 ID + 口令」当场失效，而且旧 ID 还挂在服务端表上
+   （指向一个已死的推送通道，客户端点它会显示在线却连不上）。
+
+同时还有一个反向的边界不能丢：局域网里任何人只要重复注册某个在线 ID 就能把真机踢下线，
+所以原代码**刻意**不让后来者顶掉在线设备，并且有测试钉着
+（tests/rvclient.rs::live_duplicate_registration_does_not_steal_the_id）。
+
+本轮要同时满足这两件事，所以引入了「注册令牌」。
+
+────────────────────────────────────────────────────────────────
+二、改动
+
+1) 协议：ToServer::HostRegister 增加可选字段 reg_token（serde default + skip_serializing_if）。
+   新增 uulan_protocol::rv::reg_token_hash()： SHA-256("uulan-reg-token-v1" ‖ token) 的 hex。
+   服务端只存这个哈希，不存令牌原文。
+
+2) 被控端配置：HostConfig 增加 reg_token（首次运行随机生成，与口令无关）。
+   老配置文件（这个字段出现之前生成的）在 load_or_create 时补一个并立刻落盘 ——
+   否则每次重启都会换新令牌，服务端就永远认不出「还是这台机器」。
+
+3) 服务端 handle_host_register：决定「这个 ID 给不给我」的三条规则
+   · 空着                     → 照收
+   · 已有人注册 + 令牌哈希一致 → 同一台机器重连：照收并**替换**旧注册
+   · 已有人注册 + 令牌不符/没给 → 不许顶，分配新 ID（原有边界，日志写明原因）
+   另外补了两处「注册表卫生」的修正：
+   · 注册成功后 drop 掉局部的 tx —— 不 drop 的话替换旧注册时它的推送通道永远不会关，
+     旧连接变成一条谁也连不到的僵尸注册；
+   · Device 增加注册流水号 conn，收尾时只摘「还是我这条」的注册 ——
+     以前旧连接的收尾按 device_id 盲删，会把刚上线的新注册一起摘掉
+     （现象：重连成功、随即显示离线）。
+
+4) 被控端主循环：run_forever 变成外层重连循环，原函数体搬进 serve_relay。
+   退避 1/2/4/8/15/30 秒封顶；注册成功即把退避计数清零（长连接之后再断不必等 30 秒）。
+   Ctrl-C 处理器从「每条连接的寿命」提到 main 里只装一次。
+   「已上线」凭据横幅只打首条连接，重连只留一行 info（否则 journal 每次重连刷一屏）。
+
+5) 控制端：连接阶段有限重试 --connect-retry <N>（默认 3，0 = 不重试），
+   间隔 1/2/4/8 秒。**只对「连不上」重试**（RvError::Io / RvError::Timeout / 握手超时）：
+   · 被拒（口令错/被锁/被控端忙）不重试 —— 重试是往对方的失败计数器里加数；
+   · 说得清的结果（设备不在线、ID 不合法、协议不匹配）不重试 ——
+     再试一百次也是同一个答案，只会让人多等 7 秒才看到真话。
+   重试提示走 stderr（--term 模式下 stdout 是远端字节流，一个字都不能掺）。
+
+────────────────────────────────────────────────────────────────
+三、本机测试
+
+cargo test --workspace ： 380 passed / 0 failed / 1 ignored，零警告
+（本轮基线 373；新增 7 条）
+  - crates/uulan-server/tests/host_reconnect.rs（新文件，3 条）
+      令牌一致的重连拿回同一个 ID + 旧连接被关闭 + 新会话只推给新连接 +
+      旧连接收尾后新注册仍在线；令牌不符/没令牌一律拿不到在线 ID；
+      非法 ID 仍被换掉、proto 不匹配仍被拒
+  - tests/rvclient.rs::host_with_its_reg_token_reclaims_a_live_id（走生产路径 RvConn）
+  - crates/uulan-host/src/main.rs::reconnect_backoff_starts_small_and_caps
+  - crates/uulan-client/src/main.rs::connect_retry_backoff_starts_small_and_caps
+  - crates/uulan-client/src/main.rs::only_transport_failures_are_retryable
+cargo build --release ： 0 警告
+cargo check -p uulan-host -p uulan-fs -p uulan-bulk -p uulan-server --target x86_64-unknown-linux-gnu
+： 0 警告（XTest / X11 那部分 cfg(target_os="linux") 代码只有这么查才被类型检查）
+
+────────────────────────────────────────────────────────────────
+四、真麒麟实测（192.168.223.15 / mis-pc / Kylin V10 SP1 / X11 1920x1080）
+
+装机：把含本轮改动的工作树打成 tar（不含 .git / target）→ 真机换源码（保留 target/）→
+      cargo build --release -p uulan-server -p uulan-host -p uulan-client（22s，零警告）→
+      install.sh --userland --no-start → systemctl --user kill -s KILL uulan-{host,server}
+      （systemd 自己发信号，无人值守的 cron 里这样绕开审批拦截，等价于重启）
+
+0) 配置迁移（老 host.json 没有 reg_token）：
+   迁移前：sha256 af65ced5…，字段里**没有** reg_token，device_id 805747189
+   迁移后：sha256 80eb46bb…（多了一个字段，设备 ID / 口令 / 临时码一字未变）
+           reg_token 已生成（12 字符），device_id 仍是 805747189
+   MainPID 1517732 → 1826868，NRestarts 10 → 11，/proc/<pid>/exe 指向前缀里的新二进制
+
+1) 中继被 KILL 一次（systemd 拉起，约 1 秒）：
+   host 侧 MainPID **1826868 不变**、NRestarts **仍是 11**（= 进程没退出、没被 systemd 重启）
+   host 日志：与中继的连接断了（early eof）→ step=1 retry_in_s=1.0 → step=2 retry_in_s=2.0
+             → 连不上中继（服务端还没起来）→ 已用原有设备 ID 上线 device_id=805747189
+   server 日志：被控端上线 device_id=805747189 peer=192.168.223.15:46512 name=麒麟真机
+   ⇒ 从断到重新上线约 3 秒，**设备 ID 没变**。
+
+2) 连续 4 次 KILL（间隔 3 秒，模拟中继反复抖动）：
+   host 侧 MainPID 仍 1826868、NRestarts 仍 11、host.json 里 device_id 仍 805747189；
+   每一轮都是「early eof → 1s → 连不上 → 2s → 已用原有设备 ID 上线」，
+   服务端每次就绪后约 2 秒内就看到同一个设备 ID 上线（805747189，name 麒麟真机）。
+
+3) 重连之后的画面（M2 那套逐像素比对照旧做）：
+   Windows 控制端 --headless 12 s：1920x1080 @ 29.6 fps 解出、丢帧 0、首帧 229 ms、
+   被控端自报 30.50 fps、平均码率 9.8 Mbps、
+   与真机 ffmpeg -f x11grab 截图（1920x1080）相关系数 **0.9981** / 平均绝对误差 **0.71%**
+   （本轮开工前同一台机器同一套方法：0.9981 / 0.71% —— 不是回归）
+
+4) 控制端连接重试（Windows 控制端，真中继）：
+   设备 ID 不存在（999999999）：**199 ms** 就报「服务端拒绝: Offline 被控端不在线」，
+                             一次都不重试（旧行为会干等 7 秒）
+   中继端口不通（21999，--connect-retry 2）：
+       连接失败…（1 秒后重试，第 1/2 次）→ （2 秒后重试，第 2/2 次）→ 报错退出，共约 9.2 s
+
+5) 装完之后前缀里的二进制与 target/release 一致：
+   uulan-host 74dec91aa452b89d… = target/release/uulan-host
+   uulan-client 166229a22b76492a… = target/release/uulan-client
+
+────────────────────────────────────────────────────────────────
+五、仍未验 / 已知限制（照实写）
+
+- **控制端「会话中途」不会自动接回**：被控端/中继在会话中掉线时，客户端把画面流结束当成
+  正常收尾（实测：KILL 中继后客户端 8.8 秒退出，退出码 0），窗口模式的 winit 事件循环会被
+  一起带走。要做得重构成「事件循环只建一次、会话槽可替换」，属于一项独立工作，本轮没做。
+  现在只补了**连接阶段**的重试（上面第 4 条）。
+- 注册令牌是**身份标识、不是凭据**：明文走注册（发生在加密握手之前），服务端只存哈希。
+  拿到它只能占用某个设备 ID（连不进来、解不开任何通道）。它是与口令无关的随机值，
+  所以不构成口令的离线校验器（这点与 PAKE 的设计目的一致）。
+- 老版本被控端（没有 reg_token）重连时仍然拿不到自己在线中的 ID —— 行为与改动前一致；
+  两端同批升级即可。
+- 中继侧的「设备在线」判定仍只有两条依据（推送通道是否关闭、有没有 Ping），
+  有 Ping 计时更新 last_seen 但没有基于它的**超时踢人**：网络被切成「半开」时，
+  服务端可能长时间认为那台设备还在线。被控端现在会自己退避重连并拿回 ID，
+  所以现场表现是可恢复的；但「半开连接多久判死」还没定策略，也没验。
+- root 系统装（/opt/uulan）路径、整机重启后的自启：仍然未验。本轮试过 `systemctl reboot`
+  —— polkit 对远程会话要求认证（pkcheck: Authorization requires authentication），
+  mis 没有免密 sudo，所以**无人值守时无法重启真机来验开机自启**。
+  只能在机器跟前有人时做一次；不要把它写成「已验」。

@@ -46,7 +46,7 @@ struct FakeHost {
 impl FakeHost {
     async fn connect(addr: &str, device_id: Option<String>) -> Result<Self> {
         let mut ctl = TcpStream::connect(addr).await?;
-        send(&mut ctl, &ToServer::HostRegister { device_id: device_id.clone(), name: "假麒麟".into(), proto: PROTO_VERSION }).await?;
+        send(&mut ctl, &ToServer::HostRegister { device_id: device_id.clone(), name: "假麒麟".into(), proto: PROTO_VERSION, reg_token: None }).await?;
         match recv(&mut ctl).await? {
             ToEndpoint::HostWelcome { device_id, .. } => Ok(Self { ctl, device_id, addr: addr.to_string() }),
             other => bail!("期望 host_welcome，收到 {other:?}"),
@@ -151,7 +151,7 @@ async fn malformed_device_id_is_rejected_before_lookup() {
 async fn proto_mismatch_is_refused() {
     let addr = spawn_server().await.unwrap();
     let mut h = TcpStream::connect(&addr).await.unwrap();
-    send(&mut h, &ToServer::HostRegister { device_id: None, name: "x".into(), proto: 999 }).await.unwrap();
+    send(&mut h, &ToServer::HostRegister { device_id: None, name: "x".into(), proto: 999, reg_token: None }).await.unwrap();
     match recv(&mut h).await.unwrap() {
         ToEndpoint::Error { code, .. } => assert_eq!(code, ErrCode::ProtoMismatch),
         other => panic!("期望 proto_mismatch，收到 {other:?}"),

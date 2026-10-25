@@ -34,6 +34,17 @@ pub enum Channel {
     Audio,
 }
 
+/// 注册令牌的哈希。服务端只存这个，不存令牌原文。
+///
+/// 域分隔前缀不能省：没有它，同一段字节在别的用途里算出来的哈希与这里可以互换使用。
+pub fn reg_token_hash(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"uulan-reg-token-v1");
+    h.update(token.as_bytes());
+    hex::encode(h.finalize())
+}
+
 /// 端点 → 服务器。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -44,6 +55,18 @@ pub enum ToServer {
         device_id: Option<String>,
         name: String,
         proto: u32,
+        /// 本机注册令牌（首次运行随机生成，存在 `host.json`）。
+        ///
+        /// 用途只有一个：**证明「我是这台机器」**，好在中继重启/网络抖动之后拿回
+        /// 自己的 `device_id`。设备 ID 是给人看的坐标、不是凭据；没有令牌，服务端
+        /// 就无法区分「同一台机器重连」和「别人拿这个 ID 来占位」（后者会把真机的
+        /// 注册顶掉，现场表现是「设备明明开着却显示离线」）。
+        ///
+        /// 线上是明文（注册发生在加密握手之前）。它**不是口令**：与访问口令无关的
+        /// 独立随机值，泄漏只意味着别人能占用某个设备 ID —— 他连不进来，
+        /// 也解不开任何一条通道。服务端只存它的 SHA-256。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reg_token: Option<String>,
     },
     /// 控制端请求连到某个设备。
     ClientConnect { device_id: String, client_name: String, proto: u32 },
@@ -187,7 +210,7 @@ mod tests {
     #[test]
     fn wire_shapes() {
         assert_eq!(
-            serde_json::to_string(&ToServer::HostRegister { device_id: None, name: "K".into(), proto: 1 }).unwrap(),
+            serde_json::to_string(&ToServer::HostRegister { device_id: None, name: "K".into(), proto: 1, reg_token: None }).unwrap(),
             r#"{"type":"host_register","name":"K","proto":1}"#
         );
         assert_eq!(
@@ -208,8 +231,14 @@ mod tests {
     #[test]
     fn roundtrip_all_variants() {
         for m in [
-            ToServer::HostRegister { device_id: Some("123456789".into()), name: "n".into(), proto: 1 },
-            ToServer::HostRegister { device_id: None, name: "n".into(), proto: 1 },
+            ToServer::HostRegister { device_id: Some("123456789".into()), name: "n".into(), proto: 1, reg_token: None },
+            ToServer::HostRegister { device_id: None, name: "n".into(), proto: 1, reg_token: None },
+            ToServer::HostRegister {
+                device_id: Some("123456789".into()),
+                name: "n".into(),
+                proto: 1,
+                reg_token: Some("deadbeef".into()),
+            },
             ToServer::ClientConnect { device_id: "123456789".into(), client_name: "c".into(), proto: 1 },
             ToServer::RelayOpen { session: "s".into(), channel: Channel::Control, role: Role::Client },
             ToServer::RelayOpen { session: "s".into(), channel: Channel::Bulk, role: Role::Host },
