@@ -1073,7 +1073,16 @@ async fn run_headless(
     };
     let s = rep.snap;
     let elapsed = rep.elapsed;
-    let kbps = rep.kbps;
+    // 总时长按**整次运行**算（`started` 是进程进会话前那一刻），不是最后一条会话的时长：
+    // 接回之后就变成「总量 / 最后一段」，实测帧率会凭空翻倍（真机上真出现过 47.0 fps，
+    // 而被控端自报 29.3、实际跑了 900 秒、26853 帧）。码率同理 —— 分子是全过程的字节。
+    let wall = started.elapsed();
+    let wall_s = wall.as_secs_f64();
+    let kbps = if wall_s > 0.0 {
+        (totals.bytes as f64 * 8.0) / wall_s / 1000.0
+    } else {
+        0.0
+    };
 
     if args.json {
         println!(
@@ -1092,7 +1101,8 @@ async fn run_headless(
                 "sessions": sessions,
                 "reconnects": reconnects,
                 "rendered": count,
-                "elapsed_s": elapsed.as_secs_f64(),
+                "elapsed_s": wall_s,
+                "last_session_s": elapsed.as_secs_f64(),
                 "bitrate_kbps": kbps,
             })
         );
@@ -1105,11 +1115,25 @@ async fn run_headless(
         println!("  首帧延迟   : {} ms", s.first_frame_ms);
         println!("  压缩字节   : {}", totals.bytes);
         println!("  平均码率   : {:.0} kbps", kbps);
-        println!("  持续时长   : {:.1} s", elapsed.as_secs_f64());
-        if elapsed.as_secs_f64() > 0.0 {
+        println!("  持续时长   : {:.1} s（整次运行，含连接与重连间隔）", wall_s);
+        if wall_s > 0.0 {
             println!(
-                "  实测帧率   : {:.1} fps（控制端解出）",
-                totals.decoded as f64 / elapsed.as_secs_f64()
+                "  实测帧率   : {:.1} fps（控制端解出，按整次运行算）",
+                totals.decoded as f64 / wall_s
+            );
+        }
+        // 多条会话时补一行「最后一段」：调退化时看的是这一段，别让它被总平均埋掉。
+        if sessions > 1 {
+            let last_s = elapsed.as_secs_f64();
+            println!(
+                "  最后会话   : {:.1} s / {} 帧{}",
+                last_s,
+                s.decoded,
+                if last_s > 0.0 {
+                    format!(" / {:.1} fps / {:.0} kbps", s.decoded as f64 / last_s, rep.kbps)
+                } else {
+                    String::new()
+                }
             );
         }
         println!("  被控端帧率 : {:.2} fps（对面自己数的编码帧率）", s.host_fps_x10 as f32 / 10.0);
