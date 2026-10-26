@@ -171,3 +171,9 @@ host MainPID 2398540 / NRestarts 22，设备 ID 仍是 805747189。
 
 本机 `cargo test --workspace` 仍是 423 passed / 0 failed / 1 ignored、零警告；
 `cargo build --release` 零警告（这次改的是 CLI 的统计打印，没有协议改动）。
+
+收工前按 `e789d07`（含上面那条统计修正）又部署了一遍，核对前缀与 target：
+server daaec698… / host f9db623d… / client **698deaeb…**（两两一致），两个服务 `active`，
+server MainPID 2411504 / NRestarts 23、host 2411473 / 23。麒麟控制端复测：
+6 秒 headless 首帧 265 ms / 9784 kbps / **29.5 fps**（新口径，含连接）；
+`--last` 4 秒 28.5 fps；`client.json` 仍是 `-rw-------`；`--forget` 正常。
