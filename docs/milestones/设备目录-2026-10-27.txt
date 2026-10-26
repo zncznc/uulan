@@ -1,0 +1,118 @@
+uulan · 设备目录（uulan-client --devices）· 2026-10-27 夜间批（第一轮 01:00）
+
+────────────────────────────────────────────────────────────────
+一、为什么做这一项
+
+M5 之后现场要问的第一个问题不是「能不能连上」，而是「要连的那台叫什么 ID」。
+在这之前唯一的答案是走到机器跟前执行 `bash ~/.local/uulan/run.sh status` 抄 9 位数字；
+几十台机器的时候这一步比装机本身还烦。中继其实**早就知道**答案（注册表 + 台账），
+只是没有一条消息去问它 —— `ToServer::Query` 只答「某一台在不在线」。
+
+所以这一项是「把中继已经知道的东西开一个口子」，不是新建一套设备管理。
+
+────────────────────────────────────────────────────────────────
+二、做法
+
+1) 协议（crates/uulan-protocol/src/rv.rs）
+   `ToServer::ListDevices`（无参数）→ `ToEndpoint::DeviceList{devices: Vec<DeviceEntry>}`；
+   `DeviceEntry { device_id, name, online, idle_s: Option<u64> }`。
+   - `idle_s` 只在**在线**时有值（距上次心跳的秒数）；离线的没有可比时钟，给 None，
+     不编一个「很久以前」。字段带 `serde(default)` 且 skip_serializing_if，
+     所以「没有 idle_s 的目录」也能解析。
+   - 新增 `ErrCode::Denied`：和 `Internal` 分开，才能让控制端说「这台中继没开目录」
+     而不是「服务端内部错误」。
+
+2) 中继（crates/uulan-server）
+   - `Server::inventory_at(devices, book, now)` 是**纯函数**：在线判定 + 台账补全 + 按 ID 排序。
+     `now` 由调用方给，所以「沉默超过 TTL」能用假时间测，不用真睡 45 秒。
+   - 在线判据与 `sweep` **完全一致**：`!tx.is_closed() && !device_is_stale(last_seen, now)`。
+     两处不一致会变成「列表说在线、连过去说离线」—— 这种 bug 在真机上极难定位。
+   - 名字优先级：注册表（设备自报的显示名）> 台账（曾经登记过的旧名字）。
+   - `Server::new_with_list(state, allow_list)`；`new()` 保持默认开放（老调用点零改动），
+     CLI 的 `--no-list` 走前者。**构造期定死**而不是运行期开关：字段在 `Arc<Inner>` 里，
+     共享出去就改不动，而「一台中继开不开目录」本来就是部署决策。
+
+3) 控制端（crates/uulan-client）
+   - `--devices` 在 `parse_args` 里**提前返回**：不要求 `--device`、不要求口令 ——
+     它的用途正是「我还不知道该填哪个 ID」。
+   - `format_device_list()` 是纯函数（能 `cargo test`）：空目录印一句话，不印「在线 0」的表头；
+     离线条目只写「离线」，绝不出现「空闲 0s」（那读起来像刚心跳过）。
+   - `--json` 复用既有开关，输出 `Vec<DeviceEntry>`。
+
+────────────────────────────────────────────────────────────────
+三、测试（本机）
+
+新增 10 条：
+  uulan-server/tests/device_list.rs（真 TCP + 真 RvConn，5 条）
+    empty_relay_reports_an_empty_directory /
+    registered_hosts_show_up_sorted_and_online /
+    a_disconnected_host_stays_listed_but_goes_offline /
+    listing_can_be_switched_off_by_the_relay /
+    the_directory_never_carries_a_password        ← 「目录里不许出现口令字段」的护栏
+  uulan-server/src/lib.rs（3 条）
+    inventory_merges_live_registrations_with_the_book /
+    inventory_is_empty_when_nothing_ever_registered /
+    a_closed_registration_shows_offline_but_stays_in_the_book
+  uulan-client/src/main.rs（2 条）
+    device_list_says_how_many_are_online / empty_device_list_reads_like_a_sentence_not_a_table_header
+
+本机 `cargo test --workspace`：**414 passed / 0 failed / 1 ignored，零警告**
+（上一轮基线 404 → +10）。`cargo build --release` 零警告。
+
+────────────────────────────────────────────────────────────────
+四、真机实测（麒麟 V10 SP1 / 海光 C86 / X11 1920x1080）
+
+部署：从 HEAD `d43fe5e` 打包 → 真机换源码（`src.old.20261027_015554` 留底、保留 target/）→
+`cargo build --release -p uulan-server -p uulan-host -p uulan-client` **37.3 s 零警告** →
+`install.sh --userland --no-start --server 192.168.223.15:21116` →
+`systemctl --user kill -s KILL uulan-server uulan-host`（systemd 自己发信号，无人值守可跑）。
+前缀与 target 三个二进制 sha256 逐个一致（server daaec698… / host f9db623d… / client c3abb0f…）。
+两个服务 active，host MainPID 2334355、用原设备 ID 上线。
+
+① Windows 控制端（HEAD release，拷到工作区外跑）：
+   `--devices` →
+     中继 192.168.223.15:21116：1 台设备（在线 1）
+       805747189  麒麟真机  在线  空闲 0s
+   `--devices --json` →（美化打印，`idle_s` 是当次心跳年龄）
+     [
+       { "device_id": "805747189", "name": "麒麟真机", "online": true, "idle_s": 5 }
+     ]
+   文本形式与 JSON 各跑两次，内容一致（第一次空闲 0s、JSON 那次 5s —— 心跳 10 秒一次，
+   这个数就是在变的那一项）。
+
+② 动态（在线判定与台账兜底）：`systemctl --user kill -s KILL uulan-host`
+   - **1 秒后**：`1 台设备（在线 0）` / `805747189  麒麟真机  离线`
+   - **6 秒后**：`1 台设备（在线 1）` / `805747189  麒麟真机  在线  空闲 1s`
+   ⇒ 离线条目仍在（名字来自台账），重新上线后**设备 ID 没变**（顺带又验了一遍重连身份）。
+
+③ `--no-list`（真机上另起临时中继，用**麒麟自己编的客户端**，脚本 `devlist-check.py`）：
+   - `127.0.0.1:21996 --no-list`：`--devices` **rc=1**、
+     「这台中继没有开放设备目录（服务端用 --no-list 关掉了）」；`--json` 同样 rc=1。
+   - `127.0.0.1:21997`（默认开放、还没设备注册）：rc=0、「设备目录是空的（还没有被控端注册过）」；
+     `--json` → `[]`。
+   两个临时中继验完即 terminate，不留后台进程。
+
+④ 画面基线（防回归）：12 秒 headless，**358 AU / 354 解出 / 丢帧 0 / 首帧 219 ms /
+   9798 kbps / 29.5 fps / 被控端自报 30.50 fps / 解码器重建 0 次 / 会话 1 条**；
+   与真机 `ffmpeg -f x11grab -video_size 1920x1080 -i :0` 截图逐像素比对
+   **相关系数 0.9989、平均绝对误差 1.30/255 = 0.51%**（上轮基线 0.9978 / 0.72%）。
+
+────────────────────────────────────────────────────────────────
+五、边界与未验
+
+- 目录只覆盖「这台中继知道的设备」：换一台中继、或台账文件丢了，清单就没了
+  （设备下次上线会重新登记）。它不是资产管理系统。
+- **没有鉴权**：默认任何能连到中继端口的人都能拉清单（与 `Query` 同一信任模型）。
+  敏感现场用 `--no-list` 关掉；现在没有「凭口令看清单」这种中间档，刻意不做 ——
+  中继是盲转发，不持有任何凭据。
+- `idle_s` 的分辨率是秒；心跳 10 秒一次，所以它反映的是「心跳年龄」，不是「有人在操作」。
+- 未验：几十台设备同时在线时的目录规模（字段都很小，8 MiB 帧上限远够；
+  但没实测过 100+ 条在真机上的一次查询耗时）。
+
+────────────────────────────────────────────────────────────────
+六、下一步（候选）
+
+- M5 剩余两项仍然只能等人到机器跟前：整机重启后的开机自启、root 系统装路径（`/opt/uulan`）。
+- 长连接稳定性（20 分钟 soak + VmRSS 采样）还没做过一次正式归档 —— 无人值守可跑，下一轮候选。
+- `--devices` 之后自然的一步是「控制端记住上次连的设备」（本机配置里存最近一次
+  server/device/name），省掉每次敲 9 位数字；同样属于现场可用性，不是协议改动。
