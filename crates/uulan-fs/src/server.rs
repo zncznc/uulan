@@ -568,9 +568,16 @@ mod tests {
         }
 
         async fn recv(&mut self) -> BulkFrame {
-            let f = read_frame(&mut self.rd).await.expect("读 bulk 帧");
+            self.recv_opt().await.expect("读 bulk 帧")
+        }
+
+        /// 读一帧，但**允许没有帧**：失败的 Get（比如目标是目录）一个字节都不发，
+        /// 服务端收工就关掉那条 duplex —— 这时候硬 expect 会把「正确的失败」
+        /// 报成 `early eof`。真机上第一次跑 Linux 测试时就是这么多出一条假红。
+        async fn recv_opt(&mut self) -> Option<BulkFrame> {
+            let f = read_frame(&mut self.rd).await.ok()?;
             assert_eq!(f.kind, FrameKind::Blob);
-            BulkFrame::decode(&f.payload).unwrap()
+            Some(BulkFrame::decode(&f.payload).unwrap())
         }
     }
 
@@ -648,7 +655,9 @@ mod tests {
         });
         let mut got = Vec::new();
         loop {
-            let f = peer.recv().await;
+            // 失败路径（目标是目录 / 路径不存在）服务端不会发任何帧，
+            // 这里必须能停下来 —— 否则失败用例永远等不到 End，只会读到 EOF。
+            let Some(f) = peer.recv_opt().await else { break };
             assert_eq!(f.id, id, "数据帧必须带上请求里的 id");
             if f.kind == BulkKind::End {
                 break;
