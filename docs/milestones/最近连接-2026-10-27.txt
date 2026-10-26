@@ -1,0 +1,137 @@
+uulan · 控制端记住上次连接（--last / --forget）· 2026-10-27 夜间批（第二轮 05:00）
+
+────────────────────────────────────────────────────────────────
+一、为什么做这一项
+
+上一轮把「我该连哪台」解决了（`--devices` 列中继知道的设备）。剩下的重复劳动是
+**那个 9 位数字每次还要再抄一遍**：现场的做法往往是建一个便签、或者把
+`--device 805747189` 整条命令存成脚本 —— 前者会过期，后者在被控端换机器/换 ID 之后
+变成一条连不上的命令，而报错只会说「被控端不在线」。
+
+所以这一项只做一件事：连成功一次之后，把「中继地址 + 设备 ID + 对端显示名」记在本机，
+下次 `uulan-client --last` 直接用。它不是新的设备管理，**也不碰协议**。
+
+────────────────────────────────────────────────────────────────
+二、做法
+
+新增 `crates/uulan-client/src/recent.rs`（纯逻辑 + 一个小文件）：
+
+  Recent { server, device, host_name, saved_unix }
+  路径：`$UULAN_CLIENT_CONFIG` > `$XDG_CONFIG_HOME/uulan/client.json` >
+        `$HOME/.config/uulan/client.json` > `%USERPROFILE%\.config\uulan\client.json`
+  （与 `uulan-host` 的 `host.json` 同一套约定；一台机器上现场只需要记一个目录）
+
+控制端的三个入口：
+
+  --last     只在命令行为空时补 --server / --device（`recent::apply` 是纯函数）。
+             显式给的优先：`--last --device 111111111` 一定连 111111111。
+  --forget   只删这个文件；不连中继、不要口令（「忘掉那台」正是发生在「口令不想留」时）。
+  --devices  命中记住的那台，在那一行后面标「← 上次」；`--json` 保持中继原样，不加私货。
+
+三条硬规矩（模块注释 + 测试都钉着）：
+
+1. **口令绝不落盘。** 文件里只有 server / device / host_name / saved_unix。
+   `saved_file_carries_no_credential` 把序列化结果的小写文本扫一遍
+   （password/passwd/口令/密码/temp_code/secret/token/"value"），谁加凭据字段它立刻红。
+2. **只在鉴权成功之后写。**「TCP 连上中继」不算：设备 ID 打错、口令打错时也会连上中继，
+   把那种参数记下来，下次 `--last` 就是记下一个错答案。写盘失败只留一条 info 日志，
+   绝不影响刚建立的会话（代价只是「下次还得手抄 ID」）。
+3. **坏了就当没有。** 文件缺失 / JSON 坏 / 设备 ID 是空串 → `None` + 一句 stderr，
+   `--last` 报「还没有记住任何设备」并让人去 `--devices`，不是抛错崩掉。
+   老文件（没有 host_name / saved_unix 字段）照样能读 —— 否则每次升级现场都要手动删缓存。
+
+其它细节：
+
+- 写盘走 `*.json.tmp` + `rename`，Unix 下 `0600`（内容虽无凭据，
+  「这台控制端连哪台机器」在隔离网里也值得少说一句）。
+- `--last` 那行提示走 **stderr**：`--term` 模式下 stdout 是远端 PTY 的字节流，
+  掺一行中文就等于往 shell 里凭空打了一行。
+- 提示内容必须与真正用的参数一致：命令行已明确指了别台时印
+  「上次连过的是 …；本次按命令行给的 --device 连」，不印「按 --last 用上次连过的」。
+
+────────────────────────────────────────────────────────────────
+三、测试（本机 + 真机）
+
+本机 `cargo test --workspace`：**423 passed / 0 failed / 1 ignored，零警告**
+（上一轮基线 414 → 本轮 +9：`recent` 8 条 + 目录标记 1 条）。
+`cargo build --release` 零警告。
+
+新增单测：
+  recent::roundtrip_saves_and_loads                      （有写盘权限才真跑，否则声明跳过）
+  recent::older_file_without_new_fields_still_loads       （升级兼容）
+  recent::corrupt_or_empty_file_reads_as_nothing_remembered
+  recent::saved_file_carries_no_credential                （护栏）
+  recent::apply_only_fills_what_the_command_line_left_empty
+  recent::describe_says_the_device_and_how_long_ago       （同一秒不说「0 秒前」）
+  recent::forget_reports_whether_there_was_anything
+  recent::default_path_lives_next_to_host_json
+  main::the_remembered_device_is_marked_on_its_own_line_only（只标一行；目录里没有就不标）
+
+真机侧（麒麟，ext4，写盘真的可用）：`cargo test -p uulan-client --lib recent:: -- --nocapture`
+→ **8 passed / 0 failed，一条都没跳过**（本机 Windows 上同一批测试因为
+「exe 在 D:/default-workspace 下写不了盘」是跳过的，所以必须到真机跑一次才算验过）。
+
+────────────────────────────────────────────────────────────────
+四、真机实测（麒麟 V10 SP1 / 海光 C86 / X11 1920x1080 / `:0` 处于 UKUI 锁屏）
+
+部署：HEAD `ad05994` → `git archive` → 真机换源码（`src.old.20261027_051941` 留底、保留
+target/）→ `cargo build --release -p uulan-server -p uulan-host -p uulan-client`
+**37.26 s 零警告** → `install.sh --userland --no-start --server 192.168.223.15:21116`
+→ `systemctl --user kill -s KILL uulan-server uulan-host`。
+前缀与 target 的三个二进制 sha256 两两一致（server daaec698… / host f9db623d… /
+client 42fb301e…）。两个服务 `active`，server MainPID 2398509 / NRestarts 19、
+host MainPID 2398540 / NRestarts 22，设备 ID 仍是 805747189。
+
+① Windows 控制端，第一次**显式**连接（`--server` + `--device` + `--password-file`），
+   8 秒 headless：**238 AU / 234 解出 / 丢帧 0 / 首帧 223 ms / 9806 kbps / 29.3 fps /
+   被控端自报 30.60 fps**。连上之后本机多出 `client.json`：
+   `{server: 192.168.223.15:21116, device: 805747189, host_name: 麒麟真机, saved_unix: …}`
+   （Windows 没有 POSIX 权限位，`0600` 是 Unix 侧的事；麒麟侧的实测见第 ③ 条）。
+
+② 第二次只写 `--last --password-file …`（没有 `--server`、没有 `--device`）：
+   stderr 一行 `按 --last 用上次连过的设备：805747189「麒麟真机」，13 分钟前`，
+   随后正常出画面，12 秒：**358 AU / 355 解出 / 丢帧 0 / 首帧 262 ms / 9799 kbps /
+   29.6 fps / 被控端自报 30.00 fps / 解码器重建 0 次 / 会话 1 条**。
+   `--save-frame` 的最后一帧与真机 `ffmpeg -f x11grab` 截图逐像素比对：
+   **相关系数 0.9996、平均绝对误差 1.28/255 = 0.50%**（上轮基线 0.9989 / 0.51%）。
+
+③ 真机自己编的控制端（麒麟侧，`UULAN_CLIENT_CONFIG=/tmp/uulan-client-test.json`）：
+   - 首次连接（`127.0.0.1:21116`）29.0 fps，随后文件出现：
+     `-rw------- mis mis 117` —— **0600**，内容同上；
+   - `--last` 免参数再连：`按 --last 用上次连过的设备：805747189「麒麟真机」，刚刚`，
+     首帧 261 ms、29.0 fps；
+   - `--devices` → `805747189  麒麟真机  在线  空闲 7s  ← 上次`；
+   - `--forget` → 「已忘掉上次连接的设备」，紧接着 `--last` 退出码 1 +
+     「还没有记住任何设备（…不存在或读不出来）」。
+
+④ 反例（都要求「不覆盖、不凭空造」）：
+   - 错口令（`--last` + 一个假口令文件）：`被控端拒绝：密码不正确`、rc=1，
+     **配置文件 `saved_unix` 与 `device` 一字未变**；
+   - 错设备 ID（`--last --device 111111111`）：`Offline 被控端不在线`、rc=1，
+     文件仍指向 805747189；stderr 印的是「上次连过的是 …；本次按命令行给的 --device 连」；
+   - 从来没有成功过时错口令：**不会凭空建出 `client.json`**；
+   - 明文扫描：把口令串在 `client.json` 与四次运行的 RUST_LOG=info 日志里搜 ——
+     **命中 0 个文件**。
+
+────────────────────────────────────────────────────────────────
+五、边界与未验
+
+- 只记**一台**（最后一次成功的那台）。要记多台就是「配置档」了，现场还没这个需求；
+  现在换着连两台机器，`--last` 只认最近一次 —— 想固定就连时显式写 `--device`。
+- 文件缺失/写不进去时 `--last` 会让人回退到手抄 ID，**不会**自己去猜中继上有哪台机器
+  （那需要连中继拉目录，是另一件事）。
+- 未验：窗口模式（默认开窗）下的 `--last` —— 它和 headless 共用同一份参数解析，
+  本轮没单独开窗跑（`DESIGN.md` 里另一处已记录：验证 GUI 里程碑要 `painted=N`，
+  而这一项不涉及渲染）。
+- 未验：多用户机器上「A 用户的 client.json 会不会被 B 读到」—— 文件是 0600，
+  但没人以另一个用户身份实测过。
+
+────────────────────────────────────────────────────────────────
+六、下一步（候选）
+
+- M5/M6 都已 ✅；剩下的「整机重启后的开机自启」「root 系统装（/opt/uulan）」两条
+  **必须有人到机器跟前**（polkit 拒绝远程 reboot、mis 没有免密 sudo），无人值守做不了。
+- 长连接稳定性：上轮 20 分钟 soak 没有单调增长；要「证伪泄漏」得跑小时级并跨多次重连
+  （每次重连换解码器）—— 下一轮候选。
+- 现场可用性还可以再走一步：`--last` 之后再接「记住上次用的窗口尺寸/缩放」，或者
+  把 `--devices` 的目录缓存在本机（中继连不上时也能看到「上次那台叫什么」）。

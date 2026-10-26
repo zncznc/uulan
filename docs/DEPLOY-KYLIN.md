@@ -848,3 +848,24 @@ uulan-client --server 192.168.223.15:21116 --devices
   在中继上加 `--no-list`（systemd 用户单元是 `ExecStart=` 那行加），之后控制端会得到
   `rc=1` 和一句「这台中继没有开放设备目录（服务端用 --no-list 关掉了）」。
   注意：关掉只是不给清单，单台 `Query` 与正常连接不受影响。
+
+## 19. 下次不用再抄设备 ID：`uulan-client --last`（2026-10-27 实测）
+
+连成功一次之后，控制端会把「中继地址 + 设备 ID + 对端显示名」记在本机
+`~/.config/uulan/client.json`（`$UULAN_CLIENT_CONFIG` 可改路径），**口令不记**：
+
+```bash
+# 第一次（还得给 ID）
+uulan-client --server 192.168.223.15:21116 --device 805747189 --password-file ~/.uulan-pw
+# 之后：不用 --server、不用 --device
+uulan-client --last --password-file ~/.uulan-pw
+#   按 --last 用上次连过的设备：805747189「麒麟真机」，13 分钟前
+```
+
+- **只在鉴权成功之后才写**：口令错、设备 ID 错的那次不会把错参数记下来（否则下次 `--last`
+  就是记下一个错答案）。从来没成功过时也不会凭空建文件。
+- 命令行显式给的 `--server` / `--device` **一律优先**：`--last --device 111111111` 一定连 111111111。
+- `--devices` 会在记住的那一行后面标「← 上次」（`--json` 不标，保持中继原样）。
+- `uulan-client --forget` 忘掉它（只删文件，不连中继、不要口令）。
+- 文件在麒麟上是 `-rw-------`；文件里没有任何凭据（真机把口令串在配置与日志里搜过，命中 0）。
+- 只记**最后一台**。两台机器轮着连的话，想固定就写显式 `--device`。

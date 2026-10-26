@@ -323,7 +323,7 @@ uulan/
 | **M2.5 画好** | ✅ | 窗口 ✅；**键鼠注入 ✅（两端已接，本机全链路 + 真机 XTest 实测）**；**实测帧率上报 ✅**；**剪贴板文本双向 ✅（本机全链路 + 真 Win32；X11 后端已在真机与外部 X 客户端双向验过）**；**分辨率变化重建解码器 ✅（两端都做了，本机全链路实测）** | 能远程操作并双向粘文字、被控端换分辨率后画面自动跟上。真机实测见 `docs/milestones/M3-M4-真机-2026-10-23.txt`（XTest 注入：指针落点精确、keysym 正确、滚轮=按钮5、autorepeat 已还原；X11 剪贴板：与独立 X 客户端双向互通） |
 | **M3 能操作** | ✅ | XTest 注入 + 按键连发处理；`--inject` 脚本化注入（可无人值守验）；uinput 兜底仍未做 | **真机已验**（2026-10-23）：`--inject` 走真链路 → 被控端 XTest → 真 X 服务器；用 `xev`/`xdotool` 当独立判据，坐标/键位/按钮号/配对全对（当次验在另起的 `Xvfb :99` 上）。**同一轮夜间批补验**：`--inject move:640,400` 直接打到真 `:0`，`xdotool getmouselocation` 读到 `x:640 y:400`（注入前 1901,0，已还原）。限制：`:0` 被 UKUI 锁屏挡着，**往应用里打字/拖拽仍未验** |
 | **M4 工具齐全** | 🔄 | **文件传输 ✅**（列/取/送/建/删/改名/哈希 + 路径沙箱 + sha256，真二进制实测 6 MiB 往返一致）；**端口映射 ✅**（bulk 多路复用 + `--forward`，真二进制实测 256 KiB 单流 + 两条并发流逐字节一致）；**终端（PTY）✅ 本机全链路 + 真机 Linux 侧**（真 `/dev/pts`、termios 默认、winsize 下发、退出码 7 原样回来、SIGHUP→SIGKILL 升级日志）；**终端尺寸跟随 ✅（2026-10-25，真机验：本地窗口变了远端 PTY 跟着变）**；**目录树传输 ✅（2026-10-26：`--put-tree` / `--get-tree`，真机双向 6/6 逐文件 sha256 一致）** | 三项都用真 server + 真被控端 + 真客户端链路验过。终端已上真麒麟验 Linux 独有部分；尺寸跟随真机实测：本地 pty `100x30`→`132x43` 后远端 `stty size` 由 `30 100` 变 `43 132`，`--term-size` 钉死时不跟随（见 `docs/milestones/终端尺寸跟随-2026-10-25.txt`）。剪贴板整链（Windows↔麒麟）本轮**未验**（cron 上下文没有交互式剪贴板）。**目录树传输的真机数字**（2026-10-26）：Windows→麒麟 `--put-tree` 6 目录 / 6 文件 / 4194327 字节（含 4 MiB 文件）、0.1s，真机 `find + sha256sum` 6/6 一致；`--get-tree` 拉回 6/6 一致；重复上传幂等；真链接两侧都跳过（`evil.txt -> /etc/passwd`、`sub/up -> ..` 没有被带过去，也没有无限递归），见 `docs/milestones/目录树传输-2026-10-26.txt` |
-| **M5 麒麟落地** | 🔄 | 离线安装包（tar.gz + install.sh + 3 个 systemd 单元）✅、systemd 开机自启 ✅（用户态装实测）、**就地重装（升级）✅**、**安装预检前移 ✅（缺输入不再留半装前缀）**、**控制端可编可装 ✅（`--with-client` 打包 + install.sh 装进前缀，2026-10-24）**、部署文档 ✅（`deploy/README.md` + `docs/DEPLOY-KYLIN.md` 第 13/14/15 节）、**设备目录 ✅（`uulan-client --devices`：中继在线表 ∪ 台账，`--no-list` 可关；2026-10-27 真机验）** | 真机上 `bash install.sh --userland` 一次装通：中继+被控端都是 `enabled`+`active`、`Linger=yes`、`ExecStartPre` 的 uulan-wait-x 真的等到 `:0`；`systemctl --user kill -s KILL` 后 `NRestarts=1` 自动拉起并重新上线；包内二进制取帧 29.6fps、相关系数 0.9969。见 `docs/milestones/M5-麒麟落地-2026-10-23.txt`。**就地升级已验**（2026-10-24）：在服务正在跑的真机上从离线包装重装 → 设备 ID 与 host.json 一字未变、二进制被替换、KILL 后 systemd 拉起的是前缀里的新二进制、再连 29.2fps/丢帧 0；见 `docs/milestones/M5-就地升级与安装预检-2026-10-24.txt`。**控制端在麒麟上编+装已验**（2026-10-24，见 `docs/milestones/麒麟控制端-2026-10-24.txt`）：`--with-client` 的包 3.8M、重装后前缀里多出 `uulan-client`（sha 与包内/`target` 三者一致）。**未验**：整机重启后的自启、系统装（root，/opt/uulan）路径（本机 sudo 要口令）。2026-10-25 复核：`systemctl reboot` 对远程会话被 polkit 要求认证（`pkcheck --action-id org.freedesktop.login1.reboot` → *Authorization requires authentication*），mis 又没有免密 sudo，所以**无人值守时重启不了真机**——这条只能等人到机器跟前再验，别写成已验。**设备目录已验（2026-10-27）**：`--devices` 列出真机「805747189 麒麟真机 在线」，`kill -s KILL` 后 1 秒内变「在线 0 / 离线」、6 秒后回到「在线 1 / 空闲 1s」且设备 ID 不变；`--no-list` 用麒麟自己的客户端验过拒绝路径（rc=1 + 说清原因）；画面基线 29.5 fps / 丢帧 0 / 相关系数 0.9989 无回归。见 `docs/milestones/设备目录-2026-10-27.txt` |
+| **M5 麒麟落地** | 🔄 | 离线安装包（tar.gz + install.sh + 3 个 systemd 单元）✅、systemd 开机自启 ✅（用户态装实测）、**就地重装（升级）✅**、**安装预检前移 ✅（缺输入不再留半装前缀）**、**控制端可编可装 ✅（`--with-client` 打包 + install.sh 装进前缀，2026-10-24）**、部署文档 ✅（`deploy/README.md` + `docs/DEPLOY-KYLIN.md` 第 13/14/15 节）、**设备目录 ✅（`uulan-client --devices`：中继在线表 ∪ 台账，`--no-list` 可关；2026-10-27 真机验）**、**记住上次连接 ✅（`--last` / `--forget`，`--devices` 给命中的那行标「← 上次」；2026-10-27 真机验）** | 真机上 `bash install.sh --userland` 一次装通：中继+被控端都是 `enabled`+`active`、`Linger=yes`、`ExecStartPre` 的 uulan-wait-x 真的等到 `:0`；`systemctl --user kill -s KILL` 后 `NRestarts=1` 自动拉起并重新上线；包内二进制取帧 29.6fps、相关系数 0.9969。见 `docs/milestones/M5-麒麟落地-2026-10-23.txt`。**就地升级已验**（2026-10-24）：在服务正在跑的真机上从离线包装重装 → 设备 ID 与 host.json 一字未变、二进制被替换、KILL 后 systemd 拉起的是前缀里的新二进制、再连 29.2fps/丢帧 0；见 `docs/milestones/M5-就地升级与安装预检-2026-10-24.txt`。**控制端在麒麟上编+装已验**（2026-10-24，见 `docs/milestones/麒麟控制端-2026-10-24.txt`）：`--with-client` 的包 3.8M、重装后前缀里多出 `uulan-client`（sha 与包内/`target` 三者一致）。**未验**：整机重启后的自启、系统装（root，/opt/uulan）路径（本机 sudo 要口令）。2026-10-25 复核：`systemctl reboot` 对远程会话被 polkit 要求认证（`pkcheck --action-id org.freedesktop.login1.reboot` → *Authorization requires authentication*），mis 又没有免密 sudo，所以**无人值守时重启不了真机**——这条只能等人到机器跟前再验，别写成已验。**设备目录已验（2026-10-27）**：`--devices` 列出真机「805747189 麒麟真机 在线」，`kill -s KILL` 后 1 秒内变「在线 0 / 离线」、6 秒后回到「在线 1 / 空闲 1s」且设备 ID 不变；`--no-list` 用麒麟自己的客户端验过拒绝路径（rc=1 + 说清原因）；画面基线 29.5 fps / 丢帧 0 / 相关系数 0.9989 无回归。见 `docs/milestones/设备目录-2026-10-27.txt`。**记住上次连接已验（2026-10-27）**：Windows 控制端只写 `--last`（无 `--server`、无 `--device`）直接出画面 358 AU / 355 解出 / 丢帧 0 / 首帧 262 ms / 29.6 fps，存的帧与真机截图相关系数 0.9996 / MAE 0.50%；真机自编的控制端上 `client.json` 是 `-rw-------`（涨到 0600）、`--last` 首帧 261 ms / 29.0 fps、`--forget` 后 `--last` 退出码 1；错口令 / 错设备 ID 不但不覆盖旧记录、也不会凭空建文件，口令串在配置与日志里命中 0。见 `docs/milestones/最近连接-2026-10-27.txt` |
 | **M6 加固** | ✅ | **E2E 加密 ✅（本机全链路 + 中继抓包实测）**；**PAKE（CPace/Ristretto255）✅**：口令只用来生成生成元，会话密钥 = `HKDF(X25519 共享点 ‖ PAKE 共享点)` —— 主动 MITM 的中继既解不开任何通道、也没法拿证明离线撞字典；临时验证码「用一次即失效」✅ + **每小时自动轮换 ✅（只轮换已存在的码）**+ **运行中的服务能看见 `--new-temp-code` 新写的码 ✅**；**日志脱敏 ✅ 全量**（口令只在终端/`--show` 打；会话票据改成不可逆标签 `tXXXXXXXX`；终端内容/剪贴板只记长度；两个二进制的日志一律走 stderr）；控制端口令可走 `--password-file` / `UULAN_PASSWORD`；**系统指标 ✅**（`H2C::Metrics`：CPU/内存/网速，被控端读 `/proc` 差分）；**锁屏状态 ✅**（`H2C::SystemState`：锁屏时被控端**在进 Mapper 之前**丢输入并松开已按下的键；控制端也停发） | 中继抓包看不到明文内容 —— **已用「记录字节的代理」实测**：clipboard 两个方向共 10978 字节，找不到任何明文；日志脱敏见 `docs/milestones/M6-日志脱敏-2026-10-23.txt`；**PAKE 真机实测见 `docs/milestones/M6-PAKE-2026-10-24.txt`**：永久口令 29.6fps/首帧 227ms/丢帧 0/相关系数 0.9982（与改前 0.9980 同水平）、错口令被拒、临时码走候选序号 1 首次可用第二次被拒且用完不消耗永久口令、journal 122 行口令 0 命中。**指标与锁屏的真机数字见 `docs/milestones/M6-指标与锁屏状态-2026-10-25.txt`**：`--status` 报 locked=true、CPU 0.8–0.9% 与真机 `/proc/stat` 独立差分（0.72–2.00%）同量级，内存 3792–3800MB 对得上 `free` 的「总-可用」；用**旧客户端**（不认状态）往锁屏里 `--inject`，被控端 `dropped_locked=3`、`events=0`、指针一个像素没动。**唯一遗留**：PAKE 是本仓库自研实现，没有第三方审计。**断线重连 ✅（2026-10-25）**：被控端↔中继断线自动重连（退避 1/2/4/8/15/30 s 封顶，**进程不退、设备 ID 不变**），并加注册令牌让「同一台机器重连」能拿回自己的 ID、而「后来者」仍顶不掉在线设备。真机：中继连续 KILL 5 次，host 的 MainPID 与 NRestarts 一次都没变，每次约 2–3 秒重新上线且设备 ID 仍是 805747189；重连后取帧 29.6 fps / 丢帧 0 / 首帧 229 ms / 相关系数 0.9981（基线 0.9981）。见 `docs/milestones/断线重连-2026-10-25.txt`。**控制端的断线接回 ✅（2026-10-26）**：控制端新增 `session::Live` 会话槽 + `session::drive` 会话循环，窗口跨会话不重建；真机中继被 KILL 后 **4.3 秒接回**（会话 1 543 帧 / 会话 2 1575 帧、均 30 fps 丢帧 0），接回后的帧与真机截图相关系数 0.9970 / MAE 0.73%，窗口模式 `painted=1326` 且窗口只建了一次；本机 `scripts/verify-reconnect-e2e.sh` 两会话 1947 + 3379 帧。见 `docs/milestones/断线接回-控制端-2026-10-26.txt`。**半开连接判死 ✅（2026-10-26）**：中继按 `last_seen` + `DEVICE_STALE_TTL=45s` 摘掉沉默设备（心跳 30s→10s），只影响新连接、不断已有会话；真机把被控端 `SIGSTOP` 后 49 秒被判离线（`silent_s=49 ttl_s=45`），控制端连接**75 ms** 拿到 Offline（改造前要等 15 秒握手超时），`SIGCONT` 后 2 秒用原 ID 重新上线；25 秒 `--status` 期间 0 次误判。见 `docs/milestones/半开连接判死-2026-10-26.txt`。**控制端的会话级半开判死 ✅（2026-10-26）**：`watch.rs` 加静默看门狗（`SILENCE_LIMIT=15s`，判据是视频通道的**任意帧**），TCP 半开时不再永远等下去 —— 真机把被控端 `SIGSTOP` 后 **16.1 秒**判死（`silent_s=15`）、会话按「静默 15 秒（半开？）」收尾、`SIGCONT` 后 **0.2 秒**接回（headless 两会话 1273 帧 / 丢帧 0；窗口 `painted=1244`、「窗口已就绪」只出现一次）；同轮修掉 headless `--seconds` 的「5 秒没帧就算跑完」与「握手途中 io 断开不重试」两个 bug，并修掉被控端的 `free(): invalid pointer` 崩溃（没调 `XInitThreads`，并发会话下 Xlib 无锁；改后同场景连跑 2 次 MainPID/NRestarts 不变）。部署后验收 29.5 fps / 丢帧 0 / 首帧 216 ms / 相关系数 0.9999 / MAE 0.50%。见 `docs/milestones/半开判死-控制端-2026-10-26.txt` |
 
 ### M5 落地：部署形态（systemd + 离线安装包）
@@ -1562,6 +1562,56 @@ $ uulan-client --server 192.168.223.15:21116 --devices
   **半开**（`SIGSTOP` 被控端）时目录在 **52 秒**内报「离线」，`CONT` 后 **4 秒**回线，
   `MainPID`/`NRestarts` 都没变 —— 这一步顺带把「在线判据与 sweep 同一套」验成了事实。
 
+### M5 落地：控制端记住上次连接（`--last`，已完成 · 真机实测 2026-10-27）
+
+上一项解决了「我该连哪台」（`--devices`），剩下的重复劳动是**那个 9 位数字每次还要再抄一遍**。
+现在连成功一次就记在本机，下次只写 `--last`：
+
+```
+$ uulan-client --last --password-file ~/.uulan-pw
+按 --last 用上次连过的设备：805747189「麒麟真机」，13 分钟前
+已连上「麒麟真机」（linux 0.1.0，屏幕 1920x1080，编码器 4）
+```
+
+- 文件：`crates/uulan-client/src/recent.rs`，路径 `$UULAN_CLIENT_CONFIG` >
+  `$XDG_CONFIG_HOME/uulan/client.json` > `$HOME/.config/uulan/client.json` >
+  `%USERPROFILE%\.config\uulan\client.json`（与 `host.json` 同一套约定）。
+  内容只有 `server / device / host_name / saved_unix` 四项。
+- **口令绝不落盘**：`saved_file_carries_no_credential` 把序列化结果扫一遍（password/passwd/口令/密码/
+  temp_code/secret/token），谁以后想「顺手把口令也存上」它立刻红。
+  真机上另外把口令串在 `client.json` 与四次 RUST_LOG=info 日志里搜了一遍，**命中 0**。
+- **只在鉴权成功之后写**。「TCP 连上中继」不算 —— 设备 ID 或口令打错时也会连上中继，
+  把那种参数记下来，下次 `--last` 就是记下一个错答案。真机验过反例：错口令 / 错设备 ID
+  都 rc=1，而文件里的 `device` 与 `saved_unix` **一字未变**；从来没成功过时也不会凭空建出文件。
+- **坏了就当没有**：文件缺失 / JSON 坏 / 设备 ID 是空串 → `None` + 一句 stderr，`--last` 报
+  「还没有记住任何设备」并让人去 `--devices`，不崩。老文件（缺 `host_name`/`saved_unix`）照样能读，
+  否则每次升级现场都得手动删缓存。
+- **`--last` 只补空缺**：命令行显式给的 `--server` / `--device` 一律优先（`--last` + `--device 111111111`
+  一定连 111111111）；且提示词必须和真用的参数一致 —— 命令行指了别台时印
+  「上次连过的是 …；本次按命令行给的 `--device` 连」，而不是「按 `--last` 用上次连过的」。
+- **那行提示走 stderr**：`--term` 模式下 stdout 是远端 PTY 的字节流，掺一行中文就等于
+  往 shell 里凭空打了一行。
+- `--forget` 只删文件（不连中继、不要口令）；`--devices` 给命中的那一行标「← 上次」，
+  **`--json` 不加私货** —— 脚本要的是中继原样给的目录。
+- 写盘走 `*.json.tmp` + `rename`，Unix 下 `0600`（真机实测真的是 `-rw-------`）。
+- 与上一项一样的约束：**只记一台**（最后一次成功）。要固定连某台就写显式 `--device`。
+
+#### 真机实测（`docs/milestones/最近连接-2026-10-27.txt`）
+
+部署即 HEAD `ad05994`（真机 `cargo build --release -p uulan-server -p uulan-host -p uulan-client`
+**37.26 s 零警告**，前缀与 target 三个二进制 sha256 两两一致；server MainPID 2398509 / NRestarts 19、
+host 2398540 / 22，设备 ID 仍是 805747189）：
+
+- Windows 控制端 `--last`（没有 `--server`、没有 `--device`）直接出画面：12 秒 **358 AU / 355 解出 /
+  丢帧 0 / 首帧 262 ms / 9799 kbps / 29.6 fps / 被控端自报 30.00 fps / 重建 0 次**；存的帧与真机
+  `ffmpeg -f x11grab` 截图逐像素比对 **相关系数 0.9996 / MAE 1.28/255 = 0.50%**（上轮 0.9989 / 0.51%）。
+- 真机自己编的控制端：首次连接后 `client.json` 是 `-rw-------`（117 字节）；`--last` 免参数再连
+  首帧 261 ms / 29.0 fps；`--devices` → `805747189  麒麟真机  在线  空闲 7s  ← 上次`；`--forget` 后
+  `--last` 退出码 1 + 「还没有记住任何设备」。
+- 另一条要记住的环境事实：**`recent` 的写盘单测在 Windows 上是跳过的**（exe 在
+  `D:/default-workspace` 下时写不了盘），所以真机 `cargo test -p uulan-client --lib recent:: -- --nocapture`
+  那 **8/8 全过、一条不跳** 才是这条路径真被跑过的证据。
+
 ### M2 实际验收方式（重要）
 
 M2 分两层验收，**两层都做完了**。
@@ -1609,6 +1659,7 @@ M2 分两层验收，**两层都做完了**。
 - **剪贴板只同步文本**（第一版）。图片、文件列表（`text/uri-list`）不同步；
   单条上限 192 KiB，超过就整条不同步（不截断）；「清空剪贴板」不传播
   （X11 上读不到不等于内容变空，按「没读到」处理）。
+- **控制端只记住最后一台（`--last`）**：换着连两台机器时它只认最近成功的那次，想固定连哪台就写显式 `--device`；且本机文件里**没有任何凭据**（口令继续走 `--password-file` / `UULAN_PASSWORD`）。
 - **换分辨率会重开编码源，画面会断约 0.3–1 秒**（探针周期 + 编码器重启 + 控制端重建解码器）。
   期间丢掉的帧不补发；控制端此时若正好在拖动/输入，落点按新尺寸算，不会错位。
 - **分辨率跟随只看主屏**（与「不支持多显示器切换」同一条限制）：副屏热插拔不会改变抓取区域。
