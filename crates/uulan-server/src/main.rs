@@ -5,6 +5,7 @@
 //!   uulan-server --bind 10.0.0.1:21116
 //!   uulan-server --state /var/lib/uulan/devices.json
 //!   uulan-server --list                   # 打印台账里登记过的设备
+//!   uulan-server --no-list                # 不许控制端远程拉设备目录（默认许）
 //!   uulan-server --forget 123456789       # 从台账里摘掉一台设备
 
 use std::path::PathBuf;
@@ -18,6 +19,8 @@ struct Args {
     state: PathBuf,
     list: bool,
     forget: Option<String>,
+    /// 关掉「控制端远程拉设备目录」（`ToServer::ListDevices`）。
+    no_list: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -25,6 +28,7 @@ fn parse_args() -> Result<Args> {
     let mut state = PathBuf::from("uulan-devices.json");
     let mut list = false;
     let mut forget = None;
+    let mut no_list = false;
 
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -33,6 +37,7 @@ fn parse_args() -> Result<Args> {
             "--state" => state = PathBuf::from(it.next().unwrap_or_default()),
             "--list" => list = true,
             "--forget" => forget = it.next(),
+            "--no-list" => no_list = true,
             "-h" | "--help" => {
                 println!("{}", HELP);
                 std::process::exit(0);
@@ -43,7 +48,7 @@ fn parse_args() -> Result<Args> {
     if bind.is_empty() {
         bail!("--bind 需要一个地址，例如 --bind 0.0.0.0:{DEFAULT_PORT}");
     }
-    Ok(Args { bind, state, list, forget })
+    Ok(Args { bind, state, list, forget, no_list })
 }
 
 const HELP: &str = "\
@@ -53,10 +58,15 @@ uulan-server —— uulan 内网远控的中继/会合服务器
   --state <path>    设备台账 JSON 路径（默认 ./uulan-devices.json）
   --list            打印台账里登记过的设备后退出
   --forget <id>     从台账里摘掉一台设备后退出
+  --no-list         关掉「控制端远程拉设备目录」（默认开放；见下）
   -h, --help        显示本帮助
 
 服务器是盲转发的：它不认识屏幕内容、键盘、剪贴板、文件，
 也不知道任何设备密码。访问控制由被控端自己做。
+
+--no-list 说明：默认允许控制端用 `uulan-client --devices` 拉一份设备目录
+（设备 ID + 显示名 + 在不在线，不含任何凭据）。它能省掉「挨台机器看 ID」，
+但也等于把内网机器清单交给任何能连到本端口的人。敏感现场用 --no-list 关掉。
 ";
 
 #[tokio::main]
@@ -93,7 +103,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let server = Server::new(Some(args.state))?;
+    let server = Server::new_with_list(Some(args.state), !args.no_list)?;
     let listener = server.bind(&args.bind).await?;
     server.serve(listener).await
 }

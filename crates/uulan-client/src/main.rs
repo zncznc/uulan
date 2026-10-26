@@ -8,6 +8,7 @@
 //!   uulan-client --server 10.0.0.1:21116 --device 123456789 --password aB3dE5fG
 //!   uulan-client ... --headless --frames 120   # 命令行模式，解出 120 帧后退出
 //!   uulan-client ... --headless --json         # 以 JSON 打印统计，便于脚本消费
+//!   uulan-client --server 10.0.0.1:21116 --devices   # 只看设备目录，不连任何一台
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,7 +21,8 @@ use uulan_client::connect::{self, ClientError};
 use uulan_client::session;
 use uulan_client::watch::WatchStatsSnapshot;
 use uulan_protocol::msg::Cap;
-use uulan_protocol::rvclient::RvError;
+use uulan_protocol::rv::DeviceEntry;
+use uulan_protocol::rvclient::{RvConn, RvError};
 
 struct Args {
     server: String,
@@ -55,6 +57,9 @@ struct Args {
     /// 脚本化键鼠注入（`--inject`）：只发输入、不收画面，跑完就退出。
     /// 存在的理由是「键鼠真的打进了被控端」必须能机器验证，不能靠人手点。
     inject: Option<String>,
+    /// 只列设备目录（`--devices`）：连中继、拉清单、打印、退出。
+    /// 不需要 `--device`，也不需要口令 —— 它回答的正是「我该连哪台」。
+    devices: bool,
     /// 只看被控端状态（`--status <秒>`）：读控制通道上的 Metrics / SystemState，
     /// 每秒打一行。存在的理由同 `--inject`：负载与锁屏也必须能机器验证。
     status: Option<f64>,
@@ -84,7 +89,7 @@ uulan-client —— uulan 内网远控的控制端
   --headless          不开窗口，只打印统计（自测 / 无显示环境用）
   --no-input          只读模式：不上报键鼠（排障、旁观时用）
   --no-clipboard      不同步剪贴板（不希望本机剪贴板被对面改写时用）
-  --json              以 JSON 输出统计（仅 --headless 下生效）
+  --json              以 JSON 输出（--headless 的统计 / --devices 的设备目录）
   --connect-retry <N> 连接阶段最多重试 N 次（默认 3；0 = 连一次就报错退出）
                       只在「连不上」时重试；口令错/被锁直接报错，不重试
   --reconnect <N>     会话中途断线后最多连续重连 N 次（默认 8；0 = 断线即退出）
@@ -106,6 +111,8 @@ uulan-client —— uulan 内网远控的控制端
   --term-shell <path>         指定远端 shell，例：--term-shell /bin/bash
 
 键鼠注入（脚本化，做完就退出；不开窗口、不收画面）：
+  --devices           列中继知道的设备（ID / 名称 / 在线），不连任何一台
+                      不需要 --device 和口令；加 --json 输出机器可读格式
   --status <秒>       只读被控端状态（CPU/内存/锁屏），每秒一行，跑完退出
   --inject \"<脚本>\"           沿真实链路把键鼠打进被控端，用来机器验证「真的打进去了」
                              步骤用 ; 分隔：move:X,Y（屏幕像素）/ movn:X,Y（0..1）
@@ -147,6 +154,7 @@ fn parse_args() -> Result<Args> {
         term_shell: None,
         inject: None,
         status: None,
+        devices: false,
         connect_retry: DEFAULT_CONNECT_RETRY,
         reconnect: DEFAULT_RECONNECT,
     };
@@ -178,6 +186,7 @@ fn parse_args() -> Result<Args> {
                 let spec = it.next().context("--forward 需要 [绑定地址:]本地端口:目标主机:目标端口")?;
                 a.forward.push(uulan_client::ForwardSpec::parse(&spec)?);
             }
+            "--devices" => a.devices = true,
             "--term" => a.term = true,
             "--term-size" => {
                 let v = it.next().context("--term-size 需要 COLSxROWS，例：140x40")?;
@@ -256,6 +265,10 @@ fn parse_args() -> Result<Args> {
     }
     if a.server.is_empty() {
         bail!("--server 不能为空");
+    }
+    // `--devices` 是「先看看有哪些机器」的那一步，用户这时候当然还不知道设备 ID。
+    if a.devices {
+        return Ok(a);
     }
     if a.device.is_empty() {
         bail!("必须给出 --device（被控端界面上显示的 9 位设备 ID）");
@@ -389,6 +402,38 @@ async fn connect_with_retry(
     }
 }
 
+/// 把设备目录排成人看的样子。
+///
+/// 纯函数，所以「空目录怎么说话 / 离线条目怎么标」能在本机用 `cargo test` 钉住 ——
+/// 这两句最容易在改动里悄悄变形（比如把离线写成「空闲 0s」，读起来像刚心跳过）。
+fn format_device_list(server: &str, devices: &[DeviceEntry]) -> String {
+    if devices.is_empty() {
+        return format!("中继 {server}：设备目录是空的（还没有被控端注册过）\n");
+    }
+    let online = devices.iter().filter(|d| d.online).count();
+    let mut out = format!("中继 {server}：{} 台设备（在线 {online}）\n", devices.len());
+    // 按字符数补空格对齐：中文一个字占两格显示宽，但这里的目标是「能扫」不是排版，
+    // 不值得为此引入 unicode-width。
+    let id_w = devices.iter().map(|d| d.device_id.chars().count()).max().unwrap_or(0);
+    let name_w = devices.iter().map(|d| d.name.chars().count()).max().unwrap_or(0);
+    for d in devices {
+        let state = match (d.online, d.idle_s) {
+            (true, Some(s)) => format!("在线  空闲 {s}s"),
+            (true, None) => "在线".to_string(),
+            (false, _) => "离线".to_string(),
+        };
+        out.push_str(&format!(
+            "  {:id_w$}  {:name_w$}  {}\n",
+            d.device_id,
+            d.name,
+            state,
+            id_w = id_w,
+            name_w = name_w,
+        ));
+    }
+    out
+}
+
 fn default_client_name() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
@@ -408,6 +453,35 @@ async fn main() -> Result<()> {
         .init();
 
     let args = parse_args()?;
+
+    // 设备目录：只问中继「有哪些机器」，不建立会话，也不需要口令。
+    // 放在最前面 —— 它的用途正是「我还不知道设备 ID」的那个时候。
+    if args.devices {
+        let mut rv = match RvConn::connect(&args.server).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("连不上中继 {}：{e}", args.server);
+                std::process::exit(1);
+            }
+        };
+        let list = match rv.list_devices().await {
+            Ok(l) => l,
+            Err(RvError::Server { code: uulan_protocol::rv::ErrCode::Denied, message }) => {
+                eprintln!("{message}");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("拉设备目录失败：{e}");
+                std::process::exit(1);
+            }
+        };
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&list)?);
+        } else {
+            print!("{}", format_device_list(&args.server, &list));
+        }
+        return Ok(());
+    }
 
     // 能力列表必须如实：声明了没实现的能力，被控端会准备好对应通道，
     // 而控制端点了没反应 —— 那种 bug 最难查。剪贴板只在真有后端时才声明。
@@ -1021,6 +1095,35 @@ mod tests {
             message: "设备不在线".into()
         })));
         assert!(!is_retryable(&ClientError::Unexpected("握手期间被控端断开".into())));
+    }
+
+    fn entry(id: &str, name: &str, online: bool, idle_s: Option<u64>) -> DeviceEntry {
+        DeviceEntry { device_id: id.into(), name: name.into(), online, idle_s }
+    }
+
+    #[test]
+    fn device_list_says_how_many_are_online() {
+        let s = format_device_list(
+            "10.0.0.1:21116",
+            &[
+                entry("805747189", "麒麟-mis-pc", true, Some(3)),
+                entry("805747000", "旧机器", false, None),
+            ],
+        );
+        assert!(s.starts_with("中继 10.0.0.1:21116：2 台设备（在线 1）\n"), "{s}");
+        assert!(s.contains("805747189") && s.contains("麒麟-mis-pc"));
+        assert!(s.contains("在线  空闲 3s"), "{s}");
+        // 离线就是离线：绝不能出现「空闲 0s」那种看着像刚心跳过的字样。
+        let off_line = s.lines().find(|l| l.contains("805747000")).expect("离线条目不见了");
+        assert!(off_line.trim_end().ends_with("离线"), "{off_line}");
+        assert!(!off_line.contains("空闲"), "{off_line}");
+    }
+
+    #[test]
+    fn empty_device_list_reads_like_a_sentence_not_a_table_header() {
+        let s = format_device_list("10.0.0.1:21116", &[]);
+        assert!(s.contains("设备目录是空的"), "{s}");
+        assert!(!s.contains("在线 0"), "空目录不该印一个表头出来：{s}");
     }
 
     #[test]

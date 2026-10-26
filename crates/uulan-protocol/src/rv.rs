@@ -45,6 +45,25 @@ pub fn reg_token_hash(token: &str) -> String {
     hex::encode(h.finalize())
 }
 
+/// 设备目录里的一条。
+///
+/// 服务端把「在线注册表」和「台账里登记过的设备」并起来给出去：
+/// 前面那些带实时状态，后面那些只是「曾经来过」，方便现场按名字找回该连哪台。
+///
+/// **不含任何凭据**：设备 ID 是给人看的坐标、名字是显示名，两者本来就在被控端
+/// 的 `run.sh status` 上印着。口令永远不出被控端。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceEntry {
+    pub device_id: String,
+    pub name: String,
+    pub online: bool,
+    /// 在线时距上次心跳多少秒（半开连接会一直变大，直到超过判死时限被摘掉）。
+    /// 离线的条目没有可比的时钟 —— 台账只存名字，不存时间戳，所以给 `None`
+    /// 而不是编一个「很久以前」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_s: Option<u64>,
+}
+
 /// 端点 → 服务器。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -74,6 +93,13 @@ pub enum ToServer {
     RelayOpen { session: String, channel: Channel, role: Role },
     /// 客户端查询设备在线状态（不发起会话）。
     Query { device_id: String },
+    /// 拉一份设备目录（在线 + 台账），不发起会话。
+    ///
+    /// 存在的理由：现场几十台麒麟，控制端要连某台时必须先知道它的 9 位 ID。
+    /// 没有这条消息，就只能挨个跑到机器跟前看 `run.sh status`。
+    /// 服务端可以用 `--no-list` 关掉它（关掉时回 `ErrCode::Denied`）——
+    /// 目录会暴露「内网里有哪些机器、叫什么名字」，敏感现场可以不留这个口子。
+    ListDevices,
     Ping,
     /// 被控端更新自己的显示名 / 能力。
     HostUpdate {
@@ -102,6 +128,8 @@ pub enum ToEndpoint {
     /// 配对成功，这条连接后面就是纯字节流了（服务器不再发 JSON）。
     RelayReady { channel: Channel },
     QueryResult { device_id: String, online: bool, #[serde(skip_serializing_if = "Option::is_none")] name: Option<String> },
+    /// 设备目录，按 `device_id` 升序。
+    DeviceList { devices: Vec<DeviceEntry> },
     Pong { server_time_ms: u64 },
     Error { code: ErrCode, message: String },
 }
@@ -121,6 +149,11 @@ pub enum ErrCode {
     DuplicateChannel,
     /// 服务端内部错误。
     Internal,
+    /// 服务端策略拒绝（例如 `--no-list` 关掉了设备目录）。
+    ///
+    /// 和 `Internal` 分开是为了让控制端能说人话：「这台中继没开设备目录」，
+    /// 而不是「服务端内部错误」—— 后者会让人去查日志找一个不存在的 bug。
+    Denied,
 }
 
 impl ToServer {
@@ -226,6 +259,34 @@ mod tests {
             serde_json::to_string(&ToEndpoint::Error { code: ErrCode::Offline, message: "设备不在线".into() }).unwrap(),
             r#"{"type":"error","code":"offline","message":"设备不在线"}"#
         );
+        // 设备目录：离线条目不带 idle_s（`Option` 跳字段），"ListDevices" 不带任何参数。
+        assert_eq!(
+            serde_json::to_string(&ToServer::ListDevices).unwrap(),
+            r#"{"type":"list_devices"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ToEndpoint::DeviceList {
+                devices: vec![DeviceEntry {
+                    device_id: "805747189".into(),
+                    name: "麒麟".into(),
+                    online: false,
+                    idle_s: None,
+                }]
+            })
+            .unwrap(),
+            r#"{"type":"device_list","devices":[{"device_id":"805747189","name":"麒麟","online":false}]}"#
+        );
+        // 反过来：老服务端发来的目录里没有 idle_s 字段也必须能解析。
+        let old: ToEndpoint =
+            serde_json::from_str(r#"{"type":"device_list","devices":[{"device_id":"805747189","name":"麒麟","online":true}]}"#)
+                .unwrap();
+        match old {
+            ToEndpoint::DeviceList { devices } => {
+                assert_eq!(devices[0].idle_s, None);
+                assert!(devices[0].online);
+            }
+            other => panic!("期望 DeviceList，得到 {other:?}"),
+        }
     }
 
     #[test]
@@ -244,6 +305,7 @@ mod tests {
             ToServer::RelayOpen { session: "s".into(), channel: Channel::Bulk, role: Role::Host },
             ToServer::RelayOpen { session: "s".into(), channel: Channel::Audio, role: Role::Host },
             ToServer::Query { device_id: "123456789".into() },
+            ToServer::ListDevices,
             ToServer::Ping,
             ToServer::HostUpdate { name: Some("x".into()) },
             ToServer::HostUpdate { name: None },
@@ -260,6 +322,14 @@ mod tests {
             ToEndpoint::RelayReady { channel: Channel::Control },
             ToEndpoint::QueryResult { device_id: "123456789".into(), online: true, name: Some("n".into()) },
             ToEndpoint::QueryResult { device_id: "123456789".into(), online: false, name: None },
+            ToEndpoint::DeviceList { devices: vec![] },
+            ToEndpoint::DeviceList {
+                devices: vec![
+                    DeviceEntry { device_id: "805747189".into(), name: "麒麟-mis-pc".into(), online: true, idle_s: Some(3) },
+                    DeviceEntry { device_id: "805747000".into(), name: "旧机器".into(), online: false, idle_s: None },
+                ],
+            },
+            ToEndpoint::Error { code: ErrCode::Denied, message: "未开启".into() },
             ToEndpoint::Pong { server_time_ms: 12345 },
             ToEndpoint::Error { code: ErrCode::BadSession, message: "m".into() },
         ] {

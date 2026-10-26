@@ -22,7 +22,8 @@ use tracing::{debug, info, warn};
 use uulan_protocol::frame::{read_frame, write_frame, Frame, FrameKind};
 use uulan_protocol::redact;
 use uulan_protocol::rv::{
-    gen_device_id, gen_session, is_valid_device_id, Channel, ErrCode, Role, ToEndpoint, ToServer,
+    gen_device_id, gen_session, is_valid_device_id, Channel, DeviceEntry, ErrCode, Role, ToEndpoint,
+    ToServer,
 };
 use uulan_protocol::PROTO_VERSION;
 
@@ -93,6 +94,11 @@ struct Inner {
     sessions: Mutex<HashMap<String, Session>>,
     book: Mutex<DeviceBook>,
     state_path: Option<PathBuf>,
+    /// 允不允许控制端拉设备目录（`--no-list` 关掉）。
+    ///
+    /// 目录只是「有哪些机器、叫什么名字、在不在线」，没有任何凭据；
+    /// 但它确实把内网的机器清单一次交出去，所以给一个能关的开关。
+    allow_list: bool,
 }
 
 /// 服务器句柄。`Clone` 之后共享同一份状态。
@@ -103,6 +109,15 @@ pub struct Server {
 
 impl Server {
     pub fn new(state_path: Option<PathBuf>) -> Result<Self> {
+        Self::new_with_list(state_path, true)
+    }
+
+    /// 同 [`Server::new`]，但可以关掉设备目录（对应 `uulan-server --no-list`）。
+    ///
+    /// 为什么是构造参数而不是运行时开关：`allow_list` 在 `Arc<Inner>` 里，
+    /// 共享出去之后就改不动（`Arc::get_mut` 拿不到）。而且「一台中继开不开目录」
+    /// 本来就是部署决策，不是运行期状态。
+    pub fn new_with_list(state_path: Option<PathBuf>, allow_list: bool) -> Result<Self> {
         let mut book = DeviceBook::default();
         if let Some(p) = &state_path {
             match DeviceBook::load(p) {
@@ -123,6 +138,7 @@ impl Server {
                 sessions: Mutex::new(HashMap::new()),
                 book: Mutex::new(book),
                 state_path,
+                allow_list,
             }),
         })
     }
@@ -244,6 +260,7 @@ impl Server {
                 self.handle_client_connect(stream, peer, device_id, client_name, proto).await
             }
             ToServer::Query { device_id } => self.handle_query(stream, &device_id).await,
+            ToServer::ListDevices => self.handle_list_devices(stream).await,
             ToServer::Ping => {
                 write_frame(&mut stream, FrameKind::Json, &json_bytes(&ToEndpoint::Pong { server_time_ms: now_ms() })).await?;
                 Ok(())
@@ -482,6 +499,65 @@ impl Server {
         Ok(())
     }
 
+    /// 设备目录：在线注册表 ∪ 台账，按 ID 升序。
+    ///
+    /// 抽成纯函数（`now` 由调用方给）是为了把「在线判定」与「台账补全」分开测 ——
+    /// 真去等 45 秒 TTL 的测试没人会跑。
+    fn inventory_at(
+        devices: &HashMap<String, Device>,
+        book: &DeviceBook,
+        now: Instant,
+    ) -> Vec<DeviceEntry> {
+        let mut out: Vec<DeviceEntry> = Vec::with_capacity(devices.len() + book.devices.len());
+        for (id, d) in devices {
+            // 判据与 `sweep` 完全一致：推送通道关了（对端没了），或者沉默超过 TTL
+            // （半开连接）。两处必须同一套，否则会出现「列表显示在线、连过去却说离线」。
+            let online = !d.tx.is_closed() && !Self::device_is_stale(d.last_seen, now);
+            out.push(DeviceEntry {
+                device_id: id.clone(),
+                name: d.name.clone(),
+                online,
+                idle_s: online.then(|| now.saturating_duration_since(d.last_seen).as_secs()),
+            });
+        }
+        for (id, name) in book.list() {
+            if !devices.contains_key(&id) {
+                out.push(DeviceEntry { device_id: id, name, online: false, idle_s: None });
+            }
+        }
+        out.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+        out
+    }
+
+    fn inventory(&self) -> Vec<DeviceEntry> {
+        let now = Instant::now();
+        let devices = self.inner.devices.lock().unwrap();
+        let book = self.inner.book.lock().unwrap();
+        Self::inventory_at(&devices, &book, now)
+    }
+
+    async fn handle_list_devices(&self, mut stream: TcpStream) -> Result<()> {
+        if !self.inner.allow_list {
+            send_error(
+                &mut stream,
+                ErrCode::Denied,
+                "这台中继没有开放设备目录（服务端用 --no-list 关掉了）",
+            )
+            .await;
+            return Ok(());
+        }
+        let devices = self.inventory();
+        let online = devices.iter().filter(|d| d.online).count();
+        info!(total = devices.len(), online, "设备目录查询");
+        write_frame(
+            &mut stream,
+            FrameKind::Json,
+            &json_bytes(&ToEndpoint::DeviceList { devices }),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn handle_query(&self, mut stream: TcpStream, device_id: &str) -> Result<()> {
         if !is_valid_device_id(device_id) {
             send_error(&mut stream, ErrCode::BadDeviceId, "设备 ID 必须是 9 位数字且首位非 0").await;
@@ -661,6 +737,69 @@ mod tests {
             Device { name: "test".into(), tx, last_seen, reg_token: None, conn: 1 },
             rx,
         )
+    }
+
+    fn book_of(rows: &[(&str, &str)]) -> DeviceBook {
+        let mut b = DeviceBook::default();
+        for (id, name) in rows {
+            b.remember(id, name);
+        }
+        b
+    }
+
+    #[test]
+    fn inventory_merges_live_registrations_with_the_book() {
+        let (live, _rx_live) = device_with_age(Duration::from_secs(2));
+        let (silent, _rx_silent) = device_with_age(Duration::from_secs(120));
+        let mut devices = HashMap::new();
+        devices.insert("805747189".to_string(), live);
+        devices.insert("805747111".to_string(), silent);
+        let book = book_of(&[
+            ("805747189", "麒麟-mis-pc"),
+            // 台账里故意写一个与注册表不同的名字：注册表里的显示名优先。
+            ("805747111", "台账里的旧名字"),
+            ("805747000", "早就关掉的机器"),
+        ]);
+
+        let inv = Server::inventory_at(&devices, &book, Instant::now());
+        // 三台：两台在注册表、一台只在台账里；按 ID 升序。
+        assert_eq!(inv.len(), 3);
+        // 000 只在台账里；111 在注册表但沉默 120 秒（> TTL）；189 在注册表且刚心跳过。
+        assert_eq!(inv[0].device_id, "805747000");
+        assert!(!inv[0].online, "只在台账里的设备必须报离线");
+        assert_eq!(inv[0].idle_s, None, "离线条目不该编一个空闲秒数");
+
+        assert_eq!(inv[1].device_id, "805747111");
+        assert!(!inv[1].online, "沉默超过 TTL 的注册不算在线");
+        // 名字以**注册表**里的为准（设备自己上报的），台账只在它没注册时兜底。
+        assert_eq!(inv[1].name, "test", "注册表里的显示名必须优先于台账：{}", inv[1].name);
+        assert_eq!(inv[1].idle_s, None);
+
+        assert_eq!(inv[2].device_id, "805747189");
+        assert!(inv[2].online);
+        assert_eq!(inv[2].idle_s, Some(2));
+    }
+
+    #[test]
+    fn inventory_is_empty_when_nothing_ever_registered() {
+        let inv = Server::inventory_at(&HashMap::new(), &DeviceBook::default(), Instant::now());
+        assert!(inv.is_empty());
+    }
+
+    #[test]
+    fn a_closed_registration_shows_offline_but_stays_in_the_book() {
+        let (tx, rx) = mpsc::unbounded_channel::<ToEndpoint>();
+        drop(rx); // 推送通道关了 = 对端没了
+        let mut devices = HashMap::new();
+        devices.insert(
+            "805747189".to_string(),
+            Device { name: "刚断开".into(), tx, last_seen: Instant::now(), reg_token: None, conn: 1 },
+        );
+        let book = book_of(&[("805747189", "刚断开")]);
+        let inv = Server::inventory_at(&devices, &book, Instant::now());
+        assert_eq!(inv.len(), 1, "同一台机器不该因为既在注册表又在台账里出现两次");
+        assert!(!inv[0].online);
+        assert_eq!(inv[0].idle_s, None);
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 
 use crate::frame::{read_frame, write_frame, FrameKind};
-use crate::rv::{Channel, ErrCode, Role, ToEndpoint, ToServer};
+use crate::rv::{Channel, DeviceEntry, ErrCode, Role, ToEndpoint, ToServer};
 use crate::PROTO_VERSION;
 
 #[derive(Debug, thiserror::Error)]
@@ -147,6 +147,19 @@ impl RvConn {
         match self.recv_ok().await? {
             ToEndpoint::QueryResult { online, name, .. } => Ok((online, name)),
             other => Err(RvError::Unexpected { expected: "QueryResult", got: format!("{other:?}") }),
+        }
+    }
+
+    /// 拉一份设备目录（在线 + 台账里登记过的），按 `device_id` 升序。
+    ///
+    /// 不发起会话、也不需要设备口令：这是「我该连哪台」的查询。
+    /// 服务端用 `--no-list` 关掉时返回 [`RvError::Server`]（`ErrCode::Denied`），
+    /// 调用方应当把它当成「这台中继没开目录」而不是错误日志里的 bug。
+    pub async fn list_devices(&mut self) -> Result<Vec<DeviceEntry>, RvError> {
+        self.send(&ToServer::ListDevices).await?;
+        match self.recv_ok().await? {
+            ToEndpoint::DeviceList { devices } => Ok(devices),
+            other => Err(RvError::Unexpected { expected: "DeviceList", got: format!("{other:?}") }),
         }
     }
 
