@@ -5,6 +5,7 @@
 //! - [`control`]：控制通道（键鼠上报 + 剪贴板同步 + 被控端回报）。
 //! - [`input`]：窗口事件 → 协议消息的纯函数（坐标换算、滚轮、键位表）。
 //! - [`fsx`]：文件操作（列/取/送/建/删），不开窗口、不收画面。
+//! - [`tree`]：整棵目录树的传输（`--put-tree` / `--get-tree`），只是串行的单文件操作。
 //! - [`forward`]：端口映射（`ssh -L` 那种），同样不开窗口、不收画面。
 //!
 //! 窗口（winit + softbuffer）是 [`watch`] 之上的一层，不参与协议。
@@ -13,6 +14,7 @@ pub mod connect;
 pub mod control;
 pub mod forward;
 pub mod fsx;
+pub mod tree;
 pub mod inject;
 pub mod session;
 pub mod termx;

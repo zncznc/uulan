@@ -6,6 +6,8 @@
 //! --ls <远程路径>              列目录（`:/` = 此电脑）
 //! --get <远程路径> <本地路径>   下载
 //! --put <本地路径> <远程路径>   上传
+//! --put-tree <本地目录> <远程目录>   整棵本地树上传（目录树传输见 `tree` 模块）
+//! --get-tree <远程目录> <本地目录>   整棵远端树下载
 //! --rm <远程路径>
 //! --mkdir <远程路径>
 //! ```
@@ -30,6 +32,8 @@ use uulan_protocol::bulk::{BulkFrame, BulkKind, CHUNK};
 use uulan_protocol::frame::{read_frame, write_frame, FrameKind};
 use uulan_protocol::msg::{C2H, FsEntry, FsOp, FsStreamStage, H2C};
 
+use crate::tree;
+
 /// 要做的文件操作。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
@@ -38,6 +42,10 @@ pub enum Op {
     Put { local: PathBuf, remote: String },
     Rm(String),
     Mkdir(String),
+    /// 整棵本地目录树 → 被控端（`--put-tree`）。
+    PutTree { local: PathBuf, remote: String },
+    /// 整棵远端目录树 → 本机（`--get-tree`）。
+    GetTree { remote: String, local: PathBuf },
 }
 
 impl Op {
@@ -53,6 +61,18 @@ impl Op {
         };
         for (i, a) in args.iter().enumerate() {
             match a.as_str() {
+                "--put-tree" => {
+                    return Ok(Some(Op::PutTree {
+                        local: PathBuf::from(at(i + 1, "--put-tree")?),
+                        remote: at(i + 2, "--put-tree")?,
+                    }))
+                }
+                "--get-tree" => {
+                    return Ok(Some(Op::GetTree {
+                        remote: at(i + 1, "--get-tree")?,
+                        local: PathBuf::from(at(i + 2, "--get-tree")?),
+                    }))
+                }
                 "--ls" => return Ok(Some(Op::Ls(at(i + 1, "--ls")?))),
                 "--rm" => return Ok(Some(Op::Rm(at(i + 1, "--rm")?))),
                 "--mkdir" => return Ok(Some(Op::Mkdir(at(i + 1, "--mkdir")?))),
@@ -77,7 +97,7 @@ impl Op {
 
 /// 控制通道上与本操作有关的一条消息。
 #[derive(Debug)]
-enum Step {
+pub(crate) enum Step {
     Begin { total: Option<u64> },
     Done { done: u64 },
     Failed { done: u64 },
@@ -91,22 +111,22 @@ enum Step {
 }
 
 /// 生产环境里 bulk 连接的两个半端。
-type Conn = Peer<SecReadHalf, SecWriteHalf>;
+pub(crate) type Conn = Peer<SecReadHalf, SecWriteHalf>;
 
-struct Ctl {
+pub(crate) struct Ctl {
     rd: SecReadHalf,
     wr: SecWriteHalf,
 }
 
 impl Ctl {
-    async fn send(&mut self, m: &C2H) -> Result<()> {
+    pub(crate) async fn send(&mut self, m: &C2H) -> Result<()> {
         let f = m.to_frame()?;
         write_frame(&mut self.wr, f.kind, &f.payload).await?;
         Ok(())
     }
 
     /// 等下一条属于 `id` 的通知/结果。别的消息（剪贴板、指标、输入错误）直接跳过。
-    async fn wait(&mut self, id: u32) -> Result<Step> {
+    pub(crate) async fn wait(&mut self, id: u32) -> Result<Step> {
         loop {
             let f = read_frame(&mut self.rd).await.context("控制通道读失败（被控端断线了？）")?;
             if f.kind == FrameKind::Ping {
@@ -139,7 +159,7 @@ impl Ctl {
 
     /// 一直等到 `FsResult`（跳过中途的 Begin/Done，但把 Done 的字节数记进日志里，
     /// 大文件传一半断了时这行是唯一线索）。
-    async fn wait_result(&mut self, id: u32) -> Result<Step> {
+    pub(crate) async fn wait_result(&mut self, id: u32) -> Result<Step> {
         loop {
             match self.wait(id).await? {
                 r @ Step::Result { .. } => return Ok(r),
@@ -169,6 +189,8 @@ pub async fn run(control: SecControl, bulk: SecConn, op: Op) -> Result<()> {
         Op::Ls(p) => ls(&mut ctl, p).await,
         Op::Get { remote, local } => get(&mut ctl, &mut peer, remote, local).await,
         Op::Put { local, remote } => put(&mut ctl, &mut peer, local, remote).await,
+        Op::PutTree { local, remote } => tree::put_tree(&mut ctl, &mut peer, local, remote).await,
+        Op::GetTree { remote, local } => tree::get_tree(&mut ctl, &mut peer, remote, local).await,
         Op::Rm(p) => simple(&mut ctl, FsOp::Remove { id: 1, path: p }, "已删除").await,
         Op::Mkdir(p) => simple(&mut ctl, FsOp::Mkdir { id: 1, path: p }, "已创建").await,
     }
@@ -347,7 +369,7 @@ async fn put(ctl: &mut Ctl, peer: &mut Conn, local: PathBuf, remote: String) -> 
 }
 
 /// 下载用的临时文件名（与目标同目录，rename 才是原子的）。
-fn part_path(local: &Path) -> PathBuf {
+pub(crate) fn part_path(local: &Path) -> PathBuf {
     let name = local.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let dir = local.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
     dir.join(format!("{name}.uulan-part"))
@@ -377,13 +399,13 @@ fn fmt_time(secs: i64) -> String {
 }
 
 /// bulk 连接的客户端半边。
-struct Peer<R, W> {
+pub(crate) struct Peer<R, W> {
     rd: R,
     wr: W,
 }
 
 impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Peer<R, W> {
-    async fn send_data(&mut self, id: u32, data: &[u8]) -> Result<()> {
+    pub(crate) async fn send_data(&mut self, id: u32, data: &[u8]) -> Result<()> {
         // 拷一份进 Bytes：帧要跨 await 活着，不能借着调用方的切片。
         let payload = BulkFrame::data(id, bytes::Bytes::copy_from_slice(data)).encode();
         write_frame(&mut self.wr, FrameKind::Blob, &payload)
@@ -392,14 +414,14 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Peer<R, W> {
         Ok(())
     }
 
-    async fn send_end(&mut self, id: u32) -> Result<()> {
+    pub(crate) async fn send_end(&mut self, id: u32) -> Result<()> {
         write_frame(&mut self.wr, FrameKind::Blob, &BulkFrame::end(id).encode())
             .await
             .context("写 bulk 失败（被控端可能已断开）")?;
         Ok(())
     }
 
-    async fn recv(&mut self) -> Result<Option<BulkFrame>> {
+    pub(crate) async fn recv(&mut self) -> Result<Option<BulkFrame>> {
         let f = read_frame(&mut self.rd).await.context("读 bulk 失败")?;
         if f.kind != FrameKind::Blob {
             return Ok(None);

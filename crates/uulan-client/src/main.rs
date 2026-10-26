@@ -97,6 +97,8 @@ uulan-client —— uulan 内网远控的控制端
   --put <本地路径> <远程路径>  上传
   --rm <远程路径>            删除文件（目录必须为空）
   --mkdir <远程路径>         新建目录
+  --put-tree <本地目录> <远程目录>  整棵本地目录树上传（只读模式/符号链接跳过）
+  --get-tree <远程目录> <本地目录>  整棵远端目录树下载（先清单、再逐个校验）
 
 终端（交互式；不开窗口、不收画面；客户端退出码 = 远端 shell 的退出码）：
   --term                      在远端开一个 shell
@@ -228,6 +230,22 @@ fn parse_args() -> Result<Args> {
                 let local = it.next().context("--put 需要 <本地路径> <远程路径>")?;
                 let remote = it.next().context("--put 需要 <本地路径> <远程路径>")?;
                 a.fs_op = Some(uulan_client::fsx::Op::Put { local: PathBuf::from(local), remote });
+            }
+            "--put-tree" => {
+                let local = it.next().context("--put-tree 需要 <本地目录> <远程目录>")?;
+                let remote = it.next().context("--put-tree 需要 <本地目录> <远程目录>")?;
+                a.fs_op = Some(uulan_client::fsx::Op::PutTree {
+                    local: PathBuf::from(local),
+                    remote,
+                });
+            }
+            "--get-tree" => {
+                let remote = it.next().context("--get-tree 需要 <远程目录> <本地目录>")?;
+                let local = it.next().context("--get-tree 需要 <远程目录> <本地目录>")?;
+                a.fs_op = Some(uulan_client::fsx::Op::GetTree {
+                    remote,
+                    local: PathBuf::from(local),
+                });
             }
             "-h" | "--help" => {
                 println!("{HELP}");
