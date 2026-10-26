@@ -567,10 +567,6 @@ mod tests {
                 .unwrap();
         }
 
-        async fn recv(&mut self) -> BulkFrame {
-            self.recv_opt().await.expect("读 bulk 帧")
-        }
-
         /// 读一帧，但**允许没有帧**：失败的 Get（比如目标是目录）一个字节都不发，
         /// 服务端收工就关掉那条 duplex —— 这时候硬 expect 会把「正确的失败」
         /// 报成 `early eof`。真机上第一次跑 Linux 测试时就是这么多出一条假红。
