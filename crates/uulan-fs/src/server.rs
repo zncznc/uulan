@@ -203,7 +203,7 @@ async fn list(id: u32, roots: &FsRoots, spec: &str) -> H2C {
         Ok(Target::Drives) => {
             let entries = mounts::list()
                 .into_iter()
-                .map(|name| FsEntry { name, dir: true, size: 0, mtime: 0 })
+                .map(|name| FsEntry { name, dir: true, size: 0, mtime: 0, link: false })
                 .collect();
             return H2C::FsResult {
                 id,
@@ -241,6 +241,9 @@ async fn list(id: u32, roots: &FsRoots, spec: &str) -> H2C {
         entries.push(FsEntry {
             name: ent.file_name().to_string_lossy().into_owned(),
             dir: ft.is_dir(),
+            // `file_type()` 不跟随链接：指向目录的链接这里 dir=false，
+            // 靠这个标记让控制端知道「它不是文件、别去 Get，也别钻进去」。
+            link: ft.is_symlink(),
             size: md.as_ref().map(|m| m.len()).unwrap_or(0),
             mtime: md
                 .as_ref()
@@ -810,6 +813,44 @@ mod tests {
         assert!(a.mtime > 0, "mtime 不该是 0");
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["zd", "a.txt", "B.txt"], "同层按名字（不区分大小写）");
+    }
+
+    /// 符号链接必须在列表里被标出来。
+    ///
+    /// `read_dir` 的 `file_type()` 不跟随链接，所以「指向目录的链接」的 `dir` 是 false，
+    /// 看起来像个文件。目录树传输靠 `link` 这个标记跳过它 —— 跟随会让树变成图
+    /// （指回上级成环、指到 /etc 就把系统文件搬走），当成文件去取又只会拿到
+    /// 「不是目录」。造不出链接的环境（Windows 无权限）直接跳过，不硬断言。
+    #[tokio::test]
+    async fn list_flags_symbolic_links_without_following_them() {
+        let Some(tmp) = tmp_or_skip("symlink") else { return };
+        let roots = FsRoots::new(tmp.path(), true);
+        std::fs::create_dir(tmp.path().join("realdir")).unwrap();
+        std::fs::write(tmp.path().join("realdir/inner.txt"), b"inner").unwrap();
+        std::fs::write(tmp.path().join("plain.txt"), b"plain").unwrap();
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink("realdir", tmp.path().join("dirlink")).is_ok()
+            && std::os::unix::fs::symlink("plain.txt", tmp.path().join("filelink")).is_ok();
+        #[cfg(not(unix))]
+        let made = false;
+        if !made {
+            eprintln!("跳过：这台机器上建不出符号链接");
+            return;
+        }
+
+        let (mut srv, _peer) = wire();
+        let r = handle(&FsOp::List { id: 2, path: "~/".into() }, &roots, &mut srv, &mut |_| {}).await;
+        let entries = match &r {
+            H2C::FsResult { ok: true, entries: Some(e), .. } => e.clone(),
+            other => panic!("列目录失败：{other:?}"),
+        };
+        let dir_link = entries.iter().find(|e| e.name == "dirlink").expect("dirlink 应该在列表里");
+        assert!(dir_link.link, "指向目录的链接必须带 link 标记");
+        assert!(!dir_link.dir, "不跟随链接：它不该被当成目录");
+        let file_link = entries.iter().find(|e| e.name == "filelink").expect("filelink 应该在列表里");
+        assert!(file_link.link);
+        let real = entries.iter().find(|e| e.name == "realdir").unwrap();
+        assert!(!real.link && real.dir, "真目录不带 link 标记");
     }
 
     #[tokio::test]

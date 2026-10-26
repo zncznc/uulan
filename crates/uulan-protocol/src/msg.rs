@@ -381,6 +381,15 @@ pub struct FsEntry {
     pub size: u64,
     /// Unix 秒。
     pub mtime: i64,
+    /// 这一项本身是不是符号链接（不跟随）。
+    ///
+    /// 为什么要单独一个字段：`read_dir` 的 `file_type()` 不跟随链接，
+    /// 所以「指向目录的链接」在 `dir` 上是 `false`，看起来像个文件。
+    /// 目录树传输据此**跳过**它 —— 跟随会让一棵树变成图（指回上级就成环，
+    /// 指到 `/etc` 就把系统文件搬走），而当成文件去取又会得到「不是目录」这种
+    /// 让人摸不着头脑的失败。老对端不发这个字段 → 默认 false，行为同改动前。
+    #[serde(default)]
+    pub link: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -576,7 +585,13 @@ mod tests {
             id: 1,
             ok: true,
             error: None,
-            entries: Some(vec![FsEntry { name: "a".into(), dir: false, size: 1, mtime: 0 }]),
+            entries: Some(vec![FsEntry {
+                name: "a".into(),
+                dir: false,
+                size: 1,
+                mtime: 0,
+                link: false,
+            }]),
             path: Some("~/".into()),
             hash: None,
         });

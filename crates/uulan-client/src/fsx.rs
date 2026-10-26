@@ -212,7 +212,13 @@ async fn ls(ctl: &mut Ctl, path: String) -> Result<()> {
         println!("  （空）");
     }
     for e in &entries {
-        let kind = if e.dir { "d" } else { "-" };
+        let kind = if e.link {
+            "l"
+        } else if e.dir {
+            "d"
+        } else {
+            "-"
+        };
         let when = fmt_time(e.mtime);
         if e.dir {
             println!("  {kind}        -  {when}  {}/", e.name);

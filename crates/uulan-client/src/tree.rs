@@ -430,6 +430,7 @@ pub(crate) async fn get_tree(ctl: &mut Ctl, peer: &mut Conn, remote: String, loc
     let mut files = 0usize;
     let mut bytes = 0u64;
     let mut skipped = 0usize;
+    let mut links = 0usize;
 
     // 广度优先：先建完一层目录再搬文件，出错时本地留下的是一棵「形状完整、内容缺」的树，
     // 比一条深深的半截路径好排查。
@@ -447,6 +448,13 @@ pub(crate) async fn get_tree(ctl: &mut Ctl, peer: &mut Conn, remote: String, loc
                 skipped += 1;
                 continue;
             };
+            // 链接不跟随：跟随会把树变成图（指回上级就成环，指到 /etc 就搬系统文件），
+            // 而「当成文件去取」只会得到一句「不是目录」。与上传侧的取舍保持一致。
+            if e.link {
+                println!("  ! 跳过符号链接：{name}（{spec}）");
+                links += 1;
+                continue;
+            }
             let child_spec = join_remote(&spec, name)?;
             if e.dir {
                 let child_local = ldir.join(name);
@@ -468,7 +476,7 @@ pub(crate) async fn get_tree(ctl: &mut Ctl, peer: &mut Conn, remote: String, loc
         }
     }
     println!(
-        "目录树下载完成：目录 {dirs} / 文件 {files} / 共 {bytes} 字节 / 跳过可疑条目 {skipped} / 用时 {:.1}s",
+        "目录树下载完成：目录 {dirs} / 文件 {files} / 共 {bytes} 字节 / 跳过符号链接 {links} / 跳过可疑条目 {skipped} / 用时 {:.1}s",
         started.elapsed().as_secs_f64()
     );
     Ok(())
