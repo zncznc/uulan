@@ -60,6 +60,14 @@ struct Args {
     /// 只列设备目录（`--devices`）：连中继、拉清单、打印、退出。
     /// 不需要 `--device`，也不需要口令 —— 它回答的正是「我该连哪台」。
     devices: bool,
+    /// 用本机记住的上一次连接（`--last`）补上空着的 `--server` / `--device`。
+    /// **命令行优先**：显式给了哪个就不覆盖哪个。
+    last: bool,
+    /// 忘掉记住的上一次连接（`--forget`），不需要 `--device` 和口令。
+    forget: bool,
+    /// `--server` 是否真的出现在命令行里。
+    /// 默认值是非空字符串，光看 `server.is_empty()` 分不出「没给」和「给了默认值」。
+    server_explicit: bool,
     /// 只看被控端状态（`--status <秒>`）：读控制通道上的 Metrics / SystemState，
     /// 每秒打一行。存在的理由同 `--inject`：负载与锁屏也必须能机器验证。
     status: Option<f64>,
@@ -122,6 +130,12 @@ uulan-client —— uulan 内网远控的控制端
                              例：--inject \"move:960,540; click:left; type:hello\"
                              退出码 0 = 全部注入成功；3 = 被控端报告注入失败
 
+上次连接（本机记一个文件，**不存口令**）：
+  --last              用上次连成功的那台补上空着的 --server / --device
+                      例：uulan-client --last --password-file ~/.uulan-pw
+                      命令行显式给的 --server / --device 优先，不会被覆盖
+  --forget            忘掉记住的那台（删掉 ~/.config/uulan/client.json）
+
 端口映射（做完就退出，不开窗口、不收画面；可写多次）：
   --forward [绑定地址:]本地端口:目标主机:目标端口
                              例：--forward 2222:127.0.0.1:22
@@ -155,13 +169,19 @@ fn parse_args() -> Result<Args> {
         inject: None,
         status: None,
         devices: false,
+        last: false,
+        forget: false,
+        server_explicit: false,
         connect_retry: DEFAULT_CONNECT_RETRY,
         reconnect: DEFAULT_RECONNECT,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
         match x.as_str() {
-            "--server" => a.server = it.next().unwrap_or_default(),
+            "--server" => {
+                a.server = it.next().unwrap_or_default();
+                a.server_explicit = true;
+            }
             "--device" => a.device = it.next().unwrap_or_default(),
             "--password" => a.password = it.next().unwrap_or_default(),
             "--password-file" => {
@@ -187,6 +207,8 @@ fn parse_args() -> Result<Args> {
                 a.forward.push(uulan_client::ForwardSpec::parse(&spec)?);
             }
             "--devices" => a.devices = true,
+            "--last" => a.last = true,
+            "--forget" => a.forget = true,
             "--term" => a.term = true,
             "--term-size" => {
                 let v = it.next().context("--term-size 需要 COLSxROWS，例：140x40")?;
@@ -266,12 +288,50 @@ fn parse_args() -> Result<Args> {
     if a.server.is_empty() {
         bail!("--server 不能为空");
     }
+    // `--forget` 只删本机的一个小文件：不连中继、不需要设备 ID、也不需要口令。
+    if a.forget {
+        return Ok(a);
+    }
     // `--devices` 是「先看看有哪些机器」的那一步，用户这时候当然还不知道设备 ID。
     if a.devices {
         return Ok(a);
     }
+    // `--last`：用本机记住的上一次连接补空缺。命令行给的一律不动（见 `recent::apply`）。
+    if a.last {
+        match uulan_client::recent::load_at(&recent_path()) {
+            Some(r) => {
+                let now = uulan_client::recent::now_unix();
+                let took_device = a.device.trim().is_empty();
+                let (server, device) =
+                    uulan_client::recent::apply(&r, &a.server, a.server_explicit, &a.device);
+                // 说的话必须和真正用的参数一致：命令行已经明确指了另一台时，
+                // 绝不能印「按 --last 用上次连过的」—— 那会让人以为连的是记忆里那台。
+                // 走 stderr：`--term` 模式下 stdout 就是远端 PTY 的字节流，一个字都不能掺。
+                if took_device {
+                    eprintln!(
+                        "按 --last 用上次连过的设备：{}",
+                        uulan_client::recent::describe(&r, now)
+                    );
+                } else {
+                    eprintln!(
+                        "上次连过的是 {}；本次按命令行给的 --device 连。",
+                        uulan_client::recent::describe(&r, now)
+                    );
+                }
+                a.server = server;
+                a.device = device;
+            }
+            None => bail!(
+                "还没有记住任何设备（{} 不存在或读不出来）\n\
+                 先完整连一次成功（连上就会记住），或者用 --devices 看有哪些机器",
+                recent_path().display()
+            ),
+        }
+    }
     if a.device.is_empty() {
-        bail!("必须给出 --device（被控端界面上显示的 9 位设备 ID）");
+        bail!(
+            "必须给出 --device（被控端界面上显示的 9 位设备 ID），或者用 --last 连上次那台"
+        );
     }
     let env_pw = std::env::var("UULAN_PASSWORD").ok();
     a.password = resolve_password(&a.password, a.password_file.as_deref(), env_pw.as_deref())?;
@@ -406,7 +466,10 @@ async fn connect_with_retry(
 ///
 /// 纯函数，所以「空目录怎么说话 / 离线条目怎么标」能在本机用 `cargo test` 钉住 ——
 /// 这两句最容易在改动里悄悄变形（比如把离线写成「空闲 0s」，读起来像刚心跳过）。
-fn format_device_list(server: &str, devices: &[DeviceEntry]) -> String {
+///
+/// `last` 是本机记住的上次连过的设备 ID：命中的那一行后面标「← 上次」。
+/// 只标看得见的那一行，**不动 JSON** —— 脚本要的是中继原样给的目录，不是本机的私货。
+fn format_device_list(server: &str, devices: &[DeviceEntry], last: Option<&str>) -> String {
     if devices.is_empty() {
         return format!("中继 {server}：设备目录是空的（还没有被控端注册过）\n");
     }
@@ -422,8 +485,10 @@ fn format_device_list(server: &str, devices: &[DeviceEntry]) -> String {
             (true, None) => "在线".to_string(),
             (false, _) => "离线".to_string(),
         };
+        // 只标本机记住的那台。目录里没有它就什么也不标 —— 不猜、不编。
+        let mark = if last == Some(d.device_id.as_str()) { "  ← 上次" } else { "" };
         out.push_str(&format!(
-            "  {:id_w$}  {:name_w$}  {}\n",
+            "  {:id_w$}  {:name_w$}  {}{mark}\n",
             d.device_id,
             d.name,
             state,
@@ -432,6 +497,13 @@ fn format_device_list(server: &str, devices: &[DeviceEntry]) -> String {
         ));
     }
     out
+}
+
+/// 本机「上次连的是哪台」那个文件的位置（`$UULAN_CLIENT_CONFIG` 可覆盖）。
+///
+/// 单独包一层是为了让测试和文档只说一个名字：真机上就是 `~/.config/uulan/client.json`。
+fn recent_path() -> PathBuf {
+    uulan_client::recent::default_path()
 }
 
 fn default_client_name() -> String {
@@ -453,6 +525,21 @@ async fn main() -> Result<()> {
         .init();
 
     let args = parse_args()?;
+
+    // `--forget`：只删本机那个小文件。放在最前面 —— 它不该去连任何东西，
+    // 也不该要求口令（「忘掉那台」正是发生在「口令已经不想留」的时候）。
+    if args.forget {
+        let p = recent_path();
+        match uulan_client::recent::forget_at(&p) {
+            Ok(true) => println!("已忘掉上次连接的设备（{}）", p.display()),
+            Ok(false) => println!("本来就没记住任何设备（{}）", p.display()),
+            Err(e) => {
+                eprintln!("删不掉 {}：{e}", p.display());
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
 
     // 设备目录：只问中继「有哪些机器」，不建立会话，也不需要口令。
     // 放在最前面 —— 它的用途正是「我还不知道设备 ID」的那个时候。
@@ -478,7 +565,12 @@ async fn main() -> Result<()> {
         if args.json {
             println!("{}", serde_json::to_string_pretty(&list)?);
         } else {
-            print!("{}", format_device_list(&args.server, &list));
+            // 顺手标一下本机记住的那台：现场常见的下一句是「上次那台叫什么来着」。
+            let last = uulan_client::recent::load_at(&recent_path()).map(|r| r.device);
+            print!(
+                "{}",
+                format_device_list(&args.server, &list, last.as_deref())
+            );
         }
         return Ok(());
     }
@@ -542,6 +634,15 @@ async fn main() -> Result<()> {
         );
     }
     info!(session = %uulan_protocol::redact::tag(&c.session), os = %c.host.os, "鉴权通过");
+
+    // 记住「上次连的是哪台」：**只在鉴权成功之后写**。TCP 连上中继不算 ——
+    // 设备 ID 打错、口令打错时也会连上中继，把那种参数记下来，下次 `--last` 就是
+    // 记下一个错答案。写不进去只是「下次还得手抄 ID」，绝不能因此影响这条已建立的会话。
+    let rec = recent_path();
+    if let Err(e) = uulan_client::recent::remember_at(&rec, &args.server, &args.device, &c.host.name)
+    {
+        info!(path = %rec.display(), "记住上次连接失败：{e}");
+    }
 
     // 文件操作：不开窗口、不收画面，干完就退出。视频通道连上就丢掉（被控端看到 EOF
     // 会自己停编码器），这样下载大文件时不会和视频抢带宽。
@@ -1109,6 +1210,7 @@ mod tests {
                 entry("805747189", "麒麟-mis-pc", true, Some(3)),
                 entry("805747000", "旧机器", false, None),
             ],
+            None,
         );
         assert!(s.starts_with("中继 10.0.0.1:21116：2 台设备（在线 1）\n"), "{s}");
         assert!(s.contains("805747189") && s.contains("麒麟-mis-pc"));
@@ -1121,9 +1223,30 @@ mod tests {
 
     #[test]
     fn empty_device_list_reads_like_a_sentence_not_a_table_header() {
-        let s = format_device_list("10.0.0.1:21116", &[]);
+        let s = format_device_list("10.0.0.1:21116", &[], None);
         assert!(s.contains("设备目录是空的"), "{s}");
         assert!(!s.contains("在线 0"), "空目录不该印一个表头出来：{s}");
+    }
+
+    /// 「上次连的那台」只标在那一条上，且目录里没有它时**不编**一个出来。
+    #[test]
+    fn the_remembered_device_is_marked_on_its_own_line_only() {
+        let devs = [
+            entry("805747189", "麒麟-mis-pc", true, Some(1)),
+            entry("805747000", "旧机器", false, None),
+        ];
+        let s = format_device_list("10.0.0.1:21116", &devs, Some("805747189"));
+        let marked: Vec<&str> = s.lines().filter(|l| l.contains("← 上次")).collect();
+        assert_eq!(marked.len(), 1, "只能标一行：{s}");
+        assert!(marked[0].contains("805747189"), "{marked:?}");
+        // 别的行一个标记都不能有
+        let other = s.lines().find(|l| l.contains("805747000")).unwrap();
+        assert!(!other.contains("上次"), "{other}");
+
+        // 记住的那台已经不在目录里（换机器/台账清了）：不标、也不额外编一行
+        let s = format_device_list("10.0.0.1:21116", &devs, Some("999999999"));
+        assert!(!s.contains("上次"), "{s}");
+        assert_eq!(s.lines().count(), 3, "{s}");
     }
 
     #[test]

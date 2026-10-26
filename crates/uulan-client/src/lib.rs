@@ -7,6 +7,7 @@
 //! - [`fsx`]：文件操作（列/取/送/建/删），不开窗口、不收画面。
 //! - [`tree`]：整棵目录树的传输（`--put-tree` / `--get-tree`），只是串行的单文件操作。
 //! - [`forward`]：端口映射（`ssh -L` 那种），同样不开窗口、不收画面。
+//! - [`recent`]：本机记住「上次连的是哪台」（`--last`），省掉每次抄 9 位设备 ID。
 //!
 //! 窗口（winit + softbuffer）是 [`watch`] 之上的一层，不参与协议。
 
@@ -14,6 +15,7 @@ pub mod connect;
 pub mod control;
 pub mod forward;
 pub mod fsx;
+pub mod recent;
 pub mod tree;
 pub mod inject;
 pub mod session;
