@@ -1,0 +1,60 @@
+uulan · 真机锁屏门禁端到端 · 2026-10-27 下午手工验（非夜间批）
+
+背景：M3 的「往应用里打字/拖拽」一直挂着，原因是 :0 被 UKUI 锁屏挡着。
+本轮用户启用了开发机的 192.168.223.0/24 网卡并解锁了真机屏幕，于是可以做这项验证；
+结果先验到了「门禁」本身 —— 打字/拖拽仍差一个**持续解锁**的窗口。
+
+一、链路与环境（都是本轮实测）
+
+  开发机（Windows）新增网卡 192.168.223.6/24 → 真机 192.168.223.15 通（ping 0% 丢包、平均 0ms）
+  真机：mis-pc / Kylin V10 SP1，`systemctl --user is-active uulan-server uulan-host` → 两个都 active
+  控制端：/d/uulan-bin/uulan-client.exe（2026-10-27 05:44 构建，对应当前 HEAD）
+  注入脚本：move:330,318; click:left; type:hello; move:330,318; down:left; move:420,378; up:left
+  （330,318 = 真机自起的 xev 窗口中心；420,378 = 窗口内右下 90,60 处，用来判「拖拽」）
+
+二、观察到的（原文，未改写）
+
+  控制端 stdout：
+    已连上「麒麟真机」（linux 0.1.0，屏幕 1920x1080，编码器 4）
+    WARN uulan_client::control: 被控端已锁屏：暂停发送键鼠（解锁后自动恢复） has_desktop=true
+    被控端处于锁屏：键鼠按策略不发（XTest 会绕过锁屏抓取，往锁屏里打字有风险）
+    已发送 17 条输入帧（移动 0 / 按键 0 / 文本 0 / 点击 0 / 滚轮 0；未送出 0；被控端拒绝 0）
+    客户端退出码 0
+
+  被控端 journal（uulan-host[2411504]）：
+    桌面状态探针已启用（锁屏时停止键鼠注入）
+    被控端已锁屏：暂停键鼠注入（已按下的键已松开）
+    会话开局的桌面状态（已先于任何输入告知控制端） locked=true has_desktop=true
+    编码源已启动 cur=VideoSettings { fps: 30, quality: Auto, max_bitrate_kbps: 0, scale: 1.0 } screen_w=1920 screen_h=1080
+    键鼠事件统计 events=0 inject_errors=0 dropped_locked=0
+    已还原 X 的键盘映射与 autorepeat display=:0
+    会话结束 why=对端道别: 注入脚本执行完毕
+
+  独立判据（真机上自起的 xev，窗口 226492417，420x320 位于 120,158）：
+    整轮 KeyPress / ButtonPress / ButtonRelease / MotionNotify 均为 0 行（总 136 行都是开场自报的配置信息）
+
+  同轮的另一条实测：焦点窗口名 = ukui-screensaver-dialog（即屏幕当时确实锁着），
+  而十分钟前同一条命令拿到的是「设置」——说明解锁之后屏幕又自行锁上了。
+
+三、结论
+
+  1. **锁屏门禁两端一致，本轮的「新」在于控制端一侧**：2026-10-25 已经验过**被控端**会把锁屏时的
+     输入丢掉（旧客户端硬发，`dropped_locked=3`、`events=0`）；本轮验的是**当前构建的控制端**
+     自己就提前不发（日志「暂停发送键鼠（解锁后自动恢复）」+「已发送 17 条输入帧：移动 0/按键 0/
+     文本 0/点击 0」，17 条全是协议层握手/配置帧），加上被控端把 SystemState 作为控制通道第一帧
+     发出、以及真机 xev 这个**与 uulan 无关的独立判据**整轮 0 事件（连 MotionNotify 都没有）。
+  2. **打字/拖拽仍未验**：缺的是一个持续解锁的窗口，而不是一次解锁。
+     断言脚本已备好（见第四节），屏幕解锁状态下跑 2 秒即可出结果。
+
+四、下一步（用户侧）
+
+  解锁真机屏幕并**保持解锁**（或把 UKUI 的空闲锁定关掉 / 超时延长），然后重跑：
+
+    bash <hermes-scratch>/vfy_type_drag.sh
+
+  脚本流程：取设备 ID 与口令（口令只落文件不上屏）→ 真机起 xev → 算窗口中心 →
+  沿真实链路 --inject「点击 + type:hello + 按下左键拖动 90,60」→ 读回 xev 判据 → 收尾删文件。
+  判据：xev 里应出现 5 个 KeyPress（hello 的 h/e/l/l/o）与 ButtonPress(1)→MotionNotify→ButtonRelease(1)。
+
+  踩坑记录：给客户端的 `--password-file` 必须用 `C:/...` 原生路径 —— 客户端是原生 Windows 程序，
+  MSYS 的 `/c/...` 它报「系统找不到指定的文件 (os error 2)」。
