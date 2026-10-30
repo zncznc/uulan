@@ -387,9 +387,10 @@ fn check_host(r: &mut Report) {
         let mem = std::fs::read_to_string("/proc/meminfo").ok().and_then(|s| crate::probe::parse_meminfo(&s));
         let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
         match mem {
-            Some((total_kb, avail_kb)) => r.ok(
+            // parse_meminfo 给的是 (已用字节, 总字节) —— 两个都是字节，别再往下除一次。
+            Some((used, total)) => r.ok(
                 "本机",
-                format!("{cpus} 核；内存 可用 {} / 共 {}", mb(avail_kb), mb(total_kb)),
+                format!("{cpus} 核；内存 已用 {} / 共 {}", mb(used), mb(total)),
             ),
             None => r.warn("本机", format!("{cpus} 核；读不到 /proc/meminfo"), "内存信息只是参考，不影响能不能跑。"),
         }
@@ -402,8 +403,8 @@ fn check_host(r: &mut Report) {
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn mb(kb: u64) -> String {
-    format!("{} MB", kb / 1024)
+fn mb(bytes: u64) -> String {
+    format!("{} MB", bytes / (1024 * 1024))
 }
 
 /// 按「终端显示宽度」算长度：中日韩全角字符占两列。
@@ -514,10 +515,15 @@ mod tests {
     }
 
     #[test]
-    fn mb_rounds_down_to_whole_megabytes() {
+    fn memory_line_is_in_megabytes_not_kilobytes() {
         assert_eq!(mb(0), "0 MB");
-        assert_eq!(mb(1024 * 3800), "3800 MB");
-        assert_eq!(mb(1023), "0 MB");
+        assert_eq!(mb(1024 * 1024 * 3800), "3800 MB");
+        assert_eq!(mb(1024 * 1024 - 1), "0 MB");
+        // 真机样例（麒麟 3.8G 内存）：580 MB 已用 / 3796 MB 共
+        let sample = "MemTotal:       3887912 kB\nMemAvailable:   3279447 kB\n";
+        let (used, total) = crate::probe::parse_meminfo(sample).expect("解析得出来");
+        assert_eq!(mb(total), "3796 MB");
+        assert_eq!(mb(used), "594 MB");
     }
 
     #[test]

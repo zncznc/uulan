@@ -70,6 +70,13 @@ rc=$?
 sed 's/^/    /' "$WORK/ok.txt"
 if [ "$rc" = 0 ]; then check 0 "退出码 0"; else check 1 "退出码 $rc（应为 0）"; fi
 for item in "身份" "配置" "可写" "显示" "键鼠注入" "ffmpeg" "中继" "本机"; do
+  # 显示这一项在锁屏时是对 WARN（策略提醒，不是故障）：只要不是 FAIL 就算对。
+  if [ "$item" = "显示" ]; then
+    if grep -qE "^\[(OK|WARN)\] 显示" "$WORK/ok.txt"; then check 0 "显示 通过（锁屏时是 WARN）"; else
+      check 1 "显示 FAIL 了（$(grep -E "^\[FAIL\] 显示" "$WORK/ok.txt" | head -1)）"
+    fi
+    continue
+  fi
   if grep -q "^\[ OK \] $item" "$WORK/ok.txt"; then check 0 "$item 通过"; else
     check 1 "$item 没通过（$(grep -E "^\[(FAIL|WARN)\] $item" "$WORK/ok.txt" | head -1)）"
   fi
