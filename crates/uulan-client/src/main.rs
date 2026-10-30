@@ -959,6 +959,10 @@ async fn run_headless(
     let mut reconnects = 0u32;
     let mut totals = session::Totals::default();
     let mut report: Option<Report> = None;
+    // 重连次数用尽 = 这条会话再也不会回来。窗口模式**已经在**这条路径上 `exit(4)`；
+    // headless 一直到 2026-10-30 都还是「打一句不再重连、照常出统计、退出码 0」——
+    // 脚本/夜批分不清「跑完了」和「画面早冻住了」，所以这里也要按失败收尾。
+    let mut gave_up: Option<String> = None;
 
     loop {
         let mut finished = false;
@@ -1051,6 +1055,13 @@ async fn run_headless(
                     bail!("没能建立起会话（见上面的错误）");
                 }
                 eprintln!("不再重连");
+                gave_up = Some(match &err {
+                    Some(e) => format!("连续重连 {} 次都没接回（最后一次：{e}）", plan.max_reconnects),
+                    None => format!(
+                        "会话结束后连续重连 {} 次都没接回（被控端一直没上线或中继不可达）",
+                        plan.max_reconnects
+                    ),
+                });
                 break;
             }
         }
@@ -1142,6 +1153,11 @@ async fn run_headless(
         println!("  会话       : 建立 {} 条 / 断线接回 {} 次", sessions, reconnects);
     }
 
+    if let Some(why) = &gave_up {
+        // 非 0 退出：脚本/夜批才不会把「画面早就冻住了」当成跑完（与窗口模式同一个退出码）。
+        eprintln!("会话没能接回：{why}");
+        std::process::exit(4);
+    }
     Ok(())
 }
 
