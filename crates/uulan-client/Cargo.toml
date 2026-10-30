@@ -56,3 +56,9 @@ uulan-server = { path = "../uulan-server" }
 uulan-fs = { path = "../uulan-fs" }
 uulan-host = { path = "../uulan-host" }
 uulan-media = { path = "../uulan-media" }
+
+# 只有 Windows 需要：`tests/term_raw_console.rs` 要给客户端进程造一个真控制台（ConPTY），
+# 否则 `SetConsoleMode` 那条路（stdin 必须是控制台）在测试里根本触发不到。
+# 与 host 用的是同一个 crate 的同一版本，离线包不会多带东西（控制端不打进包也照编）。
+[target.'cfg(windows)'.dev-dependencies]
+portable-pty = "0.9"

@@ -22,7 +22,8 @@
 //! ## 本机终端要进 raw 模式
 //!
 //! 否则方向键、Ctrl-C、`vim` 全都动不了（行缓冲会把它们吃掉，等到回车才发）。
-//! unix 上用 `cfmakeraw`；**Windows 控制端暂未接**（要 `SetConsoleMode`，见 DESIGN 的已知限制）。
+//! unix 上用 `cfmakeraw`；Windows 上用 `SetConsoleMode` 关掉行/回显/输入处理并打开 VT 输入
+//! （见 `wincon` 模块）。两边都在 `Drop` 里还原 —— 崩了也不能留一个不回显的终端。
 
 use uulan_protocol::crypto::SecControl;
 use std::io::{Read, Write};
@@ -395,6 +396,8 @@ fn answers_dsr(tail: &mut Vec<u8>, chunk: &[u8]) -> bool {
 struct RawMode {
     #[cfg(unix)]
     saved: Option<libc::termios>,
+    #[cfg(windows)]
+    saved: Option<wincon::Saved>,
 }
 
 impl RawMode {
@@ -417,11 +420,29 @@ impl RawMode {
             debug!("stdin 不是 tty，跳过 raw 模式");
             RawMode { saved: None }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            // Windows 控制端暂未接 SetConsoleMode。键盘仍可用，但方向键/Ctrl-C
-            // 要等回车才发出（见 DESIGN 的已知限制）。
-            debug!("Windows 控制端暂未进入原始模式");
+            // Windows 没有 termios：关行缓冲/回显/输入处理，打开 VT 输入。
+            // 读线程一个字都不用改 —— 控制台替我们把方向键翻成 VT 序列。
+            match wincon::enter_raw() {
+                Some(saved) => {
+                    info!(
+                        saved_mode = %format!("0x{:04x}", saved.mode),
+                        saved_cp = saved.cp,
+                        "已进入控制台原始模式：方向键 / Ctrl-C 立即发出，无需回车"
+                    );
+                    RawMode { saved: Some(saved) }
+                }
+                None => {
+                    // 管道/重定向（没有控制台），或老 Windows（VT 输入要 Win10 1809+）。
+                    // 保持行模式：宁可「要回车」，也不要把 0x00/0xE0 扫描码当字符发给远端。
+                    debug!("Windows 控制台未进原始模式（不是控制台，或不支持 VT 输入）");
+                    RawMode { saved: None }
+                }
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
             RawMode {}
         }
     }
@@ -434,6 +455,115 @@ impl Drop for RawMode {
             // SAFETY: `saved` 是 enter() 从 fd 0 读出来的原值。
             unsafe {
                 libc::tcsetattr(0, libc::TCSANOW, &t);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        if let Some(s) = &self.saved {
+            s.restore();
+            debug!("控制台模式已还原");
+        }
+    }
+}
+
+#[cfg(windows)]
+mod wincon {
+    //! Windows 控制台的原始输入模式。
+    //!
+    //! 只用手写的 kernel32 声明，**不引 `windows-sys`**：理由与 `windows_console_size`
+    //! 相同 —— 离线打包的机器上多一个 crate 就是多一份可能缺失的东西。
+    //!
+    //! 四个 flag 各自对应一个具体的坑：
+    //!
+    //! * 不清 `ENABLE_LINE_INPUT` → 每个键都等到回车才进读线程（就是原来那条「行模式」限制）；
+    //! * 不清 `ENABLE_ECHO_INPUT` → 本机回显一遍、远端再回显一遍，字打双份；
+    //! * 不清 `ENABLE_PROCESSED_INPUT` → Ctrl-C 变成发给**本机客户端**的信号，
+    //!   远端 shell 永远收不到（远端 `ping` 停不下来就是它）；
+    //! * 不打开 `ENABLE_VIRTUAL_TERMINAL_INPUT` → 方向键读到的是 `0x00/0xE0 + 扫描码`
+    //!   这种私有编码，直接发给远端 bash 就是乱码。打开之后是标准的 `ESC[A` 序列，
+    //!   读线程原样转发即可。
+    //!
+    //! `ENABLE_EXTENDED_FLAGS` 必须一起打开，否则清 `ENABLE_QUICK_EDIT_MODE` 不生效
+    //! （快速编辑模式会把鼠标选择变成阻塞输入，程序看起来像卡住）。
+
+    use std::ffi::c_void;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(which: u32) -> *mut c_void;
+        fn GetConsoleMode(h: *mut c_void, mode: *mut u32) -> i32;
+        fn SetConsoleMode(h: *mut c_void, mode: u32) -> i32;
+        fn GetConsoleCP() -> u32;
+        fn SetConsoleCP(cp: u32) -> i32;
+    }
+
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    pub const ENABLE_PROCESSED_INPUT: u32 = 0x0001;
+    pub const ENABLE_LINE_INPUT: u32 = 0x0002;
+    pub const ENABLE_ECHO_INPUT: u32 = 0x0004;
+    pub const ENABLE_QUICK_EDIT_MODE: u32 = 0x0040;
+    pub const ENABLE_EXTENDED_FLAGS: u32 = 0x0080;
+    pub const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+    const CP_UTF8: u32 = 65001;
+
+    /// 进原始模式前的控制台状态，`restore()` 原样写回。
+    pub struct Saved {
+        pub mode: u32,
+        pub cp: u32,
+    }
+
+    /// 目标 flag：清掉行/回显/输入处理/快速编辑，打开扩展 flag 与 VT 输入。
+    /// 抽成纯函数，单测才能在没有任何控制台的环境里钉住这几个 bit。
+    pub fn raw_mode_flags(base: u32) -> u32 {
+        let clear = ENABLE_PROCESSED_INPUT
+            | ENABLE_LINE_INPUT
+            | ENABLE_ECHO_INPUT
+            | ENABLE_QUICK_EDIT_MODE;
+        (base & !clear) | ENABLE_EXTENDED_FLAGS | ENABLE_VIRTUAL_TERMINAL_INPUT
+    }
+
+    /// 进原始模式。返回 `None` = **没改任何东西**（stdin 不是控制台，或这个 Windows
+    /// 不支持 VT 输入），调用方保持行模式即可。
+    pub fn enter_raw() -> Option<Saved> {
+        // SAFETY: 只碰 STD_INPUT_HANDLE 的控制台模式与输入码页；任一步失败就退化成行模式，
+        // 不会留下「改了一半」的状态（SetConsoleMode 要么整条生效要么不生效）。
+        unsafe {
+            let h = GetStdHandle(STD_INPUT_HANDLE);
+            if h.is_null() {
+                return None;
+            }
+            let mut mode: u32 = 0;
+            if GetConsoleMode(h, &mut mode) == 0 {
+                return None; // stdin 是管道 / 文件：没有控制台可设
+            }
+            if SetConsoleMode(h, raw_mode_flags(mode)) == 0 {
+                return None; // 老 Windows：VT 输入不支持，保持行模式
+            }
+            // 输入码页跟着切成 UTF-8：VT 输入模式下非 ASCII 字符按码页编码成字节，
+            // 默认 936（GBK）会把「中文」发成一串远端看不懂的双字节。
+            let cp = GetConsoleCP();
+            if cp != CP_UTF8 {
+                SetConsoleCP(CP_UTF8);
+            }
+            Some(Saved { mode, cp })
+        }
+    }
+
+    impl Saved {
+        pub fn restore(&self) {
+            // SAFETY: 写回的是 enter_raw() 读出来的原值。
+            unsafe {
+                let h = GetStdHandle(STD_INPUT_HANDLE);
+                if !h.is_null() {
+                    SetConsoleMode(h, self.mode);
+                }
+                if self.cp != CP_UTF8 {
+                    SetConsoleCP(self.cp);
+                }
             }
         }
     }
@@ -599,6 +729,23 @@ mod tests {
         assert_eq!(w.observe(Some((0, 24))), None);
         assert_eq!(w.observe(Some((80, 0))), None);
         assert_eq!(w.observe(Some((80, 24))), None, "0 不能污染基线");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn raw_mode_flags_drop_line_echo_and_processed_input() {
+        use wincon::*;
+        // 典型控制台输入模式：行输入 + 回显 + 输入处理 + 快速编辑都开着。
+        let base = ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_QUICK_EDIT_MODE;
+        let m = raw_mode_flags(base);
+        assert_eq!(m & ENABLE_LINE_INPUT, 0, "行输入必须关掉，否则要等回车");
+        assert_eq!(m & ENABLE_ECHO_INPUT, 0, "回显必须关掉，否则本机远端各回显一份");
+        assert_eq!(m & ENABLE_PROCESSED_INPUT, 0, "输入处理必须关掉，否则 Ctrl-C 打不到远端");
+        assert_eq!(m & ENABLE_QUICK_EDIT_MODE, 0, "快速编辑会吞输入");
+        assert_ne!(m & ENABLE_EXTENDED_FLAGS, 0, "清快速编辑必须带扩展 flag");
+        assert_ne!(m & ENABLE_VIRTUAL_TERMINAL_INPUT, 0, "方向键要靠 VT 输入翻成 ESC[A");
+        // 不相关的位不能被顺手清掉：窗口尺寸事件等由控制台自己维持。
+        assert_eq!(raw_mode_flags(0) & ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT);
     }
 
     #[test]

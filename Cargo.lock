@@ -1840,6 +1840,7 @@ dependencies = [
  "base64",
  "bytes",
  "libc",
+ "portable-pty",
  "serde",
  "serde_json",
  "sha2",
