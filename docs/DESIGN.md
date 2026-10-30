@@ -320,7 +320,7 @@ uulan/
 |---|---|---|---|
 | **M1 骨架** | ✅ | workspace 能编译；protocol 单测过；server 能注册设备并配对转发 | `cargo test` 全绿；本机起 server，两端能配对三条通道并盲转发 |
 | **M2 能看见** | ✅ | 被控端采集编码、控制端解码；端到端视频通路 | 进程内端到端测试全绿；**并在真麒麟 V10 SP1 上跑通**：Windows 控制端看到 1920x1080 真实桌面，首帧 216ms、零丢帧、画面与实机截图相关系数 0.9995。**2026-10-24 补：麒麟控制端也过了同一套验收** —— `uulan-client` 在真机上编得出来（见 M5 小节），headless 29.7 fps / 首帧 256ms / 丢帧 0 / 相关系数 0.9998、MAE 0.50%，开窗 15 s `painted=870` |
-| **M2.5 画好** | ✅ | 窗口 ✅；**键鼠注入 ✅（两端已接，本机全链路 + 真机 XTest 实测）**；**实测帧率上报 ✅**；**剪贴板文本双向 ✅（本机全链路 + 真 Win32；X11 后端已在真机与外部 X 客户端双向验过）**；**分辨率变化重建解码器 ✅（两端都做了，本机全链路实测）** | 能远程操作并双向粘文字、被控端换分辨率后画面自动跟上。真机实测见 `docs/milestones/M3-M4-真机-2026-10-23.txt`（XTest 注入：指针落点精确、keysym 正确、滚轮=按钮5、autorepeat 已还原；X11 剪贴板：与独立 X 客户端双向互通） |
+| **M2.5 画好** | ✅ | 窗口 ✅；**键鼠注入 ✅（两端已接，本机全链路 + 真机 XTest 实测）**；**实测帧率上报 ✅**；**剪贴板文本双向 ✅（本机全链路 + 真 Win32；X11 后端已在真机与外部 X 客户端双向验过）**；**分辨率变化重建解码器 ✅（两端都做了，本机全链路实测）** | 能远程操作并双向粘文字、被控端换分辨率后画面自动跟上。真机实测见 `docs/milestones/M3-M4-真机-2026-10-23.txt`（XTest 注入：指针落点精确、keysym 正确、滚轮=按钮5、autorepeat 已还原；X11 剪贴板：与独立 X 客户端双向互通）；**画面参数热更新 ✅（2026-10-30，真机验）**：控制端 `--quality/--bitrate/--fps/--scale` → `C2H::VideoSet` → 被控端当场重启编码器（这条路的被控端一半早就写好了，控制端从来没发过）。 真机：`--quality fast` 码率 9743→**1002 kbps**、`--fps 15` 实测 **15.00 fps**、 `--scale 0.5` 出 **960x540** 帧（与整屏截图盒式降采样相关 **0.9951** / MAE 0.83%）、 带参数跑完再来默认会话回到 1920x1080/30fps（参数不粘滞）。 同一改动修掉「缩放编码必花屏」：`VideoCfg` 新增 `enc_w/enc_h`（编码画幅）与屏幕尺寸分开， 解码器按编码画幅起、输入换算仍按屏幕尺寸 |
 | **M3 能操作** | ✅ | XTest 注入 + 按键连发处理；`--inject` 脚本化注入（可无人值守验）；uinput 兜底仍未做 | **真机已验**（2026-10-23）：`--inject` 走真链路 → 被控端 XTest → 真 X 服务器；用 `xev`/`xdotool` 当独立判据，坐标/键位/按钮号/配对全对（当次验在另起的 `Xvfb :99` 上）。**同一轮夜间批补验**：`--inject move:640,400` 直接打到真 `:0`，`xdotool getmouselocation` 读到 `x:640 y:400`（注入前 1901,0，已还原）。限制：`:0` 被 UKUI 锁屏挡着 —— **锁屏门禁已真机端到端验过（2026-10-27：被控端首帧报 `locked=true has_desktop=true`、控制端不发键鼠、被控端 `events=0 dropped_locked=0`、真机 xev 独立判据 0 事件）**；**往应用里打字/拖拽已验（2026-10-30，真机 :99）**：Xvfb :99 + xev 独立判据 + 真 Windows 控制端沿真实链路 `--inject type:hello / down+drag / type:中文` → xev 收到 5 个 KeyPress（keysym h e l l o）、ButtonPress×2 / ButtonRelease×2、按住左键的 MotionNotify（state 0x100，(310,250)→(400,310)）、以及动态 Unicode keycode 上的 `U4E2D/U6587`（XLookupString 给出 UTF-8 `e4b8ad/e69687`）；被控端 `events=17 inject_errors=0 dropped_locked=0`、收尾还原键盘映射与 autorepeat。脚本 `scripts/verify-input-app-e2e.sh`（11 断言全过，锁不锁屏都能跑）。**物理 :0 上的键盘/拖拽仍未验**（:0 全程锁着，按策略不注入；同一个二进制、同一条 XTest 路径已在 :99 验过，差的是 UKUI/kwin 那层窗管行为） |
 | **M4 工具齐全** | ✅ | **文件传输 ✅**（列/取/送/建/删/改名/哈希 + 路径沙箱 + sha256，真二进制实测 6 MiB 往返一致）；**端口映射 ✅**（bulk 多路复用 + `--forward`，真二进制实测 256 KiB 单流 + 两条并发流逐字节一致）；**终端（PTY）✅ 本机全链路 + 真机 Linux 侧**（真 `/dev/pts`、termios 默认、winsize 下发、退出码 7 原样回来、SIGHUP→SIGKILL 升级日志）；**终端尺寸跟随 ✅（2026-10-25，真机验：本地窗口变了远端 PTY 跟着变）**；**目录树传输 ✅（2026-10-26：`--put-tree` / `--get-tree`，真机双向 6/6 逐文件 sha256 一致）** | 三项都用真 server + 真被控端 + 真客户端链路验过。终端已上真麒麟验 Linux 独有部分；尺寸跟随真机实测：本地 pty `100x30`→`132x43` 后远端 `stty size` 由 `30 100` 变 `43 132`，`--term-size` 钉死时不跟随（见 `docs/milestones/终端尺寸跟随-2026-10-25.txt`）。剪贴板整链（Windows↔麒麟）本轮**未验**（cron 上下文没有交互式剪贴板）。**目录树传输的真机数字**（2026-10-26）：Windows→麒麟 `--put-tree` 6 目录 / 6 文件 / 4194327 字节（含 4 MiB 文件）、0.1s，真机 `find + sha256sum` 6/6 一致；`--get-tree` 拉回 6/6 一致；重复上传幂等；真链接两侧都跳过（`evil.txt -> /etc/passwd`、`sub/up -> ..` 没有被带过去，也没有无限递归），见 `docs/milestones/目录树传输-2026-10-26.txt` |
 | **M5 麒麟落地** | 🔄 | 离线安装包（tar.gz + install.sh + 3 个 systemd 单元）✅、systemd 开机自启 ✅（用户态装实测）、**就地重装（升级）✅**、**安装预检前移 ✅（缺输入不再留半装前缀）**、**控制端可编可装 ✅（`--with-client` 打包 + install.sh 装进前缀，2026-10-24）**、部署文档 ✅（`deploy/README.md` + `docs/DEPLOY-KYLIN.md` 第 13/14/15 节）、**设备目录 ✅（`uulan-client --devices`：中继在线表 ∪ 台账，`--no-list` 可关；2026-10-27 真机验）**、**记住上次连接 ✅（`--last` / `--forget`，`--devices` 给命中的那行标「← 上次」；2026-10-27 真机验）** | 真机上 `bash install.sh --userland` 一次装通：中继+被控端都是 `enabled`+`active`、`Linger=yes`、`ExecStartPre` 的 uulan-wait-x 真的等到 `:0`；`systemctl --user kill -s KILL` 后 `NRestarts=1` 自动拉起并重新上线；包内二进制取帧 29.6fps、相关系数 0.9969。见 `docs/milestones/M5-麒麟落地-2026-10-23.txt`。**就地升级已验**（2026-10-24）：在服务正在跑的真机上从离线包装重装 → 设备 ID 与 host.json 一字未变、二进制被替换、KILL 后 systemd 拉起的是前缀里的新二进制、再连 29.2fps/丢帧 0；见 `docs/milestones/M5-就地升级与安装预检-2026-10-24.txt`。**控制端在麒麟上编+装已验**（2026-10-24，见 `docs/milestones/麒麟控制端-2026-10-24.txt`）：`--with-client` 的包 3.8M、重装后前缀里多出 `uulan-client`（sha 与包内/`target` 三者一致）。**未验**：整机重启后的自启、系统装（root，/opt/uulan）路径（本机 sudo 要口令）。2026-10-25 复核：`systemctl reboot` 对远程会话被 polkit 要求认证（`pkcheck --action-id org.freedesktop.login1.reboot` → *Authorization requires authentication*），mis 又没有免密 sudo，所以**无人值守时重启不了真机**——这条只能等人到机器跟前再验，别写成已验。**设备目录已验（2026-10-27）**：`--devices` 列出真机「805747189 麒麟真机 在线」，`kill -s KILL` 后 1 秒内变「在线 0 / 离线」、6 秒后回到「在线 1 / 空闲 1s」且设备 ID 不变；`--no-list` 用麒麟自己的客户端验过拒绝路径（rc=1 + 说清原因）；画面基线 29.5 fps / 丢帧 0 / 相关系数 0.9989 无回归。见 `docs/milestones/设备目录-2026-10-27.txt`。**记住上次连接已验（2026-10-27）**：Windows 控制端只写 `--last`（无 `--server`、无 `--device`）直接出画面 358 AU / 355 解出 / 丢帧 0 / 首帧 262 ms / 29.6 fps，存的帧与真机截图相关系数 0.9996 / MAE 0.50%；真机自编的控制端上 `client.json` 是 `-rw-------`（涨到 0600）、`--last` 首帧 261 ms / 29.0 fps、`--forget` 后 `--last` 退出码 1；错口令 / 错设备 ID 不但不覆盖旧记录、也不会凭空建文件，口令串在配置与日志里命中 0。见 `docs/milestones/最近连接-2026-10-27.txt` |
@@ -749,6 +749,57 @@ cargo check -p uulan-host --target x86_64-unknown-linux-gnu     0 警告
 - x11grab 在分辨率变小/变大时的真实表现（报错退出？补黑边？只抓左上角？）—— 三种都要试
 - 换分辨率那一瞬间，控制端窗口（winit + softbuffer）改尺寸/重绘是否正常，有没有黑屏一拍
 - 输入映射器换尺寸后，真实点击落点是否与画面一致（多屏 / 缩放场景尤其要看）
+
+### M2.5 完成：画面参数热更新（画质档位 / 帧率 / 编码缩放，2026-10-30）
+
+控制端新增四个参数，全部走一条 `C2H::VideoSet`：`--quality auto|fast|high|hd|bluray`、
+`--bitrate <kbps>`、`--fps <1..144>`、`--scale <0.1..1.0>`。被控端收到后按新参数重启编码器，
+回一条新的 `VideoCfg` 让控制端重建解码器 —— **不断线、不改被控端配置、不落盘**。
+
+#### 为什么「缩放」不是加个 ffmpeg 参数那么简单
+
+原来 `VideoCfg` 只有一个 `w/h`，控制端拿它当两个互相矛盾的量：
+
+* **屏幕尺寸**：`MouseMoveAbs` 是归一化坐标，乘它才能得到像素落点；
+* **编码画幅**：解码器（ffmpeg rawvideo）按它在启动时定死每帧字节数。
+
+`scale != 1` 时两者不相等。只报一个数的结果是：画面是斜条纹（按全尺寸读 1/2 画幅的字节流），
+或者点哪儿都偏（把编码画幅当屏幕尺寸去乘）。所以：
+
+- **协议**：`HostVideoCfg` 加 `enc_w/enc_h`（`serde(default)`，0 = 与 `w/h` 相同，老被控端照旧）。
+  控制端解码器按 `encoded_size()` 起、按它判「要不要重建」；**输入换算仍用 `w/h`**。
+- **唯一换算处**：`uulan_media::ffmpeg::scaled_size(w, h, scale)` —— 向下取整再清最低位（偶数），
+  因为 h264 的 yuv420 要求宽高都能被 2 整除。ffmpeg 的滤镜直接用这对具体像素数
+  （`scale=960:540`），不再写 `scale=iw*0.5:ih*0.5`：后者由 ffmpeg 自己取整，和报给控制端的数
+  可能差 1 像素 —— 那 1 像素就是「一屏斜条纹、永远不自愈」。
+- **`Quality::Keep`**：只改帧率/缩放时用，语义是「画质这一项我不表态」。写成 `Auto` 的话，
+  用户只想把帧率降到 15，结果把对面配好的高清档悄悄改成自动。
+
+#### 实测
+
+本机 `cargo test --workspace` **431 passed / 0 failed / 0 ignored**（基线 423），零警告。
+新增 `crates/uulan-client/tests/video_set.rs`（真 server + 真被控端 + 真 lavfi + 真 x264 + 真解码）：
+下发 `fps=6, scale=0.25` 后解出 **80x60** 帧（重建 1 次）、屏幕尺寸仍是 320x240、
+`0.5,0.5` 仍换算成 **160,120**（不是 40,30）。
+
+真麒麟（HEAD `3738f0d`，物理 `:0`，锁屏状态，Windows 控制端 headless，12 s）：
+
+```
+默认                ：354 帧 / 丢帧 0 / 首帧 229 ms / 29.5 fps / 9743 kbps / 重建 0
+--quality fast      ：351 帧 / 丢帧 0 / 首帧 290 ms / 29.2 fps / 1002 kbps / 重建 0
+--fps 15            ：174 帧 / 丢帧 0 / 首帧 421 ms / 14.5 fps（被控端自报 15.00）/ 重建 0
+--scale 0.5         ：352 帧 / 丢帧 0 / 首帧 247 ms / 29.3 fps / 2492 kbps / 960x540 / 重建 1
+--scale .5 + fast   ：292 帧 / 丢帧 0 / 29.2 fps / 1007 kbps / 960x540 / 重建 1
+窗口（--scale 0.5） ：painted=408 / 解出 232 / 丢帧 0 / 首帧 258 ms
+逐像素：默认 vs 整屏截图 0.9980 / MAE 0.71%（无回归）；
+        960x540 vs 整屏盒式降采样 0.995139 / MAE 0.8305%（确实是那台机器的桌面缩略图）
+```
+
+带参数跑完再跑默认会话 → 1920x1080 / 30 fps / 9748 kbps / 重建 0 次：**参数不粘滞**，
+`host.json` 的 sha256 与设备 ID 一个字节没变。详见 `docs/milestones/画质档位与缩放-2026-10-30.txt`。
+
+**没做的**：`VideoSet` 里的 `chroma`/`encoder` 被控端本来就没接（只用 CPU x264）；
+窗口模式下没有运行时热键（要有人按键盘才验得了）；`--scale` 只缩编码、不在控制端放大显示。
 
 ### M4 进行中：文件传输（已完成 · 本机已实测）
 

@@ -1,0 +1,105 @@
+uulan · 画面参数热更新（画质档位 / 帧率 / 编码缩放）· 2026-10-30
+================================================================
+
+代码：HEAD `3738f0d`（本轮一个提交）
+真机：192.168.223.15 mis@mis-pc（银河麒麟 V10 SP1，海光 C86，X11 1920x1080，锁屏状态）
+控制端：本机 Windows release 构建（`uulan-client.exe`），跑在 `D:\uulan-bin`（工作区外）
+
+一、这轮做了什么（以及为什么必须连带着修一个真 bug）
+
+被控端的 `C2H::VideoSet` 处理 2026-10-23 就写好了（改档位/帧率/缩放 → 当场重启编码器），
+但**控制端从来没发过它一条** —— 典型「协议先行、一端未接」。补齐之后，弱网现场可以自己
+压带宽，不用改被控端配置、也不用断线重连。
+
+同一改动里必须一起修的：**缩放编码会让控制端花屏**。原来的 `VideoCfg` 只有一个 `w/h`，
+控制端拿它既当「屏幕尺寸」（归一化坐标乘回像素）又当「编码画幅」（解码器 rawvideo 每帧
+字节数）。`scale != 1` 时两者不等 —— 按全尺寸去读缩过的字节流就是一屏斜条纹、点击落点也整体偏。
+
+  · 协议 `HostVideoCfg` 新增 `enc_w/enc_h`（`serde(default)` = 0，0 表示「与 w/h 相同」，
+    老被控端照旧）；`Quality::Keep` 表示「画质这一项我不表态」。
+  · 被控端 `VideoCfg` 同时报屏幕尺寸与编码画幅；缩放尺寸统一由
+    `uulan_media::ffmpeg::scaled_size()` 算（向下取整 + 偶数对齐，h264 yuv420 要求偶数），
+    ffmpeg 的 `scale` 滤镜直接用这对具体像素数 —— 以前写 `scale=iw*0.5:ih*0.5`，
+    ffmpeg 会自己取整，与报给控制端的数可能差 1 像素，那正是「斜条纹」的来源。
+  · 控制端解码器按 `enc_w/enc_h` 起、按编码画幅判「要不要重建」；输入换算仍用屏幕尺寸。
+
+二、本机（可重复）
+
+```
+cargo test --workspace        431 passed / 0 failed / 0 ignored        （本轮基线 423）
+cargo build --release         0 警告
+cargo check --workspace --all-targets   0 警告
+```
+
+新增 `crates/uulan-client/tests/video_set.rs`（真 server + 真被控端会话 + 真 lavfi 采集 +
+真 x264 + 真协议 + 真 ffmpeg 解码；替身只有注入 sink）：
+
+```
+下发 VideoSet{fps:6, scale:0.25, quality:Keep}
+帧：320x240 3 帧 / 80x60 3 帧；重建 1 次；解出 53 / 喂入 113 AU / 丢帧 0；请求帧率 6
+断言：解码画幅 80x60（帧字节数 = frame_bytes(80,60)）；屏幕尺寸仍是 320x240；
+      VideoCfg.fps = 6；0.5,0.5 → MoveAbs{160,120}（不是 40,30）
+```
+
+协议/媒体层新增单测：`encoded_size_falls_back_to_screen_for_old_hosts`、
+`a_scale_change_rebuilds_the_decoder_but_keeps_screen_size`、
+`scaled_size_always_returns_even_dimensions`、`fps_or_scale_alone_keeps_the_hosts_quality`、
+`explicit_bitrate_wins_over_named_quality`、`quality_names_are_the_ones_in_help`。
+
+三、真麒麟实测（同一 HEAD，服务端+被控端同批换，用户态装）
+
+部署：从 HEAD 打包 → 换源码（保留 target/）→ 真机 `cargo build --release -p uulan-server -p uulan-host`
+33.2 s → `install.sh --userland --no-start` → `systemctl --user kill -s KILL` 两个单元 →
+`MainPID=3977366`、`NRestarts=26`（只涨了这次）、两个都 `active`；
+`host.json` 的 sha256 前 16 位 `80eb46bba190d9ce` 与部署前相同、设备 ID 仍是 `805747189`
+（身份没被升级动到）；前缀里的 host 与 `target/release` 的 sha256 一致（`9829a83d8c2c3b83`）。
+
+画面（物理 `:0`，锁屏状态，Windows 控制端 headless）：
+
+| 参数 | 解出帧 | 丢帧 | 首帧 | 解出帧率 | 被控端自报 | 平均码率 | 编码画幅 | 重建 |
+|---|---|---|---|---|---|---|---|---|
+| （默认，改前 HEAD `2e9b9e7`） | 354 | 0 | 225 ms | 29.3 fps | 29.80 fps | 9699 kbps | 1920x1080 | 0 |
+| （默认，改后 `3738f0d`） | 354 | 0 | 229 ms | 29.5 fps | 30.00 fps | 9743 kbps | 1920x1080 | 0 |
+| `--quality fast` | 351 | 0 | 290 ms | 29.2 fps | 30.00 fps | **1002 kbps** | 1920x1080 | 0 |
+| `--fps 15` | 174 | 0 | 421 ms | 14.5 fps | **15.00 fps** | 9966 kbps | 1920x1080 | 0 |
+| `--scale 0.5` | 352 | 0 | 247 ms | 29.3 fps | 30.00 fps | **2492 kbps** | **960x540** | 1 |
+| `--scale 0.5 --quality fast` | 292 | 0 | — | 29.2 fps | — | **1007 kbps** | 960x540 | 1 |
+
+逐像素比对（`--save-frame` 的 PPM vs 真机 `ffmpeg -f x11grab` 截图）：
+
+```
+默认 vs 整屏截图        ：相关 0.9980 / MAE 0.71%   （与 10-22 基线同一水平，无回归）
+--scale 0.5 vs 整屏盒式降采样 960x540：相关 0.995139 / MAE 0.8305%
+      —— 半尺寸帧确实是这台机器的桌面缩略图，不是斜条纹
+```
+
+窗口模式（`--seconds 8 --scale 0.5`，`NO_COLOR=1`）：
+
+```
+已下发画面参数 quality=Keep fps=0 scale=0.5 bitrate_kbps=0
+窗口已就绪
+被控端分辨率/编码画幅变了，解码器已重建 screen_w=1920 screen_h=1080 enc_w=960 enc_h=540 from_w=1920 from_h=1080
+窗口已关闭 painted=408 input_sent=0
+收到 AU 235 / 关键帧 16 / 解出帧 232 / 丢帧 0 / 首帧 258ms / 重建解码器 1 次
+```
+
+**参数不落盘、不粘滞**：带参数跑完之后再来一条默认会话 → 1920x1080 / 30 fps / 9748 kbps /
+重建 0 次，被控端配置一个字都没改。
+
+四、边界（明确没验的）
+
+- `--scale` 只做「编码缩小」，窗口里看到的就是缩小后的画面（文字会变小、变糊）。
+  「缩小编码 + 本地放大显示」没做，也不打算做（远控首要目标是看清文字）。
+- 物理 `:0` 锁屏下的**输入落点**没有跟着这一项验（锁屏门禁按策略不发键鼠）；
+  「缩放编码时归一化坐标仍按屏幕尺寸换算」由本机全链路测试 `video_set.rs` 钉住
+  （0.5,0.5 → 160,120），真机上换来的是同一个 `input.set_screen` 路径。
+- `--quality/--fps/--scale` 只在**会话开始**下发；窗口模式下没有运行时热键（要有人按键盘才验得了，
+  无人值守做不到）。被控端侧的热更新路径本身是通的 —— 本机 e2e 就是「会话中途下发」。
+- 编码器 `chroma/encoder` 两个字段协议里有，被控端 `VideoSet` 处理里**没接**（本来也没接），
+  所以 `--quality` 不会改色度/编码器，只用 CPU x264。
+- `Quality::Keep` 的语义只在单测里钉住：真机 `host.json` 的 `quality` 本来就是 `Auto`，
+  所以「只改帧率/缩放时不会把**非 Auto** 的档位改掉」这条，真机上没有可对照的场景
+  （要改真机配置才能验，本轮没动它的配置）。journal 里 `--scale 0.5`（不带 `--quality`）那次
+  记的是 `quality=Auto`（会话开始时按配置起），说明 Keep 没有把档位改成别的东西。
+- 首帧从 229 ms 涨到 290–421 ms（下发参数 → 被控端重启一次编码器）。这是这条路的既有代价，
+  不是回归：编码器重启本身在「分辨率变化」那条路径上早就有。
