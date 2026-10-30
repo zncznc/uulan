@@ -87,6 +87,40 @@ extern "C" {
     fn XTestFakeRelativeMotionEvent(dpy: *mut Display, x: c_int, y: c_int, delay: c_ulong) -> c_int;
 }
 
+/// 只查 XTest 扩展在不在：开一次显示、问一句、关掉。
+///
+/// 自检（`--diagnose`）用。**不要**拿 [`X11Sink::open`] 来探测：它会关掉全局
+/// autorepeat（那是「一次会话」该做的事），而且还真改 X 的全局状态 ——
+/// 自检不该在用户的桌面上留下任何痕迹。
+pub fn probe_xtest(display: Option<&str>) -> Result<(c_int, c_int), String> {
+    uulan_clip::x11::init_xlib();
+    let cname = match display {
+        Some(s) if !s.is_empty() => Some(
+            CString::new(s).map_err(|e| format!("显示名 {s:?} 含非法字符：{e}"))?,
+        ),
+        _ => None,
+    };
+    unsafe {
+        let dpy = XOpenDisplay(match &cname {
+            Some(c) => c.as_ptr(),
+            None => std::ptr::null(),
+        });
+        if dpy.is_null() {
+            return Err(format!(
+                "打不开 X 显示 {}（DISPLAY 不对，或当前用户没有该 X 会话的访问权）",
+                display.unwrap_or("$DISPLAY")
+            ));
+        }
+        let (mut ev, mut err, mut major, mut minor) = (0, 0, 0, 0);
+        let rc = XTestQueryExtension(dpy, &mut ev, &mut err, &mut major, &mut minor);
+        XCloseDisplay(dpy);
+        if rc == 0 {
+            return Err("X 服务器没有 XTest 扩展，无法注入键鼠".to_string());
+        }
+        Ok((major, minor))
+    }
+}
+
 pub struct X11Sink {
     dpy: *mut Display,
     display_name: String,

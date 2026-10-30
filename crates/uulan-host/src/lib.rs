@@ -12,6 +12,7 @@
 
 pub mod capture;
 pub mod config;
+pub mod diagnose;
 pub mod input;
 pub mod portmap;
 pub mod probe;

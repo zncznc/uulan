@@ -43,6 +43,7 @@ struct Args {
     show: bool,
     new_temp_code: bool,
     once: bool,
+    diagnose: bool,
 }
 
 const HELP: &str = "\
@@ -55,6 +56,8 @@ uulan-host —— uulan 内网远控的被控端
   --encoder <name>    x264（默认）/ nvenc / vaapi
   --name <name>       本机显示名
   --show              打印设备 ID、密码、临时码后退出（唯一会打印口令的入口）
+  --diagnose          自检：显示 / XTest / ffmpeg / 中继 / 配置可写性，给一行结论 + 建议
+                      只读，不注册中继、不改配置；退出码 0 = 能跑，1 = 有失败项
   --new-temp-code     生成新的一次性临时验证码，落盘后退出
   --once              收到一次会话并结束后就退出（自测用）
   -h, --help          显示本帮助
@@ -74,6 +77,7 @@ fn parse_args() -> Result<Args> {
         show: false,
         new_temp_code: false,
         once: false,
+        diagnose: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -93,6 +97,7 @@ fn parse_args() -> Result<Args> {
                 });
             }
             "--show" => a.show = true,
+            "--diagnose" => a.diagnose = true,
             "--new-temp-code" => a.new_temp_code = true,
             "--once" => a.once = true,
             "-h" | "--help" => {
@@ -146,6 +151,21 @@ async fn main() -> Result<()> {
     }
     if dirty {
         cfg.save(&cfg_path)?;
+    }
+
+    if args.diagnose {
+        // 自检是「只读」模式：上面那几段命令行覆盖已经落盘（和正常启动一致），
+        // 但从这里往下不碰中继、不开会话、不碰 X 的全局状态。
+        let report = uulan_host::diagnose::run(
+            &cfg,
+            &cfg_path,
+            args.ffmpeg.as_deref(),
+            args.encoder.unwrap_or(Encoder::X264),
+        )
+        .await;
+        print!("{}", report.render());
+        // 退出码就是结论：脚本和现场都能直接判。
+        std::process::exit(if report.all_ok() { 0 } else { 1 });
     }
 
     if args.new_temp_code {

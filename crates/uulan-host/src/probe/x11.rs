@@ -80,6 +80,27 @@ pub fn system_state(display: &str) -> Option<DesktopState> {
     }
 }
 
+/// 只读一次「输入焦点在哪个窗口」的名字（`--diagnose` 的输出里要给人看）。
+///
+/// 与 [`system_state`] 一样是「开一次显示、读一次、关掉」，但这边只返回名字，
+/// 好让现场看到 `焦点 ukui-screensaver-dialog` 就明白为什么键鼠被门禁挡下。
+pub fn focus_name(display: &str) -> Option<String> {
+    let name = CString::new(display).ok()?;
+    uulan_clip::x11::init_xlib();
+    unsafe {
+        let dpy = XOpenDisplay(name.as_ptr());
+        if dpy.is_null() {
+            return None;
+        }
+        let mut focus: Window = 0;
+        let mut revert: c_int = REVERT_TO_PARENT;
+        XGetInputFocus(dpy, &mut focus, &mut revert);
+        let out = if focus == 0 || focus == 1 { None } else { window_name(dpy, focus) };
+        XCloseDisplay(dpy);
+        out
+    }
+}
+
 unsafe fn focus_is_a_locker(dpy: *mut Display) -> bool {
     let mut focus: Window = 0;
     let mut revert: c_int = REVERT_TO_PARENT;
