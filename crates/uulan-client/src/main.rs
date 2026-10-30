@@ -387,6 +387,20 @@ fn parse_args() -> Result<Args> {
             "必须给出 --device（被控端界面上显示的 9 位设备 ID），或者用 --last 连上次那台"
         );
     }
+    // 画面参数只对「看画面」的会话有意义：`--inject`、文件、终端、端口映射、`--status`
+    // 都不开视频通道，给了也不会有任何效果。宁可当场报错，也别让人以为自己压了带宽。
+    let has_video_flag =
+        a.quality.is_some() || a.bitrate.is_some() || a.fps.is_some() || a.scale.is_some();
+    let non_video_mode = a.inject.is_some()
+        || a.fs_op.is_some()
+        || a.term
+        || !a.forward.is_empty()
+        || a.status.is_some();
+    if has_video_flag && non_video_mode {
+        bail!(
+            "--quality/--bitrate/--fps/--scale 只对看画面的会话有效：--inject、文件操作、--term、--forward、--status 都不开视频通道"
+        );
+    }
     let env_pw = std::env::var("UULAN_PASSWORD").ok();
     a.password = resolve_password(&a.password, a.password_file.as_deref(), env_pw.as_deref())?;
     if a.password.is_empty() {
