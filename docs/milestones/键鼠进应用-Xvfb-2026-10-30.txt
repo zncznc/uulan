@@ -1,0 +1,81 @@
+uulan · 键鼠「真的进了应用」端到端验收（打字 + 拖拽 + 中文）· 2026-10-30 夜间批（实跑 11:1x–12:0x）
+
+背景：M3 的最后一项「往应用里打字/拖拽」一直挂着，唯一的拦路条件是**物理 :0 被 UKUI 锁屏挡住**
+（解锁要人到机器跟前，且解锁后还会自行再锁）。这一轮换了打法：**在真机上另起一个真的 X 服务器**
+（Xvfb :99），跑一份独立的 relay + host，用真 Windows 控制端沿真实链路注入，判据用 xev。
+这样「锁不锁屏都能跑」，可以放进无人值守的夜批。
+
+一、环境与链路（都是本轮实测）
+
+  真机：mis-pc / 银河麒麟 V10 SP1 / 海光 C86，`systemctl --user is-active uulan-server uulan-host` → 两个 active
+       物理 :0：1920x1080，焦点窗口 `ukui-screensaver-dialog`（**锁着**，本轮全程没解锁）
+  测试台：Xvfb :99（1280x800x24）+ `xev -geometry 420x300+100+100`（判据窗）
+        relay：`uulan-server --bind 0.0.0.0:21995 --state /tmp/uulan-input-app/devices.json`
+        host  ：`DISPLAY=:99 uulan-host --config /tmp/uulan-input-app/host.json --capture x11::99.0 --server 127.0.0.1:21995 --name Xvfb99`
+        （独立配置，**没碰** `~/.config/uulan/host.json`；正式服务一直没动）
+  控制端：Windows 侧 `uulan-client-1030.exe`（HEAD 9272e1f 的 release 构建）
+  为什么这条链路算「真」：**采集 / 注入 / 锁屏探测全都跟着 `--capture` 的显示号走**，
+  所以 :99 上跑的是同一个二进制、同一条 XTest 路径，只是桌面内容不是用户那一个。
+
+二、ASCII 打字 + 拖拽（xev 是独立判据，它只打印收到的事件）
+
+  注入脚本：`move:310,250; click:left; type:hello; move:310,250; down:left; move:400,310; up:left`
+  控制端自报：`已发送 17 条输入帧（移动 3 / 按键 0 / 文本 10 / 点击 4；未送出 0；被控端拒绝 0）`，退出码 0
+
+  xev 收到（原文计数）：
+    KeyPress    5    keysym 依次 h e l l o（keycode 43/26/46/46/32，XLookupString 各给出 1 字节）
+    KeyRelease  5    与按下成对
+    ButtonPress 2    第一次 = 点击；第二次 = 拖拽起点 (310,250)
+    ButtonRelease 2
+    MotionNotify 3   其中 state 0x100（Button1Mask）的那条在 root:(400,310) —— **按住左键拖了 90,60**
+    指针最终落在 x:400 y:310（`xdotool getmouselocation` 复核）
+
+  被控端自报：`XTest 注入后端已就绪 display=:99.0 xtest_major=2 xtest_minor=2 autorepeat_turned_off=true`
+             `会话开局的桌面状态 locked=false has_desktop=true`
+             `键鼠事件统计 events=17 inject_errors=0 dropped_locked=0`
+             收尾 `已还原 X 的键盘映射与 autorepeat display=:99.0`
+
+三、中文（非 ASCII 路径，最容易「单测绿、真机没反应」的那一条）
+
+  注入脚本：`move:310,250; type:中文`
+  控制端自报：`已发送 5 条输入帧（移动 1 / 文本 4 / …）`，退出码 0
+
+  xev 收到：
+    KeyPress keysym 0x1004e2d, U4E2D → `XLookupString gives 3 bytes: (e4 b8 ad) "中"`
+    KeyPress keysym 0x1006587, U6587 → `XLookupString gives 3 bytes: (e6 96 87) "文"`
+    伴随 `MappingNotify request MappingKeyboard, first_keycode 252/253, count 1`
+    —— 即「动态注册一个 Unicode keycode（0x01000000+码点）→ 按下 → 会话收尾还原」这条路径真的走通了，
+    而且是**真 X 服务器把码点翻成了 UTF-8 字节**，不是协议层自说自话。
+
+四、同轮的画面基线（物理 :0，锁屏状态下取帧）
+
+  `--headless --seconds 12`：收到 358 AU / 解出 354 帧 / 丢帧 0 / 首帧 260 ms / 29.4 fps / 9707 kbps
+  与真机 `ffmpeg -f x11grab` 截图逐像素比：**相关系数 0.997137，平均绝对误差 0.7218%**
+  （2026-10-22 基线是 0.9982 / 0.71%；锁屏界面上有时钟，局部差异属正常，误差量级没变）
+
+五、本轮落地的脚本（都可无人值守重跑）
+
+  `scripts/remote-xvfb-testbed.sh up|down|events|status`
+      真机侧测试台：Xvfb :99 + xev + 独立 relay/host，独立配置与状态目录（/tmp/uulan-input-app）
+  `scripts/verify-input-app-e2e.sh`
+      控制端侧编排：起测试台 → 取口令（只落文件、不上屏）→ 两阶段注入 → 读 xev 判据 → 11 条断言 → 收尾
+      本轮实跑 **11 条断言全过（11 通过 / 0 失败，退出码 0）**，连跑两次结果一致
+
+六、边界（别把这条当「物理桌面也验了」）
+
+  - 物理 :0 上的**键盘与拖拽**仍未验：:0 全程锁着，按策略（XTest 会绕过锁屏抓取）不发键鼠。
+    同一个二进制、同一条 XTest 路径在 :99 上验过；差的是 UKUI/kwin 那层窗管行为。
+  - `:99` 是 Xvfb：**没有窗口管理器**，所以「窗口激活、焦点策略、装饰」这些没覆盖。
+  - 输入法中间态（拼音 preedit）本来就不支持，这里验的是「已上屏的中文」。
+  - `type:` 走的是 `KeyChar`（文本帧），所以按键统计里 `按键 0 / 文本 10`：ASCII 也是按字符发的，
+    物理键位映射（Shift+A 这种组合键）走的是另一条路径，不在本脚本覆盖范围。
+
+七、踩到的坑（都是可复现的）
+
+  1. **tracing 给字段名染色**：`events\x1b[0m\x1b[2m=\x1b[0m17`，所以 `grep -oE 'events=[0-9]+'` 抓不到，
+     脚本会误报「被控端统计异常（空）」。启动 host 时带 `NO_COLOR=1`，grep 前再 `sed -E 's/\x1b\[[0-9;]*m//g'` 兜一层。
+  2. **xev 的 KeyRelease 也带着 keysym**：只按 `keysym` 抓会把序列变成 `hheelllloo`。
+     要 `grep -A4 '^KeyPress event'` 先限定在按下事件里。
+  3. **`ssh kylin "cmd"` 的 stdout 里混着 motd「Kylin V10 SP1」**：把口令「重定向到文件」时它会成为第一行。
+     取口令/设备 ID 这类「落文件」的操作一律按行号取或 `tail -1`，别假设文件里只有一行。
+  4. 会话统计是被控端**收尾时**才写的：客户端刚退出就 grep 可能还是空，要给它几秒（脚本里最多等 4 秒）。
