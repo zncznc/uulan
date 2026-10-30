@@ -230,6 +230,7 @@ if [ "$DO_HOST" = 1 ]; then
     echo " 设备 ID  : $DEVICE_ID"
     echo " 访问密码 : uulan-host --show   （刻意不写进安装日志）"
     echo " 日志     : journalctl --user -u uulan-host -f"
+    echo " 自检     : $PREFIX/bin/uulan-host --diagnose   （显示/XTest/ffmpeg/中继，退出码 0 = 能跑）"
 fi
 if [ "$HAVE_CLIENT" = 1 ]; then
     echo " 控制端   : $PREFIX/bin/uulan-client --server $SERVER --device $DEVICE_ID --password-file <文件>"

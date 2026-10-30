@@ -869,3 +869,49 @@ uulan-client --last --password-file ~/.uulan-pw
 - `uulan-client --forget` 忘掉它（只删文件，不连中继、不要口令）。
 - 文件在麒麟上是 `-rw-------`；文件里没有任何凭据（真机把口令串在配置与日志里搜过，命中 0）。
 - 只记**最后一台**。两台机器轮着连的话，想固定就写显式 `--device`。
+
+## 20. 装完先自检：`uulan-host --diagnose`（2026-10-31 实测）
+
+现场「连不上」的原因就那么几种，但每种的表现都不一样。装完 / 换机 / 报障时先跑这一条：
+
+```bash
+DISPLAY=:0 XAUTHORITY=$HOME/.Xauthority uulan-host --diagnose; echo "退出码=$?"
+```
+
+真机实测输出（生产配置，`:0` 锁屏）：
+
+```
+== uulan 被控端自检 ==
+[ OK ] 身份       /home/mis/.config/uulan/host.json；设备 ID 805747189；临时码 无；注册令牌 有
+[ OK ] 配置       采集源 X11 屏幕 :0；中继 192.168.223.15:21116
+[ OK ] 可写       /home/mis/.config/uulan 可写（配置、设备台账、日志都落在这里）
+[WARN] 显示       :0 可用，1920x1080，锁屏 是，焦点 ukui-screensaver-dialog
+         └─ 现在锁着屏：连上能看到画面，但键鼠会被门禁挡下（这是策略，不是故障）。
+[ OK ] 键鼠注入   XTest 2.2 可用（:0）
+[ OK ] ffmpeg     /usr/bin/ffmpeg（ffmpeg version 4.2.2-1kylin1k23.8），编码器 libx264 在
+[ OK ] 中继       192.168.223.15:21116 TCP 可达
+[ OK ] 本机       16 核；内存 已用 3791 MB / 共 32025 MB
+
+== 7 通过 / 1 警告 / 0 失败 ==
+结论：可以跑（`uulan-host` 或用 systemd 用户单元常驻）。
+```
+
+怎么用：
+
+- **退出码就是结论**：0 = 能跑；1 = 有 `[FAIL]`。脚本里直接 `if ! uulan-host --diagnose; then …`。
+- **只读**：不注册中继（不会抢设备身份）、不改配置、不动 X 的全局状态（XTest 只查扩展，
+  不会关 autorepeat）。唯一写操作是往配置目录写一个探针文件再删掉 —— 那是「可写」这一项
+  必须真写一次才算数。
+- **不打印秘密**：口令、临时码、注册令牌只出现「有 / 无」。可以放心贴进工单。
+- `[WARN]` 不是故障：锁屏、合成源、非 Linux 机器（读不到 `/proc`）都会是 WARN。
+  锁屏时连上能看到画面、键鼠被门禁挡下 —— 这是策略，解锁后自然恢复。
+- `显示` 报 `打不开 X 显示 :0`：先确认是图形登录（不是 ssh / 文本控制台）、
+  `DISPLAY` 与 `XAUTHORITY` 对、并且 `uulan-host` 跑在**这个用户自己的会话**里
+  （systemd 用户单元就是干这个的）。
+- `中继` 报 `Connection refused`：中继没起或端口不对 → `systemctl --user status uulan-server`、
+  `ss -lnt | grep 21116`。报「3 秒超时」则是网络不通/被防火墙丢包，两者原因不同。
+
+验收脚本 `scripts/verify-diagnose-e2e.sh`（真机 16 断言全过）：正例要求八项 + 结论行 + 退出码 0；
+三个反例分别只坏一项（`DISPLAY=:77`、`--ffmpeg /bin/false`、`--server 127.0.0.1:1`），
+必须 `[FAIL]` 指对那一项且退出码 1；最后拿 `host.json` 的口令原值 grep 输出，命中 0 次。
+数字与踩到的坑见 `docs/milestones/现场自检-2026-10-31.txt`。

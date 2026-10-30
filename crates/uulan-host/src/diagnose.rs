@@ -519,7 +519,7 @@ mod tests {
         assert_eq!(mb(0), "0 MB");
         assert_eq!(mb(1024 * 1024 * 3800), "3800 MB");
         assert_eq!(mb(1024 * 1024 - 1), "0 MB");
-        // 真机样例（麒麟 3.8G 内存）：580 MB 已用 / 3796 MB 共
+        // 样例：MemTotal 3887912 kB、MemAvailable 3279447 kB（≈ 3796 MB 共 / 594 MB 已用）
         let sample = "MemTotal:       3887912 kB\nMemAvailable:   3279447 kB\n";
         let (used, total) = crate::probe::parse_meminfo(sample).expect("解析得出来");
         assert_eq!(mb(total), "3796 MB");
