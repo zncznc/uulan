@@ -204,8 +204,11 @@ impl Server {
                 .values()
                 .any(|c| c.since.map_or(false, |t| now.duration_since(t) > RELAY_WAIT_TTL));
             if expired || stalled {
+                // 票据是 60 秒有效的 bearer token：日志里只能出现不可逆标签（`tXXXXXXXX`），
+                // 与「发起会话」（下发那侧）和「有人要连进来」（被控端那侧）用的是同一套标签，
+                // 排障时仍然能把三条日志对上。原值在这里泄露过一版，本轮的日志脱敏验收抓到了。
                 debug!(
-                    session = %sid,
+                    session = %redact::tag(sid),
                     device_id = %s.device_id,
                     client = %s.client_name,
                     expired,

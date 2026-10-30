@@ -74,6 +74,22 @@ timeout 60 "$WORK/uulan-client.exe" --server "127.0.0.1:$PORT" --device "$DEVICE
   --password-file "$WORK/pw.txt" --ls ":/" >"$WORK/client-ls.out" 2>"$WORK/client-ls.log"
 check $? "客户端用 --password-file 连上并列出「此电脑」"
 
+echo "──────── ①b 文件内容金丝雀（--put / --get）────────"
+# 文件正文也是用户数据：日志里只该有字节数，不该有内容。
+FILE_CANARY="HYGIENEFILE-$(date +%s)-Qk4"
+printf 'first line\nbody %s\nthird\n' "$FILE_CANARY" >"$WORK/up-canary.txt"
+timeout 60 "$WORK/uulan-client.exe" --server "127.0.0.1:$PORT" --device "$DEVICE" \
+  --password-file "$WORK/pw.txt" --put "$WORK/up-canary.txt" "$WORK/up-canary-copy.txt" \
+  >"$WORK/client-put.out" 2>"$WORK/client-put.log"
+check $? "上传一个带金丝雀的文件"
+timeout 60 "$WORK/uulan-client.exe" --server "127.0.0.1:$PORT" --device "$DEVICE" \
+  --password-file "$WORK/pw.txt" --get "$WORK/up-canary-copy.txt" "$WORK/down-canary.txt" \
+  >"$WORK/client-get.out" 2>"$WORK/client-get.log"
+check $? "把它取回来"
+grep -q "$FILE_CANARY" "$WORK/down-canary.txt" 2>/dev/null \
+  && check 0 "取回的文件里真的有金丝雀（否则「日志里搜不到」不算数）" \
+  || check 1 "取回的文件里没有金丝雀 —— 这一段等于没发生"
+
 echo "──────── ② 终端：敲一条带金丝雀的命令 ────────"
 printf 'echo %s\r\nexit 0\r\n' "$CANARY" | \
   timeout 60 "$WORK/uulan-client.exe" --server "127.0.0.1:$PORT" --device "$DEVICE" \
@@ -98,11 +114,35 @@ INJ_RC=$?
 check $([ "$INJ_RC" = 0 ] || [ "$INJ_RC" = 3 ] && echo 0 || echo 1) \
   "注入跑完（rc=$INJ_RC；0=注入成功；3=合成源没有可注入的桌面）"
 
-sleep 0.3
+echo "──────── ③b 临时码 + 注册令牌 ────────"
+# 临时码是「用一次即失效」的凭据，注册令牌是「这台机器的身份」—— 两个都不该进日志。
+# 这里让**另一个进程**写一个新码（真机上就是 `uulan-host --new-temp-code` 那条路），再用它连一次：
+# 既验「运行中的服务看得见外部写的码」，也验码本身没被写进日志。
+"$WORK/uulan-host.exe" --config "$WORK/host.json" --new-temp-code >"$WORK/tempcode.out" 2>&1
+check $? "另一个进程写出了新临时码（--new-temp-code）"
+TEMP=$(sed -n 's/.*"temp_code": *"\([^"]*\)".*/\1/p' "$WORK/host.json" | head -1)
+REG=$(sed -n 's/.*"reg_token": *"\([^"]*\)".*/\1/p' "$WORK/host.json" | head -1)
+if [ -z "$TEMP" ] || [ -z "$REG" ]; then
+  echo "host.json 里没有 temp_code / reg_token（字段名变了？）"; sed -n 1,5p "$WORK/host.json"; exit 2
+fi
+printf '%s\n' "$TEMP" >"$WORK/temp.txt"   # 同 pw.txt：只落文件，不上屏、不进命令行
+timeout 60 "$WORK/uulan-client.exe" --server "127.0.0.1:$PORT" --device "$DEVICE" \
+  --password-file "$WORK/temp.txt" --headless --seconds 5 \
+  >"$WORK/client-temp.out" 2>"$WORK/client-temp.log"
+check $? "用新写的临时码连上了（运行中的服务看得见外部改的配置）"
+
+echo "──────── ③c 等中继自己的 sweep（会话 TTL 60 s）────────"
+# 「回收会话」那条日志只有在会话超时被回收时才出现。不等这一轮，那条路径就是**没被覆盖**的
+# —— 票据原值恰好是在那里漏出来的（2026-10-31 的真机 TRACE 日志抓到）。
+sleep 72
+
 echo "──────── ④ 全量搜秘密 ────────"
 # 只搜 tracing 日志（stderr）。`client-*.out` 是终端画面/目录列表本身 —— 那是给人看的
 # 字节流，不是日志；把它算进来等于断言「终端不能用」。
-LOGS="$WORK/server.log $WORK/host.log $WORK/client-ls.log $WORK/client-term.log $WORK/client-inject.log"
+# 注意：`tempcode.out` **不在**这张表里 —— 它是 `uulan-host --new-temp-code` 的**产品输出**
+# （这条命令的用途就是让操作员读到新码），不是日志。把它算进来等于断言「临时码不能用」。
+LOGS="$WORK/server.log $WORK/host.log $WORK/client-ls.log $WORK/client-term.log $WORK/client-inject.log \
+      $WORK/client-put.log $WORK/client-get.log $WORK/client-temp.log"
 LINES=$(cat $LOGS | wc -l)
 echo "  日志行数合计：$LINES（RUST_LOG=trace）"
 
@@ -120,6 +160,10 @@ hit "访问密码原值" -F "$PW"
 hit "访问密码原值（按字段名）" -E "\"password\": *\"$PW\""
 hit "终端命令金丝雀" -F "$CANARY"
 hit "会话票据原值（旧格式 session=<32 hex>）" -E "session=t?[0-9a-f]{32}"
+hit "一次性临时码原值" -F "$TEMP"
+hit "注册令牌原值" -F "$REG"
+hit "文件内容金丝雀" -F "$FILE_CANARY"
+hit "密钥材料形态（key=/psk=/master=/shared= 后跟长十六进制）" -E "(key|psk|master|shared|secret)=[0-9a-fA-F]{16,}"
 
 # 顺便看一眼：日志里到底有没有「带了标签的会话」—— 有，才说明票据那一路真的走过。
 grep -q -E "session=t[0-9a-f]{8}" "$WORK/host.log" && check 0 "被控端日志里会话是标签形态（tXXXXXXXX）" \
@@ -129,6 +173,8 @@ grep -q -E "session=t[0-9a-f]{8}" "$WORK/host.log" && check 0 "被控端日志�
 grep -q "有人要连进来" "$WORK/host.log" && check 0 "确有会话建立（不是空跑）" || check 1 "日志里没有会话记录"
 grep -q "终端会话已开启" "$WORK/host.log" && check 0 "确有终端会话" || check 1 "日志里没有终端会话"
 grep -q "文件操作完成" "$WORK/host.log" && check 0 "确有文件操作" || check 1 "日志里没有文件操作"
+grep -q "回收会话" "$WORK/server.log" && check 0 "中继确实回收过会话（③c 那 72 秒不是白等）" \
+  || check 1 "中继没有「回收会话」记录 —— 那条路径这一轮没被覆盖到"
 
 echo
 if [ "$FAIL" = 0 ]; then
