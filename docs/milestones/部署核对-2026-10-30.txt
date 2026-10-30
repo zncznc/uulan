@@ -1,0 +1,40 @@
+uulan · 本轮（2026-10-30）部署核对 · 真麒麟
+
+代码：HEAD `9ef0b1e`（本轮两个提交 403d42c / 9ef0b1e）
+做法：从 HEAD 打包（`git archive`，**不用工作区**）→ scp → 真机换源码（保留 `target/`）→
+`cargo build --release -p uulan-server -p uulan-host -p uulan-client`（36.8 s）→
+`install.sh --userland --no-start` → `systemctl --user kill -s KILL uulan-server uulan-host`。
+
+一、部署核对（都成立）
+
+  - 单元：`uulan-server` / `uulan-host` 都是 `active`；host `MainPID=3784786`、`NRestarts=25`（只涨了本轮 KILL 的一次）。
+  - 跑的是前缀里的新二进制：`readlink /proc/<pid>/exe` → `~/.local/uulan/bin/uulan-host` 与 `…/uulan-server`。
+  - 三个二进制 `bin` 与 `target/release` 的 sha256 前缀一致：
+      uulan-server  daaec698fcda / daaec698fcda
+      uulan-host    f9db623d9eb9 / f9db623d9eb9
+      uulan-client  2720dd2974b3 / 2720dd2974b3
+  - 配置与身份一字未变：`~/.config/uulan/host.json` 的 sha256 前 16 位 `80eb46bba190d9ce` 与部署前相同，
+    设备 ID 仍是 805747189。
+
+二、画面基线（物理 :0，锁屏状态；麒麟自编自跑的控制端）
+
+  `uulan-client --headless --seconds 12 --save-frame`：收到 358 AU / 解出 **357 帧** / **丢帧 0** /
+  首帧 **257 ms** / **29.7 fps** / 9731 kbps / 会话 1 条 / 退出码 0。
+  与真机 `ffmpeg -f x11grab` 截图逐像素比：**相关系数 0.998149 / MAE 0.7109%**
+  —— 与 2026-10-22 的基线（0.9982 / 0.71%）同一水平，没有回归。
+
+三、Windows 控制端的同轮数字（同一 HEAD）
+
+  `--headless --seconds 12`：解出 354 帧 / 丢帧 0 / 首帧 260 ms / 29.4 fps / 9707 kbps，
+  与真机截图相关系数 0.997137 / MAE 0.7218%（锁屏界面上有时钟，逐像素差异比麒麟侧略大，误差量级一致）。
+
+四、清理
+
+  临时口令文件、截图、测试台目录与进程都已清掉（`/tmp/uulan-pw-1030.txt`、
+  `/tmp/uulan-xvfb`、`/tmp/uulan-input-app` 等都不在了）；正式服务全程只被 KILL 过两次（换二进制），
+  端口仍是 21116。
+五、同轮的日志脱敏复跑（本机，当前构建）
+
+  `bash scripts/verify-log-hygiene.sh`（`RUST_LOG=trace` 全量跑一次真会话：文件列表 + 终端两条命令 +
+  注入）→ 退出码 0；143 行日志里**访问密码 0 次命中、终端命令金丝雀 0 次命中、旧格式 32 hex 票据 0 次命中**，
+  会话行是标签形态 `tXXXXXXXX`，并且「确有会话 / 确有终端 / 确有文件操作」三项反证齐全（不是空跑）。
