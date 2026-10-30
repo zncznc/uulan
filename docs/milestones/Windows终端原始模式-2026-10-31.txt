@@ -1,0 +1,62 @@
+Windows 控制端 · 终端控制台原始模式（SetConsoleMode）
+2026-10-31 01:00–01:35 夜间批（模型 alibaba-token-plan-cn / deepseek-v4.1-flash-1017）
+HEAD 起点 b6d6f3e / 本轮提交 a154a79
+
+问题
+  Windows 控制端的 `--term` 一直是行模式：每个键等回车才发；Ctrl-C 变成发给本机客户端的
+  CTRL_C_EVENT（远端 ping 停不下来，客户端自己先死）。DESIGN 的已知限制里挂着这条。
+
+改法（crates/uulan-client/src/termx.rs，cfg(windows)）
+  wincon 模块，手写 kernel32（GetStdHandle/GetConsoleMode/SetConsoleMode/GetConsoleCP/
+  SetConsoleCP），不引 windows-sys。
+  目标 flag = (base & ~(PROCESSED|LINE|ECHO|QUICK_EDIT)) | EXTENDED_FLAGS | VT_INPUT
+  输入码页切 CP_UTF8（默认 936），Drop 里模式与码页都还原。
+  退化路径「什么都不改」：stdin 不是控制台 / SetConsoleMode 拒绝 VT 输入（老 Windows）。
+
+本机测试（Windows 11 build 26100）
+  cargo test --workspace            : 433 passed / 0 failed / 1 ignored（基线 431，新增 2），零警告
+  cargo build --release             : 通过，零警告（57.83 s）
+  cargo check -p uulan-host -p uulan-fs -p uulan-bulk --target x86_64-unknown-linux-gnu : 0 警告
+  新增 tests/term_raw_console.rs    : 1 passed / 2.85 s（真 ConPTY + 真 cmd.exe + 真 server/host）
+
+  这次测试本身是新东西：用 portable-pty（仅 Windows dev-dependency）给客户端进程造一个真
+  ConPTY 当终端，于是 GetConsoleMode/SetConsoleMode/VT 输入都真的生效，整条路可以断言。
+  四条断言：进了原始模式 / 不带回车的字串立刻到远端 / 方向键字节立刻到远端 / Ctrl-C 后客户端
+  还活着且会话可用；外加退出码原样回来与「conhost 问过光标位置（证明真挂在控制台上）」。
+
+红（改前）与绿（改后）同一台机器、同一条测试：
+  UULAN_CLIENT_EXE=D:/uulan-bin/uulan-client-before-rawmode.exe（上一轮 22:48 的 release）
+    → FAILED：屏幕上只有「已请求开启远端终端 cols=100 rows=30」，没有「已进入控制台原始模式」
+  默认（本轮构建的二进制）
+    → ok：saved_mode=0x01f7 saved_cp=936，5 条断言全过
+  踩到的坑：假终端必须回答 ConPTY 的 ESC[6n；不答它就不往下画（屏幕只有 4 字节，空等 20 秒）。
+
+真机（麒麟 V10 SP1，192.168.223.15：805747189）
+  部署：git archive HEAD → 换源码（保留 target/）→ cargo build --release -p uulan-server -p uulan-host
+        32.73 s 零警告；install.sh --userland --no-start；systemctl --user kill -s KILL 两个单元
+        sha256 uulan-server daaec698…3282b / uulan-host 9829a83d…90886
+        MainPID 3980524 → 4027473，两个单元 active，运行的是前缀里的二进制
+        journal：「已用原有设备 ID 上线 device_id=805747189」
+  画面基线（同 batch 的 HEAD 客户端）：AU 358 / 解出 355 / 丢帧 0 / 首帧 246 ms / 9730 kbps /
+        1920x1080 / 29.5 fps / 被控端自报 30.10 fps / 会话 1 条
+        与真机 ffmpeg x11grab 截图（1920x1080）逐像素比对：相关系数 0.9993 / MAE 0.51%
+        （历史基线 0.9982 / 0.71%，无回归）
+
+  真机终端端到端（Windows 控制端 --term → 真中继 → 麒麟 host 的 Linux PTY，7/7 断言）：
+    ① 客户端「已进入控制台原始模式」saved_mode=0x01f7 saved_cp=936
+    ② 不带回车的 uulan-raw-typing 立刻出现在麒麟 bash 的回显里
+    ③ echo mark-two 真的在麒麟上执行
+    ④ 上方向键 ESC[A 让 bash 历史重现上一行（远端 Linux PTY 不需要转码）
+    ⑤ Ctrl-C 没打死本机客户端
+    ⑥ Ctrl-C 之后会话仍可用（echo mark-three 执行）
+    ⑦ exit 3 的退出码原样回到 Windows 客户端（实际 Some(3)）
+    驱动脚本是仓库外的临时代码 D:/uulan-bin/cterm（portable-pty 造 ConPTY + 断言），
+    不属于仓库；仓库内的自动验收是 tests/term_raw_console.rs。
+
+未验 / 已知边界
+  · 远端是 Windows（ConPTY）时方向键到不了应用：远端会 ESC[?9001h 要 win32-input-mode，
+    控制端纯字节透传，ESC[A 只被当成三个字符（屏幕上 ^[[A）。要支持得加 VT→win32-input-mode
+    转码，本轮没做。远端是麒麟的 Linux PTY 时没有这层问题（真机 ④ 已验）。
+  · 本机 IME 上屏的中文只做到「输入码页切 UTF-8」，真实 IME 未验。
+  · 粘贴（Ctrl+V / 右键）未验。
+  · stdin 是管道/重定向时仍退回行模式（脚本化验证走的就是这条路，行为与改动前一致）。
