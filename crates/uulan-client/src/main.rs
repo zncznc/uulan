@@ -20,7 +20,7 @@ use tracing::info;
 use uulan_client::connect::{self, ClientError};
 use uulan_client::session;
 use uulan_client::watch::WatchStatsSnapshot;
-use uulan_protocol::msg::Cap;
+use uulan_protocol::msg::{Cap, Quality, VideoSet};
 use uulan_protocol::rv::DeviceEntry;
 use uulan_protocol::rvclient::{RvConn, RvError};
 
@@ -77,6 +77,14 @@ struct Args {
     /// 会话中途断线后最多连续重连几次（默认 8，0 = 断线即退出）。
     /// 与 `connect_retry` 是两件事：那是「一开始就没连上」，这是「连上了又断」。
     reconnect: u32,
+    /// 画质档位（`--quality`）。不给 = 用被控端自己的配置。
+    quality: Option<uulan_protocol::msg::Quality>,
+    /// 码率上限 kbps（`--bitrate`）。给了就走 `Quality::Custom`。
+    bitrate: Option<u32>,
+    /// 请求的编码帧率（`--fps`）。0/None = 不动。
+    fps: Option<u32>,
+    /// 编码缩放倍率（`--scale`）。1.0 = 原始分辨率。
+    scale: Option<f32>,
 }
 
 const HELP: &str = "\
@@ -100,6 +108,11 @@ uulan-client —— uulan 内网远控的控制端
   --json              以 JSON 输出（--headless 的统计 / --devices 的设备目录）
   --connect-retry <N> 连接阶段最多重试 N 次（默认 3；0 = 连一次就报错退出）
                       只在「连不上」时重试；口令错/被锁直接报错，不重试
+  --quality <档位>    画质档位：auto|fast|high|hd|bluray（不给 = 用被控端配置）
+  --bitrate <kbps>    码率上限，给了就覆盖档位（例：--bitrate 2000）
+  --fps <N>           请求的编码帧率（1..144）
+  --scale <倍率>      编码缩放，0.1..1.0（例：--scale 0.75 = 四分之三画幅，带宽跟着降）
+                      只缩编码、不改被控端显示器分辨率；窗口里看到的是缩放后的画面
   --reconnect <N>     会话中途断线后最多连续重连 N 次（默认 8；0 = 断线即退出）
                       退避 1/2/4/8/15 秒；口令错、协议不匹配这类不重试
                       中继重启（升级）后窗口会自己接回来，不用重开
@@ -174,6 +187,10 @@ fn parse_args() -> Result<Args> {
         server_explicit: false,
         connect_retry: DEFAULT_CONNECT_RETRY,
         reconnect: DEFAULT_RECONNECT,
+        quality: None,
+        bitrate: None,
+        fps: None,
+        scale: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -225,6 +242,43 @@ fn parse_args() -> Result<Args> {
             }
             "--inject" => {
                 a.inject = Some(it.next().context("--inject 需要一个脚本，例如 \"click:left\"")?)
+            }
+            "--quality" => {
+                let v = it.next().context("--quality 需要一个档位：auto|fast|high|hd|bluray")?;
+                a.quality = Some(parse_quality(&v)?);
+            }
+            "--bitrate" => {
+                let v: u32 = it
+                    .next()
+                    .context("--bitrate 需要 kbps，例如 --bitrate 2000")?
+                    .parse()
+                    .context("--bitrate 的数值不是数字")?;
+                if v == 0 {
+                    bail!("--bitrate 必须大于 0（想「不设上限」就别给这个参数）");
+                }
+                a.bitrate = Some(v);
+            }
+            "--fps" => {
+                let v: u32 = it
+                    .next()
+                    .context("--fps 需要帧率，例如 --fps 20")?
+                    .parse()
+                    .context("--fps 的数值不是数字")?;
+                if !(1..=144).contains(&v) {
+                    bail!("--fps 要在 1..=144 之间");
+                }
+                a.fps = Some(v);
+            }
+            "--scale" => {
+                let v: f32 = it
+                    .next()
+                    .context("--scale 需要倍率，例如 --scale 0.75")?
+                    .parse()
+                    .context("--scale 的数值不是数字")?;
+                if !(0.1..=1.0).contains(&v) {
+                    bail!("--scale 要在 0.1..=1.0 之间（不放大，远控放大没有意义）");
+                }
+                a.scale = Some(v);
             }
             "--reconnect" => {
                 a.reconnect = it
@@ -379,6 +433,53 @@ fn resolve_password(
 }
 
 /// 解析 `COLSxROWS`（也收大写 `X` 和 `*`，省得为了一个分隔符去查文档）。
+/// 画质档位名 → 枚举。名字同时就是命令行与日志里用的词，别搞第二套说法。
+fn parse_quality(v: &str) -> Result<Quality> {
+    Ok(match v.trim().to_ascii_lowercase().as_str() {
+        "auto" => Quality::Auto,
+        "fast" => Quality::Fast,
+        "high" => Quality::High,
+        "hd" => Quality::Hd,
+        "bluray" | "original" => Quality::Bluray,
+        _ => bail!("不认识的画质档位 {v}（可用：auto|fast|high|hd|bluray）"),
+    })
+}
+
+/// 把 `--quality/--bitrate/--fps/--scale` 折成一条 `VideoSet`。
+///
+/// 一个都没给 = `None`（被控端按自己的配置来，一个字节都不多发）。
+/// 给了 `--bitrate` 就以码率为准（`Quality::Custom`）；没给画质档位时用 `Quality::Keep`
+/// ——「这一项我不表态」，免得只想降帧率的用户把对面配好的高清档悄悄改成自动。
+fn video_set(a: &Args) -> Option<VideoSet> {
+    make_video_set(a.quality, a.bitrate, a.fps, a.scale)
+}
+
+/// 同上，但只接受四个纯值（便于单测：`Args` 有二十来个字段，构造它跟测语义无关）。
+fn make_video_set(
+    quality: Option<Quality>,
+    bitrate: Option<u32>,
+    fps: Option<u32>,
+    scale: Option<f32>,
+) -> Option<VideoSet> {
+    if quality.is_none() && bitrate.is_none() && fps.is_none() && scale.is_none() {
+        return None;
+    }
+    // 给了码率就以码率为准：`Custom` 的语义就是「上限由我这条消息里的数字决定」。
+    let quality = if bitrate.is_some() {
+        Quality::Custom
+    } else {
+        quality.unwrap_or(Quality::Keep)
+    };
+    Some(VideoSet {
+        fps: fps.unwrap_or(0),
+        max_bitrate_kbps: bitrate.unwrap_or(0),
+        quality,
+        scale: scale.unwrap_or(1.0),
+        chroma: "420".into(),
+        encoder: "auto".into(),
+    })
+}
+
 fn parse_size(s: &str) -> Result<(u16, u16)> {
     let norm = s.replace(['X', '*', '×'], "x");
     let (c, r) = norm
@@ -764,6 +865,7 @@ async fn main() -> Result<()> {
         clipboard: clip_ok,
         no_input: args.no_input,
         max_reconnects: args.reconnect,
+        video: video_set(&args),
     };
 
     // ── 窗口模式 ──────────────────────────────────────────────────────────
@@ -1148,7 +1250,19 @@ async fn run_headless(
             );
         }
         println!("  被控端帧率 : {:.2} fps（对面自己数的编码帧率）", s.host_fps_x10 as f32 / 10.0);
-        println!("  当前画幅   : {}x{}（最新一条画面参数）", s.cfg_w, s.cfg_h);
+        // 缩放编码时两行都要打：屏幕尺寸决定点击落点，编码画幅决定解码字节数。
+        // 只打一个数的话，现场看到「画面是 960x540」而统计写 1920x1080 会以为是 bug。
+        if (s.enc_w, s.enc_h) != (s.cfg_w, s.cfg_h) {
+            println!(
+                "  当前画幅   : {}x{}（屏幕）/ {}x{}（编码，已缩放）",
+                s.cfg_w, s.cfg_h, s.enc_w, s.enc_h
+            );
+        } else {
+            println!("  当前画幅   : {}x{}（最新一条画面参数）", s.cfg_w, s.cfg_h);
+        }
+        if s.cfg_fps > 0 {
+            println!("  请求帧率   : {} fps（被控端当前编码帧率）", s.cfg_fps);
+        }
         println!("  解码器重建 : {} 次（被控端换过分辨率）", s.resizes);
         println!("  会话       : 建立 {} 条 / 断线接回 {} 次", sessions, reconnects);
     }
@@ -1211,6 +1325,47 @@ mod tests {
     }
 
     /// 连接阶段的重试间隔：先小步、再封顶，且极值不溢出。
+    /// 没给任何画面参数 = 一个字节都不发（不能悄悄把对面的配置改掉）。
+    #[test]
+    fn no_video_flags_means_no_video_set_message() {
+        assert!(make_video_set(None, None, None, None).is_none());
+    }
+
+    /// 只调帧率/缩放时，画质必须是 `Keep`（「这一项我不表态」）而不是 `Auto`。
+    /// 写成 `Auto` 的话，用户只想把帧率降到 15，结果把被控端配好的高清档悄悄改成自动。
+    #[test]
+    fn fps_or_scale_alone_keeps_the_hosts_quality() {
+        let v = make_video_set(None, None, Some(15), Some(0.5)).expect("应当有消息");
+        assert_eq!(v.fps, 15);
+        assert!((v.scale - 0.5).abs() < f32::EPSILON);
+        assert_eq!(v.quality, Quality::Keep, "没表态的画质不能变成 Auto");
+        assert_eq!(v.max_bitrate_kbps, 0);
+    }
+
+    /// 给了码率 → `Custom` + 那个数字；同时给的档位让位（码率是更具体的表态）。
+    #[test]
+    fn explicit_bitrate_wins_over_named_quality() {
+        let v = make_video_set(Some(Quality::Hd), Some(1500), None, None).expect("应当有消息");
+        assert_eq!(v.quality, Quality::Custom);
+        assert_eq!(v.max_bitrate_kbps, 1500);
+        assert_eq!(v.fps, 0, "0 = 不动被控端的帧率");
+        assert!((v.scale - 1.0).abs() < f32::EPSILON, "1.0 = 不缩放");
+    }
+
+    #[test]
+    fn quality_names_are_the_ones_in_help() {
+        for (name, want) in [
+            ("auto", Quality::Auto),
+            ("FAST", Quality::Fast),
+            ("high", Quality::High),
+            ("hd", Quality::Hd),
+            ("bluray", Quality::Bluray),
+        ] {
+            assert_eq!(parse_quality(name).unwrap(), want, "{name}");
+        }
+        assert!(parse_quality("ultra").is_err(), "不认识的档位要报错，不能静默当 auto");
+    }
+
     #[test]
     fn connect_retry_backoff_starts_small_and_caps() {
         let seq: Vec<u64> = (1..=6).map(|i| connect_retry_delay(i).as_secs()).collect();

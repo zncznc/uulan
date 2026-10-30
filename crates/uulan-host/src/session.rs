@@ -390,6 +390,14 @@ impl VideoSettings {
         };
         (cq, maxrate)
     }
+
+    /// 这套参数下的**编码画幅**（缩放后）。给 `VideoCfg.enc_w/enc_h` 用。
+    ///
+    /// 与 ffmpeg 的 `scale` 滤镜共用 [`uulan_media::ffmpeg::scaled_size`] —— 报给控制端的
+    /// 数字必须和编码器实际吐出来的一致，否则控制端会按错的 rawvideo 每帧字节数解码。
+    pub fn encoded_size(self, screen: Screen) -> (u32, u32) {
+        uulan_media::ffmpeg::scaled_size(screen.w, screen.h, self.scale)
+    }
 }
 
 /// 开一次会话所需的全部输入。
@@ -1161,7 +1169,9 @@ async fn control_loop(
                                     cur.scale = v.scale;
                                     changed = true;
                                 }
-                                if v.quality != cur.quality {
+                                // `Keep` = 「这一项我不表态」：只改帧率/缩放的控制端会把画质
+                                // 留空，别把被控端配置里的档位悄悄换成 Auto。
+                                if v.quality != Quality::Keep && v.quality != cur.quality {
                                     cur.quality = v.quality;
                                     changed = true;
                                 }
@@ -1689,9 +1699,14 @@ async fn video_loop(
 
 /// 组装一条 `VideoCfg`。周期性上报实测帧率时也用它 —— 字段只写一遍，免得两处不一致。
 fn video_cfg(screen: Screen, encoder: Encoder, s: VideoSettings, actual_fps: f32) -> H2C {
+    let (enc_w, enc_h) = s.encoded_size(screen);
     H2C::VideoCfg(HostVideoCfg {
+        // `w`/`h` 是**屏幕**尺寸（控制端拿它换算归一化坐标），`enc_w`/`enc_h` 是编码画幅
+        // （解码器按它启动）。缩放编码时两者不同，混用就是花屏 / 点击落点整体偏移。
         w: screen.w,
         h: screen.h,
+        enc_w,
+        enc_h,
         codec: "h264".into(),
         fps: s.fps,
         encoder: encoder.codec_name().to_string(),

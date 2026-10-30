@@ -76,6 +76,8 @@ fn cfg(w: u32, h: u32, fps: f32) -> HostVideoCfg {
         encoder: "libx264".into(),
         chroma: "420".into(),
         actual_fps: fps,
+        enc_w: 0,
+        enc_h: 0,
     }
 }
 

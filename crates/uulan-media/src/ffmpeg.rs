@@ -109,6 +109,23 @@ impl CaptureOptions {
     }
 }
 
+/// 缩放后的**编码画幅**。`scale == 1.0` 时原样返回。
+///
+/// 这是全仓唯一的换算处：被控端把结果写进 `VideoCfg.enc_w/enc_h`，ffmpeg 的 `scale`
+/// 滤镜也按同一对数出图。两边各算一遍的话，只要差 2 个像素（偶数对齐、取整方向），
+/// 控制端的 rawvideo 每帧字节数就对不上 —— 画面是斜条纹，而且永远不会自愈。
+///
+/// **为什么强制偶数**：h264 的 yuv420 要求宽高都能被 2 整除，奇数直接让编码器报错退出。
+/// 取整方向统一用「向下截断再清最低位」，保证「算出来的」和「ffmpeg 真的编出来的」一致。
+pub fn scaled_size(w: u32, h: u32, scale: f32) -> (u32, u32) {
+    if (scale - 1.0).abs() <= f32::EPSILON {
+        return (w, h);
+    }
+    let ew = ((w as f32 * scale) as u32) & !1;
+    let eh = ((h as f32 * scale) as u32) & !1;
+    (ew.max(2), eh.max(2))
+}
+
 /// GOP 长度：fps 的一半（约 0.5 秒），至少 5 帧。
 pub fn gop_for(fps: u32) -> u32 {
     (fps / 2).max(5)
@@ -163,11 +180,15 @@ pub fn encode_args_with_input(o: &CaptureOptions, input: &[String]) -> Vec<Strin
 
     // ---- 滤镜：可选缩放 / VAAPI 上传 ----
     let scaled = (o.scale - 1.0).abs() > f32::EPSILON;
+    // 尺寸用 `scaled_size` 算成具体像素数：`scale=iw*0.5:ih*0.5` 在奇数宽高上会被
+    // ffmpeg 自己取整，和 `VideoCfg.enc_w/enc_h` 报给控制端的数可能差 1 像素 —— 那正是
+    // 「画面斜条纹」的来源。写死数字就没这个自由度。
+    let (ew, eh) = scaled_size(o.width, o.height, o.scale);
     match o.encoder {
         Encoder::Vaapi => {
             let mut vf = String::from("format=nv12,hwupload");
             if scaled {
-                vf = format!("scale=iw*{s}:ih*{s},format=nv12,hwupload", s = o.scale);
+                vf = format!("scale={ew}:{eh},format=nv12,hwupload");
             }
             push(&mut a, "-vf");
             a.push(vf);
@@ -175,7 +196,7 @@ pub fn encode_args_with_input(o: &CaptureOptions, input: &[String]) -> Vec<Strin
         _ => {
             if scaled {
                 push(&mut a, "-vf");
-                a.push(format!("scale=iw*{s}:ih*{s}", s = o.scale));
+                a.push(format!("scale={ew}:{eh}"));
             }
         }
     }
@@ -479,7 +500,19 @@ mod tests {
 
         let mut o = opts();
         o.scale = 0.5;
-        assert!(joined(&o).contains("-vf scale=iw*0.5:ih*0.5"));
+        assert!(joined(&o).contains("-vf scale=640:360"), "{}", joined(&o));
+    }
+
+    #[test]
+    fn scaled_size_always_returns_even_dimensions() {
+        // 1080 * 0.7 = 756（偶），1366 * 0.7 = 956.2 → 956；1920 * 0.33 = 633.6 → 632
+        assert_eq!(scaled_size(1920, 1080, 0.5), (960, 540));
+        assert_eq!(scaled_size(1920, 1080, 0.33), (632, 356));
+        assert_eq!(scaled_size(1366, 768, 0.7), (956, 536));
+        // 比例 1.0 原样返回（不能因为偶数对齐动到用户的屏幕分辨率）
+        assert_eq!(scaled_size(1367, 769, 1.0), (1367, 769));
+        // 极端小倍率也不能退化成 0（ffmpeg 会直接报错）
+        assert_eq!(scaled_size(320, 240, 0.01), (2, 2));
     }
 
     #[test]
@@ -510,7 +543,7 @@ mod tests {
         o.scale = 0.5;
         let s = joined(&o);
         // 顺序必须是 scale → nv12 → hwupload，否则多一次自动转换就白费了
-        assert!(s.contains("-vf scale=iw*0.5:ih*0.5,format=nv12,hwupload"), "{s}");
+        assert!(s.contains("-vf scale=640:360,format=nv12,hwupload"), "{s}");
     }
 
     #[test]

@@ -170,6 +170,12 @@ pub enum Quality {
     Bluray,
     /// 自定义码率，配合 `max_bitrate_kbps`。
     Custom,
+    /// **别动画质**：只改帧率/缩放的时候用它，免得把被控端配置里的档位悄悄改掉。
+    ///
+    /// 这是 `VideoSet` 里的「这一项我不表态」，所以被控端收到它必须完全跳过画质那一项。
+    /// 2026-10-30 新增 —— 老被控端不认识这个值（serde 会报未知变体），
+    /// 所以带 `keep` 的 `VideoSet` 要求两端同批升级（v3 本来就只有这一条部署路径）。
+    Keep,
 }
 
 /// 一个码率档位 → (CQ, 码率上限 kbps, 编码器预设)。0 表示不设上限。
@@ -181,6 +187,8 @@ pub fn quality_preset(q: Quality) -> (u8, u32) {
         Quality::Hd => (23, 8_000),
         Quality::Bluray => (18, 20_000),
         Quality::Custom => (23, 0),
+        // Keep 不会走到换算（被控端见到它就整项跳过）；给个中性值只为让 match 穷尽。
+        Quality::Keep => (23, 0),
     }
 }
 
@@ -359,6 +367,32 @@ pub struct HostVideoCfg {
     /// 实测帧率（每秒一次的滑动平均），便于控制端显示。
     #[serde(default)]
     pub actual_fps: f32,
+    /// **实际编码出来的画幅**（`VideoSet.scale` 生效后）。0 = 与 `w`/`h` 相同。
+    ///
+    /// 为什么必须单独给：`w`/`h` 是**被控端屏幕**的尺寸，控制端拿它换算归一化坐标；
+    /// 而解码器是按**编码画幅**启动的（rawvideo 每帧字节数在那一刻定死）。两者在缩放编码时
+    /// 不相等 —— 混成一个字段的结果是画面斜条纹或点击落点整体偏移。
+    /// 老被控端不带这两个字段（反序列化成 0），此时按「编码画幅 = 屏幕尺寸」处理。
+    #[serde(default)]
+    pub enc_w: u32,
+    #[serde(default)]
+    pub enc_h: u32,
+}
+
+impl HostVideoCfg {
+    /// 解码器该按多大画幅启动。`enc_w/enc_h` 缺失（老被控端）时退回屏幕尺寸。
+    pub fn encoded_size(&self) -> (u32, u32) {
+        if self.enc_w == 0 || self.enc_h == 0 {
+            (self.w, self.h)
+        } else {
+            (self.enc_w, self.enc_h)
+        }
+    }
+
+    /// 编码画幅与屏幕尺寸不一致（缩放编码中）。
+    pub fn is_scaled(&self) -> bool {
+        self.encoded_size() != (self.w, self.h)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -574,6 +608,8 @@ mod tests {
             encoder: "libx264".into(),
             chroma: "420".into(),
             actual_fps: 29.7,
+            enc_w: 0,
+            enc_h: 0,
         }));
         rt_h2c(H2C::VideoError { message: "nvenc 初始化失败，已回退 libx264".into() });
         rt_h2c(H2C::Metrics(Metrics { cpu: 12.5, mem_used: 1 << 30, mem_total: 1 << 32, net_rx: 1, net_tx: 2, rtt_ms: 8 }));

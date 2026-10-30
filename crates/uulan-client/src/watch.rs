@@ -98,9 +98,15 @@ pub struct WatchStats {
     pub frames: AtomicU64,
     /// 静默看门狗判死时记录的静默秒数（0 = 会话正常收尾，没被判死）。
     pub silent_s: AtomicU64,
-    /// 最新一条 `VideoCfg` 报的画幅宽 / 高（换过分辨率之后就是新值）。
+    /// 最新一条 `VideoCfg` 报的**屏幕**画幅宽 / 高（换过分辨率之后就是新值）。
     pub cfg_w: AtomicU64,
     pub cfg_h: AtomicU64,
+    /// 最新一条 `VideoCfg` 报的**编码**画幅（缩放编码时与上面两个不同）。
+    pub enc_w: AtomicU64,
+    pub enc_h: AtomicU64,
+    /// 被控端当前**请求**的编码帧率（`VideoCfg.fps`，不是实测值）。
+    /// 和实测帧率分开记：`--fps 15` 有没有生效，只能靠这一项判断。
+    pub cfg_fps: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -120,6 +126,11 @@ pub struct WatchStatsSnapshot {
     pub silent_s: u64,
     pub cfg_w: u32,
     pub cfg_h: u32,
+    /// 编码画幅。缩放编码时就是解码器实际的输出尺寸。
+    pub enc_w: u32,
+    pub enc_h: u32,
+    /// 被控端当前请求的编码帧率（0 = 还没报过）。
+    pub cfg_fps: u32,
 }
 
 impl WatchStats {
@@ -139,6 +150,9 @@ impl WatchStats {
             silent_s: self.silent_s.load(Ordering::Relaxed),
             cfg_w: self.cfg_w.load(Ordering::Relaxed) as u32,
             cfg_h: self.cfg_h.load(Ordering::Relaxed) as u32,
+            enc_w: self.enc_w.load(Ordering::Relaxed) as u32,
+            enc_h: self.enc_h.load(Ordering::Relaxed) as u32,
+            cfg_fps: self.cfg_fps.load(Ordering::Relaxed) as u32,
         }
     }
 
@@ -147,6 +161,14 @@ impl WatchStats {
         (
             self.cfg_w.load(Ordering::Relaxed) as u32,
             self.cfg_h.load(Ordering::Relaxed) as u32,
+        )
+    }
+
+    /// 解码器**当前**的画幅（= 编码画幅）。缩放编码时比 [`WatchStats::size`] 小。
+    pub fn encoded(&self) -> (u32, u32) {
+        (
+            self.enc_w.load(Ordering::Relaxed) as u32,
+            self.enc_h.load(Ordering::Relaxed) as u32,
         )
     }
 
@@ -174,7 +196,14 @@ pub fn apply_video_cfg(stats: &WatchStats, c: &HostVideoCfg, expect: (u32, u32))
     stats.host_fps_x10.store(x10, Ordering::Relaxed);
     stats.cfg_w.store(c.w as u64, Ordering::Relaxed);
     stats.cfg_h.store(c.h as u64, Ordering::Relaxed);
-    c.w != expect.0 || c.h != expect.1
+    let (ew, eh) = c.encoded_size();
+    stats.enc_w.store(ew as u64, Ordering::Relaxed);
+    stats.enc_h.store(eh as u64, Ordering::Relaxed);
+    stats.cfg_fps.store(c.fps as u64, Ordering::Relaxed);
+    // 判据是**编码画幅**：解码器按它启动（rawvideo 每帧字节数在那一刻定死）。
+    // 屏幕尺寸变了但编码画幅没变（比如分辨率变、缩放倍率同时变回去）也该重建，
+    // 因为被控端的抓取区域变了 —— 那是另一种「画面不再是原来那块」。
+    ew != expect.0 || eh != expect.1
 }
 
 /// 一帧已解码的 BGRA 画面。
@@ -281,7 +310,8 @@ impl VideoWatcher {
             }
         };
 
-        if info.w == 0 || info.h == 0 {
+        let (enc_w, enc_h) = info.encoded_size();
+        if enc_w == 0 || enc_h == 0 {
             return Err(WatchError::NoVideoCfg);
         }
 
@@ -293,10 +323,10 @@ impl VideoWatcher {
         })?;
 
         // 第一代解码器在这里起：起不来就当场返回错误，别让调用方拿到一个永远不出帧的 watcher。
-        let first = VideoDecoder::start(&ffmpeg_path, info.w, info.h).await?;
+        let first = VideoDecoder::start(&ffmpeg_path, enc_w, enc_h).await?;
         let stats = Arc::new(WatchStats::default());
         // 首帧的 VideoCfg 里也带实测帧率（刚开播通常是 0，编码器重启时可能已经有值）。
-        apply_video_cfg(&stats, &info, (info.w, info.h));
+        apply_video_cfg(&stats, &info, (enc_w, enc_h));
         let latest_rx = latest_tx.subscribe();
         let started = Instant::now();
         // 这条通道只干一件事：让上层知道「这条会话结束了」。
@@ -487,7 +517,8 @@ async fn supervise(
     // 静默看门狗跨代共用：换分辨率时那 0.3–1 秒的停顿不该重置（也不会，15 秒远大于它）。
     let mut silence = SilenceWatch::new(SILENCE_LIMIT, Instant::now());
     loop {
-        let (fw, fh) = (info.w, info.h);
+        // 解码器按**编码画幅**起：缩放编码时它比屏幕尺寸小，rawvideo 每帧字节数按它算。
+        let (fw, fh) = info.encoded_size();
         let mut decoder = match reuse.take() {
             Some(d) => d,
             None => match VideoDecoder::start(&ffmpeg, fw, fh).await {
@@ -618,7 +649,15 @@ async fn supervise(
                 decoded.abort();
                 let _ = decoder.kill().await;
                 stats.resizes.fetch_add(1, Ordering::Relaxed);
-                info!(w = cfg.w, h = cfg.h, from_w = fw, from_h = fh, "被控端分辨率变了，解码器已重建");
+                info!(
+                    screen_w = cfg.w,
+                    screen_h = cfg.h,
+                    enc_w = cfg.encoded_size().0,
+                    enc_h = cfg.encoded_size().1,
+                    from_w = fw,
+                    from_h = fh,
+                    "被控端分辨率/编码画幅变了，解码器已重建"
+                );
                 info = cfg;
                 stats.ended.store(false, Ordering::Relaxed);
                 // 新码流以关键帧开头（被控端重启编码源必然先出 IDR），不需要再补旧帧
@@ -741,6 +780,8 @@ mod tests {
             encoder: "libx264".into(),
             chroma: "420".into(),
             actual_fps: fps,
+            enc_w: 0,
+            enc_h: 0,
         }
     }
 
@@ -755,6 +796,34 @@ mod tests {
         // 0 表示「还没测出来」，不是「测得是 0」
         assert!(!apply_video_cfg(&s, &cfg(1280, 720, 0.0), (1280, 720)));
         assert_eq!(s.host_fps(), 0.0);
+    }
+
+    #[test]
+    fn encoded_size_falls_back_to_screen_for_old_hosts() {
+        // 老被控端不带 enc_w/enc_h（反序列化成 0）：解码器只能按屏幕尺寸起
+        let mut c = cfg(1280, 720, 30.0);
+        assert_eq!(c.encoded_size(), (1280, 720));
+        assert!(!c.is_scaled());
+        c.enc_w = 0;
+        c.enc_h = 0;
+        assert_eq!(c.encoded_size(), (1280, 720));
+    }
+
+    #[test]
+    fn a_scale_change_rebuilds_the_decoder_but_keeps_screen_size() {
+        // 缩放编码：屏幕还是 1920x1080（输入坐标按它换算），编码画幅变成 960x540
+        let mut c = cfg(1920, 1080, 30.0);
+        c.enc_w = 960;
+        c.enc_h = 540;
+        assert!(c.is_scaled());
+        assert_eq!(c.encoded_size(), (960, 540));
+        let s = WatchStats::default();
+        // 上一代解码器是 1920x1080 —— 编码画幅变了就必须重建，哪怕屏幕尺寸没变
+        assert!(apply_video_cfg(&s, &c, (1920, 1080)), "编码画幅变了要重建解码器");
+        assert_eq!(s.size(), (1920, 1080), "屏幕尺寸（输入换算用）不能被缩放改掉");
+        assert_eq!(s.encoded(), (960, 540));
+        // 已经按 960x540 解码了：同一条 cfg 再来一次不该再重建
+        assert!(!apply_video_cfg(&s, &c, (960, 540)));
     }
 
     #[test]

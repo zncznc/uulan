@@ -34,7 +34,7 @@ use crate::control::{ControlLink, HostStatus, InputSender, InputStats};
 use crate::watch::{Frame, VideoWatcher, WatchError, WatchStats, WatchStatsSnapshot};
 use uulan_protocol::crypto::CryptoError;
 use uulan_protocol::frame::FrameError;
-use uulan_protocol::msg::Cap;
+use uulan_protocol::msg::{Cap, C2H, VideoSet};
 use uulan_protocol::rv::ErrCode;
 use uulan_protocol::rvclient::RvError;
 
@@ -276,6 +276,11 @@ pub struct Plan {
     pub no_input: bool,
     /// 断线后最多连续重连几次（0 = 断线即收工）。
     pub max_reconnects: u32,
+    /// 要下发给被控端的画面参数（`--quality/--fps/--scale/--bitrate`）。`None` = 不动它的配置。
+    ///
+    /// **每条会话都要发一次**：被控端在重连之间会重开编码器，每次仍按它自己的配置起；
+    /// 只在第一条会话发的话，接回之后就悄悄回到原档位了。
+    pub video: Option<VideoSet>,
 }
 
 impl Plan {
@@ -440,6 +445,22 @@ pub async fn open(
     } else {
         None
     };
+
+    // 画面参数：会话一起来就下发。走的是控制通道（已经被加密、已经鉴权），
+    // 被控端收到后按新参数重启编码器，并用一条新的 `VideoCfg` 让这边的解码器跟上。
+    if let Some(v) = plan.video.clone() {
+        if link.input().send(C2H::VideoSet(v.clone())) {
+            info!(
+                quality = ?v.quality,
+                fps = v.fps,
+                scale = v.scale,
+                bitrate_kbps = v.max_bitrate_kbps,
+                "已下发画面参数（被控端会按它重启编码器）"
+            );
+        } else {
+            warn!("画面参数没能下发：控制通道已经关了");
+        }
+    }
 
     if let Some(l) = live {
         l.mark_live(c.host.clone(), watcher.stats(), link.status(), input.clone());
