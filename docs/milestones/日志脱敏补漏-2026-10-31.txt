@@ -1,0 +1,44 @@
+日志脱敏补漏：中继「回收会话」曾打印会话票据原值
+2026-10-31 01:40–02:20 夜间批（alibaba-token-plan-cn / deepseek-v4.1-flash-1017）
+
+怎么发现的
+  本轮在真机上跑 TRACE 测试台（另起的 server:21199 + host + 自有配置，不动正式服务），
+  用同一套检查搜 server/host 日志，命中 5 条：
+    DEBUG uulan_server: 回收会话 session=983e85a06f35fe11b663f7a30e53427a device_id=104149669 …（共 5 条）
+  其余四处（服务端下发「发起会话」、服务端「等待对端拨号 / 通道已配对」、被控端「有人要连进来」、
+  控制端「鉴权通过 / 会话」）早就是 redact::tag() 的 tXXXXXXXX 标签，只有 sweep 这一处漏了。
+  为什么上一轮没抓到：验收脚本只跑短会话，而 sweep 要等 SESSION_TTL=60 s 到期（每 10 s 一拍）
+  才会写这条 —— 那条路径从来没被覆盖过。
+
+改法
+  crates/uulan-server/src/lib.rs 的 sweep：session = %redact::tag(sid)。
+  scripts/verify-log-hygiene.sh：
+    · 新增 ③c「等一轮中继 sweep」（sleep 72）+ 反向断言「中继确实回收过会话」；
+    · 新增四类秘密：一次性临时码原值（另一个进程 --new-temp-code 写、再用它连一次）、
+      注册令牌（host.json.reg_token）、文件正文金丝雀（--put 一个带金丝雀的文件再 --get 回来）、
+      密钥材料形态（key=/psk=/master=/shared= 后跟 ≥16 位十六进制）；
+    · tempcode.out 明确排除：--new-temp-code 的产品输出就是那个码，不是日志。
+
+测得的数字
+  本机（改后，RUST_LOG=trace，verify-log-hygiene.sh）：
+    259 行日志；口令 / 临时码 / 注册令牌 / 终端金丝雀 / 文件金丝雀 / 票据原值 / 密钥材料
+    全部 0 次命中；会话是 tXXXXXXXX 标签；「中继确实回收过会话」通过（③c 不是白等）。
+  本机测试：cargo test --workspace 433 passed / 0 failed / 1 ignored，零警告；
+           cargo build --release 通过。
+  真机（麒麟测试台，改前 server）：
+    ✗ 会话票据原值 5 次命中（server.log「回收会话 session=<32 hex>」）
+    ✓ 口令 / 临时码 / 注册令牌 / 终端金丝雀 / 文件金丝雀 / 密钥材料：0 次命中
+  真机（麒麟测试台，改后 server，同一套检查）：
+    227 行（server+host）；上面 7 类全部 0 次命中；
+    ✓ 会话是标签形态 ✓ 「回收会话 session=t…」也是标签 ✓ 确有终端会话 ✓ 被控端确实上线过
+    ✓ 中继确实回收过会话（sweep 路径被覆盖）
+  真机部署（正式服务）：cargo build --release -p uulan-server -p uulan-host 32.94 s 零警告；
+    install.sh --userland --no-start + KILL 两个单元 → 两单元 active、MainPID 4041048、
+    设备 ID 仍是 805747189；前缀二进制 sha256：
+      uulan-server 9360cb5a7aa33d6bdcddf92dd0693e26d48adffdd0fc9dccf1fcccd818f19697
+      uulan-host   9829a83d8c2c3b83cbf3ded17bc4747fee3a3343ed1ea59af4d4066c52790886
+
+未验
+  · 剪贴板内容的日志脱敏仍只有代码级证据（只记字节数）与真机 :0 无 X 剪贴板所有者工具
+    （没有 xclip/xsel，python3 也没有 tkinter），这一轮**没有**用金丝雀实测剪贴板那条路径。
+  · 旧日志里的历史票据改不回来（journal 已写出的内容仍在，见 DESIGN 已知限制）。
