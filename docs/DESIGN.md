@@ -321,7 +321,7 @@ uulan/
 |---|---|---|---|
 | **M1 骨架** | ✅ | workspace 能编译；protocol 单测过；server 能注册设备并配对转发 | `cargo test` 全绿；本机起 server，两端能配对三条通道并盲转发 |
 | **M2 能看见** | ✅ | 被控端采集编码、控制端解码；端到端视频通路 | 进程内端到端测试全绿；**并在真麒麟 V10 SP1 上跑通**：Windows 控制端看到 1920x1080 真实桌面，首帧 216ms、零丢帧、画面与实机截图相关系数 0.9995。**2026-10-24 补：麒麟控制端也过了同一套验收** —— `uulan-client` 在真机上编得出来（见 M5 小节），headless 29.7 fps / 首帧 256ms / 丢帧 0 / 相关系数 0.9998、MAE 0.50%，开窗 15 s `painted=870` |
-| **M2.5 画好** | ✅ | 窗口 ✅；**键鼠注入 ✅（两端已接，本机全链路 + 真机 XTest 实测）**；**实测帧率上报 ✅**；**剪贴板文本双向 ✅（本机全链路 + 真 Win32；X11 后端已在真机与外部 X 客户端双向验过）**；**分辨率变化重建解码器 ✅（两端都做了，本机全链路实测）** | 能远程操作并双向粘文字、被控端换分辨率后画面自动跟上。真机实测见 `docs/milestones/M3-M4-真机-2026-10-23.txt`（XTest 注入：指针落点精确、keysym 正确、滚轮=按钮5、autorepeat 已还原；X11 剪贴板：与独立 X 客户端双向互通）；**画面参数热更新 ✅（2026-10-30，真机验）**：控制端 `--quality/--bitrate/--fps/--scale` → `C2H::VideoSet` → 被控端当场重启编码器（这条路的被控端一半早就写好了，控制端从来没发过）。 真机：`--quality fast` 码率 9743→**1002 kbps**、`--fps 15` 实测 **15.00 fps**、 `--scale 0.5` 出 **960x540** 帧（与整屏截图盒式降采样相关 **0.9951** / MAE 0.83%）、 带参数跑完再来默认会话回到 1920x1080/30fps（参数不粘滞）。 同一改动修掉「缩放编码必花屏」：`VideoCfg` 新增 `enc_w/enc_h`（编码画幅）与屏幕尺寸分开， 解码器按编码画幅起、输入换算仍按屏幕尺寸 |
+| **M2.5 画好** | ✅ | 窗口 ✅；**键鼠注入 ✅（两端已接，本机全链路 + 真机 XTest 实测）**；**实测帧率上报 ✅**；**剪贴板文本双向 ✅（本机全链路 + 真 Win32；X11 后端已在真机与外部 X 客户端双向验过）**；**分辨率变化重建解码器 ✅（两端都做了；本机全链路 + 2026-11-01 真机实测：会话中途改分辨率不断线、相关系数 0.9999/0.9997）** | 能远程操作并双向粘文字、被控端换分辨率后画面自动跟上。真机实测见 `docs/milestones/M3-M4-真机-2026-10-23.txt`（XTest 注入：指针落点精确、keysym 正确、滚轮=按钮5、autorepeat 已还原；X11 剪贴板：与独立 X 客户端双向互通）；**画面参数热更新 ✅（2026-10-30，真机验）**：控制端 `--quality/--bitrate/--fps/--scale` → `C2H::VideoSet` → 被控端当场重启编码器（这条路的被控端一半早就写好了，控制端从来没发过）。 真机：`--quality fast` 码率 9743→**1002 kbps**、`--fps 15` 实测 **15.00 fps**、 `--scale 0.5` 出 **960x540** 帧（与整屏截图盒式降采样相关 **0.9951** / MAE 0.83%）、 带参数跑完再来默认会话回到 1920x1080/30fps（参数不粘滞）。 同一改动修掉「缩放编码必花屏」：`VideoCfg` 新增 `enc_w/enc_h`（编码画幅）与屏幕尺寸分开， 解码器按编码画幅起、输入换算仍按屏幕尺寸 |
 | **M3 能操作** | ✅ | XTest 注入 + 按键连发处理；`--inject` 脚本化注入（可无人值守验）；uinput 兜底仍未做 | **真机已验**（2026-10-23）：`--inject` 走真链路 → 被控端 XTest → 真 X 服务器；用 `xev`/`xdotool` 当独立判据，坐标/键位/按钮号/配对全对（当次验在另起的 `Xvfb :99` 上）。**同一轮夜间批补验**：`--inject move:640,400` 直接打到真 `:0`，`xdotool getmouselocation` 读到 `x:640 y:400`（注入前 1901,0，已还原）。限制：`:0` 被 UKUI 锁屏挡着 —— **锁屏门禁已真机端到端验过（2026-10-27：被控端首帧报 `locked=true has_desktop=true`、控制端不发键鼠、被控端 `events=0 dropped_locked=0`、真机 xev 独立判据 0 事件）**；**往应用里打字/拖拽已验（2026-10-30，真机 :99）**：Xvfb :99 + xev 独立判据 + 真 Windows 控制端沿真实链路 `--inject type:hello / down+drag / type:中文` → xev 收到 5 个 KeyPress（keysym h e l l o）、ButtonPress×2 / ButtonRelease×2、按住左键的 MotionNotify（state 0x100，(310,250)→(400,310)）、以及动态 Unicode keycode 上的 `U4E2D/U6587`（XLookupString 给出 UTF-8 `e4b8ad/e69687`）；被控端 `events=17 inject_errors=0 dropped_locked=0`、收尾还原键盘映射与 autorepeat。脚本 `scripts/verify-input-app-e2e.sh`（11 断言全过，锁不锁屏都能跑）。**物理 :0 上的键盘/拖拽已验（2026-10-31，真机解锁态）**：`scripts/verify-input-e2e.sh` 4 通过 / 0 失败，独立判据是同一台机器上的 `xev` —— KeyPress=5（keysym 依次 h e l l o）、ButtonPress=2、ButtonRelease=2、MotionNotify=3（按住左键的拖拽移动），打的是用户看得见的真桌面（不是 Xvfb）。见 `docs/milestones/M3-真机输入与剪贴板跨机-2026-10-31.txt`。前提：屏幕得先解锁（UKUI 屏保曾自锁 4 天，`mis` 身份 `pkill -x ukui-screensaver-dialog` / `-default` 即可解开，不需要 root） |
 | **M4 工具齐全** | ✅ | **文件传输 ✅**（列/取/送/建/删/改名/哈希 + 路径沙箱 + sha256，真二进制实测 6 MiB 往返一致）；**端口映射 ✅**（bulk 多路复用 + `--forward`，真二进制实测 256 KiB 单流 + 两条并发流逐字节一致）；**终端（PTY）✅ 本机全链路 + 真机 Linux 侧**（真 `/dev/pts`、termios 默认、winsize 下发、退出码 7 原样回来、SIGHUP→SIGKILL 升级日志）；**终端尺寸跟随 ✅（2026-10-25，真机验：本地窗口变了远端 PTY 跟着变）**；**目录树传输 ✅（2026-10-26：`--put-tree` / `--get-tree`，真机双向 6/6 逐文件 sha256 一致）**、**Windows 控制端控制台原始模式 ✅（2026-10-31：真 ConPTY + 真 cmd.exe 端到端，单键不再等回车、Ctrl-C 打到远端）** | 三项都用真 server + 真被控端 + 真客户端链路验过。终端已上真麒麟验 Linux 独有部分；尺寸跟随真机实测：本地 pty `100x30`→`132x43` 后远端 `stty size` 由 `30 100` 变 `43 132`，`--term-size` 钉死时不跟随（见 `docs/milestones/终端尺寸跟随-2026-10-25.txt`）。**剪贴板整链（Windows↔麒麟）在无人值守会话里验不了 —— 2026-10-31 夜批把上一条记录更正了**：早先记成「缺陷，Win32 后端 `OpenClipboard` 争用没有重试」，**不成立**（重试从 M2.5 首版就有：6×10ms，客户端还每 500ms 轮询，一整条会话上千次尝试仍 0 次成功）。真正原因是**这个会话整体拿不到 Windows 剪贴板**：同一会话里 python(ctypes) 20/20、30/30 次 `OpenClipboard` 全 `ERROR_ACCESS_DENIED(5)`，`clip.exe` 也「拒绝访问」、powershell `Get/Set-Clipboard` 也失败，而 session=1 / desktop=Default / Medium IL / job 无剪贴板 UI 限制 —— 与 uulan 无关，机制未查明。本轮把「能力声明」改成真探测（`Clipboard::probe()` + `last_error()`，错误码当场取、翻成人话），修掉了「恒报发送 0 却查不出原因」这个真问题：改动前控制端统计 `发送 0 / 接收 0（写入失败 1）` + 一句无错误码的 `打不开剪贴板`，改动后直接打印 `剪贴板不可用：OpenClipboard 失败（Win32 错误 5：拒绝访问…）` 且不再声明 `Cap::Clipboard`；统计新增「本机读取失败」。**两个方向仍未验**，要在交互式桌面会话里跑 `scripts/verify-clipboard-cross.sh --device <ID> --password-file <文件>`（新增；第 0 步探不到剪贴板就退出 2 并说明「不要据此判定不通」），判据见 `docs/milestones/剪贴板跨机-环境判定-2026-10-31.txt`。**目录树传输的真机数字**（2026-10-26）：Windows→麒麟 `--put-tree` 6 目录 / 6 文件 / 4194327 字节（含 4 MiB 文件）、0.1s，真机 `find + sha256sum` 6/6 一致；`--get-tree` 拉回 6/6 一致；重复上传幂等；真链接两侧都跳过（`evil.txt -> /etc/passwd`、`sub/up -> ..` 没有被带过去，也没有无限递归），见 `docs/milestones/目录树传输-2026-10-26.txt` |
 | **M5 麒麟落地** | 🔄 | 离线安装包（tar.gz + install.sh + 3 个 systemd 单元）✅、systemd 开机自启 ✅（用户态装实测）、**就地重装（升级）✅**、**安装预检前移 ✅（缺输入不再留半装前缀）**、**控制端可编可装 ✅（`--with-client` 打包 + install.sh 装进前缀，2026-10-24）**、部署文档 ✅（`deploy/README.md` + `docs/DEPLOY-KYLIN.md` 第 13/14/15 节）、**设备目录 ✅（`uulan-client --devices`：中继在线表 ∪ 台账，`--no-list` 可关；2026-10-27 真机验）**、**记住上次连接 ✅（`--last` / `--forget`，`--devices` 给命中的那行标「← 上次」；2026-10-27 真机验）**、**现场自检 ✅（`uulan-host --diagnose`：身份 / 配置可写 / 显示 / XTest / ffmpeg / 中继 / 本机，一条命令 + 退出码；2026-10-31 真机 7 通过 / 1 警告 / 0 失败，16 条脚本断言全过）** | 真机上 `bash install.sh --userland` 一次装通：中继+被控端都是 `enabled`+`active`、`Linger=yes`、`ExecStartPre` 的 uulan-wait-x 真的等到 `:0`；`systemctl --user kill -s KILL` 后 `NRestarts=1` 自动拉起并重新上线；包内二进制取帧 29.6fps、相关系数 0.9969。见 `docs/milestones/M5-麒麟落地-2026-10-23.txt`。**就地升级已验**（2026-10-24）：在服务正在跑的真机上从离线包装重装 → 设备 ID 与 host.json 一字未变、二进制被替换、KILL 后 systemd 拉起的是前缀里的新二进制、再连 29.2fps/丢帧 0；见 `docs/milestones/M5-就地升级与安装预检-2026-10-24.txt`。**控制端在麒麟上编+装已验**（2026-10-24，见 `docs/milestones/麒麟控制端-2026-10-24.txt`）：`--with-client` 的包 3.8M、重装后前缀里多出 `uulan-client`（sha 与包内/`target` 三者一致）。**整机重启后的开机自启 ✅ 已验证（2026-10-31）**：`systemctl reboot` 后 43 秒 SSH 恢复、48 秒时 `uulan-server` 与 `uulan-host` 双双 `active`（host 于开机后 38 秒自行拉起、`NRestarts=0` 没走重试），控制端随即连上并解出 210+ 帧、首帧 212ms、丢包 0 —— 即「无人值守开机 → 自动上线 → 能被控」整条链成立。**未验**：系统装（root，/opt/uulan）路径。2026-10-31 夜批再确认一次：`sudo -n true` 仍报「需要密码」，无人值守下做不了这条。2026-10-25 复核：`systemctl reboot` 对远程会话被 polkit 要求认证（`pkcheck --action-id org.freedesktop.login1.reboot` → *Authorization requires authentication*），mis 又没有免密 sudo，所以**无人值守时重启不了真机**——这条只能等人到机器跟前再验，别写成已验。**设备目录已验（2026-10-27）**：`--devices` 列出真机「805747189 麒麟真机 在线」，`kill -s KILL` 后 1 秒内变「在线 0 / 离线」、6 秒后回到「在线 1 / 空闲 1s」且设备 ID 不变；`--no-list` 用麒麟自己的客户端验过拒绝路径（rc=1 + 说清原因）；画面基线 29.5 fps / 丢帧 0 / 相关系数 0.9989 无回归。见 `docs/milestones/设备目录-2026-10-27.txt`。**记住上次连接已验（2026-10-27）**：Windows 控制端只写 `--last`（无 `--server`、无 `--device`）直接出画面 358 AU / 355 解出 / 丢帧 0 / 首帧 262 ms / 29.6 fps，存的帧与真机截图相关系数 0.9996 / MAE 0.50%；真机自编的控制端上 `client.json` 是 `-rw-------`（涨到 0600）、`--last` 首帧 261 ms / 29.0 fps、`--forget` 后 `--last` 退出码 1；错口令 / 错设备 ID 不但不覆盖旧记录、也不会凭空建文件，口令串在配置与日志里命中 0。见 `docs/milestones/最近连接-2026-10-27.txt` |
@@ -775,6 +775,37 @@ cargo check -p uulan-host --target x86_64-unknown-linux-gnu     0 警告
 - x11grab 在分辨率变小/变大时的真实表现（报错退出？补黑边？只抓左上角？）—— 三种都要试
 - 换分辨率那一瞬间，控制端窗口（winit + softbuffer）改尺寸/重绘是否正常，有没有黑屏一拍
 - 输入映射器换尺寸后，真实点击落点是否与画面一致（多屏 / 缩放场景尤其要看）
+
+#### 真机实测（2026-11-01，`scripts/verify-resolution-follow.sh`，19 条断言全过）
+
+真机上用 `xrandr --fb` 在**会话中途**改帧缓冲（这台机器 VGA/HDMI 都 disconnected，改得动、
+也可逆；脚本的 trap 里恢复原值），控制端连的是**正式服务**（systemd 用户单元 + 正式中继），
+不是测试台：
+
+```
+会话 A  1024x768 → 1280x720（会话第 11 秒改）
+  解码器已重建 screen_w=1280 screen_h=720 from_w=1024 from_h=768
+  887 帧 / 丢帧 0 / 首帧 201ms / 28.8 fps（被控端自报 30.00）/ 4786 kbps
+  存帧 1280x720；与真机 x11grab 截图相关 0.9999 / MAE 0.39%
+  会话「建立 1 条 / 断线接回 0 次」—— 换分辨率没有断线
+会话 B  1280x720 → 1024x768（同上）
+  887 帧 / 丢帧 0 / 首帧 195ms / 29.0 fps / 4811 kbps
+  存帧 1024x768；相关 0.9997 / MAE 0.49%
+```
+
+- 换代边界上会丢几帧（另一次运行里丢了 4 帧，最终这轮 0）—— 按设计丢的，脚本按「≤ 5」断言
+  并把数字打出来，不写「必须 0」那种假严格。
+- **同一个实验抓到并修掉一个真 bug**：`resolve_screen` 只在**进程启动**时探一次，屏幕在进程活着
+  的时候变了以后，**新会话仍按旧尺寸开始** —— 编码器按旧尺寸抓一块当前屏幕之外的区域，ffmpeg
+  当场退出（journal 原样：`视频源结束 frames=0 keyframes=0 bytes=0`），连接横幅也报旧分辨率。
+  现在每个会话开头 `session::refresh_screen()` 重探一次（钉死尺寸用配置、合成源按 spec 重抠、
+  探不到**沿用缓存**而不是退回 1920x1080 兜底），修后 12 分钟 journal 里 `frames=0` 命中 `0`。
+- **仍未验**：①同一条会话里「画面换代 + 输入映射器跟着换尺寸」的真机落点（本机全链路
+  `resize_path.rs` / `resize_host.rs` 覆盖；控制端没有「同一会话既收画面又脚本化注入」的入口，
+  `--inject` 是独立会话）；②窗口（winit + softbuffer）在换代那一刻有没有黑屏一拍 —— 本轮全是
+  headless；③多显示器 / 副屏热插拔（这台机器 `xrandr` 没有连着的输出）。
+- 数字归档：`docs/milestones/分辨率跟随-真机-2026-11-01.txt`；复跑：
+  `bash scripts/verify-resolution-follow.sh --device <ID> --password-file <文件>`。
 
 ### M2.5 完成：画面参数热更新（画质档位 / 帧率 / 编码缩放，2026-10-30）
 
@@ -1999,10 +2030,15 @@ M2 分两层验收，**两层都做完了**。
   也不要把「编码器卡住」误判成断线（那样会反复重连、每次都得换解码器）。
 - **`XInitThreads` 是进程级开关**：被控端现在启动后第一次碰 X 就装上 Xlib 线程锁。
   控制端的 winit 自己也会初始化 Xlib，那边对这一条只能算「顺带」。
-- **键鼠「进应用」的验收走的是真机上的 `Xvfb :99`，不是物理 `:0`**：`:0` 锁屏时按策略不注入，要人在机器跟前解锁才能验；`:99` 用同一个二进制、同一条 XTest 路径，但没有窗管。
-  物理 `:0` 上的键盘与拖拽仍未在解锁态验过（移动/点击已在 2026-10-23 用 `xdotool` 读数验过）。
-- **整机重启后的开机自启仍未验**：没人值守时重启不了真机（polkit 对远程会话要求认证、
-  mis 无免密 sudo）。这条必须有人到机器跟前做，别在报告里写成已验。
+- **键鼠「进应用」的常规验收走真机上的 `Xvfb :99`，不是物理 `:0`**：`:99` 用同一个二进制、
+  同一条 XTest 路径，但没有窗管，所以锁不锁屏都能跑（`scripts/verify-input-app-e2e.sh`）。
+  物理 `:0` 上的键盘与拖拽**已在解锁态验过（2026-10-31：`scripts/verify-input-e2e.sh` 4 通过 /
+  0 失败，判据是同机 `xev`）**；仍没覆盖的是 `:99` 那种「没有窗管时的窗口激活/焦点策略」。
+- **整机重启后的开机自启已在 2026-10-31 验过**（不是「仍未验」）：`systemctl reboot` 后 43 秒
+  SSH 恢复、48 秒时 `uulan-server` 与 `uulan-host` 双双 `active`（host 开机后 38 秒自起、
+  `NRestarts=0`），控制端随即连上解出 210+ 帧。仍然验不了的只有 **root 系统装（`/opt/uulan`）**：
+  mis 没有免密 sudo，`systemctl reboot` 对远程 ssh 会话又被 polkit 要求认证 —— 这两件都只能
+  有人到机器跟前做，别在报告里写成已验。
 
 ## 10. 与参考项目的差异一览
 
