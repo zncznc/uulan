@@ -40,14 +40,18 @@
   轮询里把「读失败」与「内容没变」分开计数（`clip_read_errors`），首条与每 100 条打一次 WARN；
   收工统计改成「剪贴板同步：发送 N / 接收 M（本机写入失败 K / 本机读取失败 R）」。
 
-【本机实测（同一会话，改动前 vs 改动后）】
-改动前（旧 release，22:24）：进会话后统计 `发送 0 / 接收 0（本机写入失败 1）`，
-  日志只有一句 `打不开剪贴板（被其他程序占用）`，没有错误码，看不出是哪一类失败。
-改动后（22:25）：
+【本机实测（同一环境，改动前 vs 改动后）】
+改动前（`uulan-client-head-1031.exe`，10-31 05:15 编的、修复前的二进制，窗口模式连真机 10 秒）：
+  收工统计只有 `剪贴板同步：发送 0 / 接收 0（本机写入失败 0）` —— 不说明为什么，
+  也看不出「本机根本打不开剪贴板」；启动阶段对它只字不提，能力照旧声明。
+  （headless 模式下连这一行都没有，见文末「下一步」。）
+改动后（新二进制，22:25 同一台真机、同一个会话）：
   剪贴板不可用：OpenClipboard 失败（Win32 错误 5：拒绝访问：剪贴板被别的程序长期占着，或被会话策略拦下）
     → 本次会话不同步剪贴板（其它功能照常）
   统计里不再出现「剪贴板同步」行（因为压根没声明这个能力）。
   视频不受影响：解出 355 帧 / 丢帧 0 / 首帧 191ms / 29.6 fps。
+中间那一版（22:24）打的还是「Win32 错误 0：没有错误码」—— 因为取错误码的代码放在重试循环之后，
+被 `thread::sleep` 冲掉了；现在 `open_and()` 每次失败立刻取（提交 7e63239）。
 
 【真机验收（麒麟 192.168.223.15，从 HEAD 8605b2b 部署）】
 - 部署：`git archive HEAD` → scp → `src.in.<ts>`（保留 target/）→
@@ -74,3 +78,18 @@
 - 真机解锁：`pkill -x ukui-screensaver-dialog` 这次**没杀掉** —— 进程 comm 被截断成
   `ukui-screensave`（15 字符），`-x` 按完整名匹配不上。改用 `ps ... | grep screensaver` 取 PID 后
   `kill <PID>`，当场解开（`xdotool getactivewindow getwindowname` → 「桌面」）。
+  验完已把 `org.ukui.screensaver idle-activation-enabled` 改回 `true`。
+
+【下一步（留给下一轮）】
+1. headless 的收工统计里**没有**「输入上报 / 剪贴板同步」这两行（只有窗口模式有）。
+   脚本判「剪贴板到底同没同步」时只能看启动那句「剪贴板不可用」或去跑窗口模式 ——
+   应在 headless 里按会话累加 `ControlLink::stats()` 再打两行。
+2. 跨机剪贴板两个方向：等一个交互式桌面会话跑 `scripts/verify-clipboard-cross.sh`。
+3. M5 root 系统装：需要人到机器跟前（sudo 口令）。
+
+【附带回归】
+- `scripts/verify-window-e2e.sh`：`painted=856`、解出 1759 帧、丢帧 0、首帧 72ms、退出码 0；
+  收工统计已显示新格式「（本机写入失败 0 / 本机读取失败 0）」。
+- 麒麟 X11 剪贴板后端回归（改了 `Clipboard` trait 之后）：
+  `cargo build --release --example x11_clip_probe -p uulan-clip` + `DISPLAY=:0 x11_clip_probe REGRESS-CLIP-9f2c 1`
+  → `backend=x11 available=true` / `SET-OK <<<REGRESS-CLIP-9f2c>>>`（owner 侧仍能应答）。
