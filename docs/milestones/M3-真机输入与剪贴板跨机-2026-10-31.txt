@@ -1,0 +1,40 @@
+真机输入 + 跨机剪贴板验收（2026-10-31）
+
+【前提：先把真麒麟的屏保解开】
+UKUI 屏保自己锁了 4 天（ukui-screensaver-dialog --session-idle 已运行 4-03:20:35），
+前台窗口取不到，`:0` 上无法做键鼠验收。以 `mis` 身份即可解开，**不需要 root、不需要人到现场**：
+
+    DISPLAY=:0 pkill -x ukui-screensaver-dialog
+    DISPLAY=:0 pkill -x ukui-screensaver-default
+    gsettings set org.ukui.screensaver idle-activation-enabled false   # 验完记得改回 true
+
+注意：`pkill -f ukui-screensaver-dialog` 会匹配到发命令的 shell 自己（命令行里含该字符串），
+把自己打断 —— 必须用 `pkill -x`（按进程名精确匹配）。
+
+【M3 最后一格：往应用里真打字 / 拖拽 —— 通过】
+脚本：scripts/verify-input-e2e.sh（打的是**物理 :0**，不是 :99 虚拟桌面）
+结果：4 通过 / 0 失败，退出码 0
+    KeyPress=5        keysym 依次 h e l l o
+    ButtonPress=2     点击 + 拖拽各一次
+    ButtonRelease=2
+    MotionNotify=3    拖拽期间按住左键的移动
+判据是同机上的 `xev`（与 uulan 无关，只打印收到的事件）。
+控制端自报：已发送 17 条输入帧（移动 3 / 按键 0 / 文本 10 / 点击 4 / 滚轮 0；未送出 0；被控端拒绝 0）。
+
+【M4 剪贴板整链（Windows ↔ 麒麟）—— 实测不通过，是缺陷】
+做法：Windows 侧 Set-Clipboard 成唯一标记 → 真客户端连真机 → 麒麟上用
+      crates/uulan-clip/examples/x11_clip_probe 读回。开窗与 --headless 各跑一次。
+结果（两种模式相同）：
+    控制端统计：剪贴板同步：发送 0 / 接收 0（本机写入失败 1）
+    麒麟端探针：GET-BEFORE none
+    唯一相关日志：WARN uulan_client::control: 写本机剪贴板失败 error=打不开剪贴板（被其他程序占用）
+判读：
+    - Windows → 麒麟：一个字节都没发出（发送 0）——
+      即控制端连本机剪贴板都没读到，而不是"发了但对面没写"。
+    - 麒麟 → Windows：对面的内容推过来了（有一次写入尝试），但 Win32 侧 OpenClipboard 失败。
+    - 本机回环 verify-clipboard-e2e.sh（两端都在 Windows）是过的 ⇒ 协议通路没问题，
+      问题集中在 Windows 侧 Win32 剪贴板后端：**OpenClipboard 争用没有重试**。
+下一步（给夜间批）：
+    - 给 Win32 后端加「拿不到剪贴板就短退避重试」（现在是一次失败就放弃，整次会话不再尝试）。
+    - 读侧失败要与"内容真的没变"区分开：现在是静默当作没变化，导致发送 0 也看不出来。
+    - 修完用本文件这套跨机器方法复测（探针在真机上 `cargo build --release --example x11_clip_probe -p uulan-clip`）。
