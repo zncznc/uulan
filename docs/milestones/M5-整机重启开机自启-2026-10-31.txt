@@ -1,0 +1,31 @@
+M5 最后一格：整机重启后的开机自启（2026-10-31，真麒麟）
+
+【前提状态】
+两个 unit 均 enabled、Linger=yes；lightdm 未配 autologin（grep /etc/lightdm 无 autologin）；
+mis 无免密 sudo（用口令执行 `systemctl reboot`）。
+
+【过程与结果】
+    18:46:29  下发 reboot
+    18:46:36  离线（7s）
+    18:47:12  SSH 恢复（43s）
+    18:47:17  uulan-server / uulan-host 双双 active（up 0 minutes）
+    uulan-host 的 ExecMainStartTimestamp = 18:47:07（开机后 38 秒），NRestarts=0 —— 没走「等 X 超时再重试」那条路
+    随后用控制端连：exit=0，210+ 帧解出，首帧 212ms，丢包 0，实测 29.1 fps
+⇒ 「无人值守开机 → 中继+被控端自己起来 → 控制端能连上并出画面」整条链成立。
+
+【同一轮附带查到的两个环境事实（都不是 uulan 的缺陷）】
+1. **重启后 :0 是 1024x768**。查 `xrandr --query`：
+       VGA-0 disconnected primary
+       HDMI-A-0 disconnected
+   即**这台机器当前没接显示器**，X 用默认的 1024x768 帧缓冲。重启前那次是 1920x1080，
+   说明当时有显示输出。分辨率变化不影响远控（M2.5 的解码器重建本来就是干这个的）。
+2. **桌面一起来就是锁着的**：`ukui-screensaver-dialog --lock-startup`。
+   远控连上去看到的就是锁屏 —— 这是 DESIGN.md 里已写明的已知限制（不做锁屏解锁）。
+   解锁仍按既定做法：`pkill -x ukui-screensaver-dialog; pkill -x ukui-screensaver-default`
+   （本次实测：杀掉后 `pgrep -cx` = 0，但因为没有显示器，`getactivewindow` 仍报错，属环境所致）。
+   取完证据后已把 `org.ukui.screensaver idle-activation-enabled` 改回 true。
+
+【没做的一项】
+root 系统装（/opt/uulan）**本轮没做**。原因：系统装会再起一份 uulan-server，
+与当前用户态装共用 21116 会端口冲突，可能把正在工作的那套弄坏。
+要做应当先在安装脚本里加 `--no-start`（只落文件不启服务），验完再卸。
