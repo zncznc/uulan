@@ -702,7 +702,18 @@ async fn main() -> Result<()> {
         }
         false
     } else {
-        uulan_clip::default_clipboard(None).available()
+        // 声明能力前**真开一次剪贴板**：只问「平台支持吗」是不够的 ——
+        // 无人值守/受限会话里整条会话都可能被拒（连 clip.exe 都 拒绝访问），
+        // 那时旧写法照样声明 Cap::Clipboard，结果统计永远是「发送 0」而查不出原因。
+        let mut cb = uulan_clip::default_clipboard(None);
+        match cb.probe() {
+            Ok(()) => true,
+            Err(why) => {
+                println!("剪贴板不可用：{why}");
+                println!("  → 本次会话不同步剪贴板（其它功能照常）");
+                false
+            }
+        }
     };
     let mut caps: Vec<Cap> = vec![];
     if clip_ok {
@@ -913,8 +924,8 @@ async fn main() -> Result<()> {
             si.moves, si.keys, si.chars, si.buttons, si.wheels, si.dropped, si.host_errors
         );
         println!(
-            "剪贴板同步：发送 {} / 接收 {}（本机写入失败 {}）",
-            si.clips_sent, si.clips_recv, si.clip_errors
+            "剪贴板同步：发送 {} / 接收 {}（本机写入失败 {} / 本机读取失败 {}）",
+            si.clips_sent, si.clips_recv, si.clip_errors, si.clip_read_errors
         );
         let hs = live.status().snapshot();
         println!(

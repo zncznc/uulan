@@ -41,6 +41,11 @@ pub struct InputStats {
     pub clips_recv: AtomicU64,
     /// 写本地剪贴板失败次数。
     pub clip_errors: AtomicU64,
+    /// 读本地剪贴板失败次数（打不开，不是「内容没变」）。
+    ///
+    /// 单独计这个数：以前「发送 0」既可能是「本机剪贴板一直是旧的」，
+    /// 也可能是「根本读不到」，现场分不清（2026-10-31 就被误判成后端没重试）。
+    pub clip_read_errors: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -55,6 +60,7 @@ pub struct InputStatsSnapshot {
     pub clips_sent: u64,
     pub clips_recv: u64,
     pub clip_errors: u64,
+    pub clip_read_errors: u64,
 }
 
 impl InputStatsSnapshot {
@@ -76,6 +82,7 @@ impl InputStats {
             clips_sent: self.clips_sent.load(Ordering::Relaxed),
             clips_recv: self.clips_recv.load(Ordering::Relaxed),
             clip_errors: self.clip_errors.load(Ordering::Relaxed),
+            clip_read_errors: self.clip_read_errors.load(Ordering::Relaxed),
         }
     }
 }
@@ -346,6 +353,21 @@ impl ControlLink {
                     _ = tick.tick() => {
                         let Some(c) = clip.as_mut() else { continue };
                         let cur = c.get_text();
+                        // 读失败与「内容没变」必须分开：`None` 本身两者都可能，
+                        // 后端能给出原因时才算「读失败」并计数。
+                        if cur.is_none() {
+                            if let Some(why) = c.last_error() {
+                                let n = st.clip_read_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                                // 每 100 次才再打一条，否则 2Hz 会把日志刷满。
+                                if n == 1 || n % 100 == 0 {
+                                    warn!(
+                                        error = %why,
+                                        count = n,
+                                        "读本机剪贴板失败（不是「内容没变」；本次会话的发送数会一直是 0）"
+                                    );
+                                }
+                            }
+                        }
                         let Some(text) = clip_sync.outbound(cur.as_deref()) else {
                             continue;
                         };

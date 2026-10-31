@@ -44,6 +44,27 @@ pub trait Clipboard: Send {
     /// 是否真的能读写剪贴板。`false` 时两端都不该声明 `Cap::Clipboard`。
     fn available(&self) -> bool;
 
+    /// **真开一次剪贴板**，回答「现在能不能用」。
+    ///
+    /// 与 [`Clipboard::available`] 的区别：那个只回答「平台/后端支持吗」。
+    /// Windows 上会话被策略拦、或别的程序长期占着剪贴板时，`available` 为真而
+    /// 读写全失败 —— 现场表现是「发送 0」却查不出原因。声明能力前必须先 `probe`。
+    fn probe(&mut self) -> Result<(), String> {
+        if self.available() {
+            Ok(())
+        } else {
+            Err(format!("{} 后端不可用", self.name()))
+        }
+    }
+
+    /// 最近一次读写失败的原因（成功时清空）。默认不报告。
+    ///
+    /// 读侧尤其需要它：`get_text` 返回 `None` 既可能是「剪贴板是空的」，
+    /// 也可能是「打不开」。两者混在一起，「发送 0」就永远说不清。
+    fn last_error(&self) -> Option<String> {
+        None
+    }
+
     /// 读当前文本。`None` = 读不到（不是「剪贴板是空的」）。
     fn get_text(&mut self) -> Option<String>;
 
@@ -76,6 +97,10 @@ impl Clipboard for NoClipboard {
 
     fn available(&self) -> bool {
         false
+    }
+
+    fn probe(&mut self) -> Result<(), String> {
+        Err(self.reason.clone())
     }
 
     fn get_text(&mut self) -> Option<String> {
