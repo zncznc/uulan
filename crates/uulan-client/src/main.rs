@@ -1086,6 +1086,10 @@ async fn run_headless(
     let mut reconnects = 0u32;
     let mut totals = session::Totals::default();
     let mut report: Option<Report> = None;
+    // 输入/剪贴板计数跨会话累加：headless 的收工统计也要报这两行 ——
+    // `scripts/verify-clipboard-cross.sh` 与夜批判「剪贴板到底同没同步」看的就是它们，
+    // 而以前只有窗口模式会打（脚本在 headless 下永远抓不到，等于断言写死成失败）。
+    let mut ins = uulan_client::control::InputStatsSnapshot::default();
     // 重连次数用尽 = 这条会话再也不会回来。窗口模式**已经在**这条路径上 `exit(4)`；
     // headless 一直到 2026-10-30 都还是「打一句不再重连、照常出统计、退出码 0」——
     // 脚本/夜批分不清「跑完了」和「画面早冻住了」，所以这里也要按失败收尾。
@@ -1133,6 +1137,8 @@ async fn run_headless(
                     let (rep, done) =
                         watch_session(args, deadline, &mut o, &mut count, &mut last_frame, sessions == 1)
                             .await;
+                    // 必须在 close 之前取：close 会把 link 吃掉，之后的计数就没了。
+                    ins.accumulate(&o.link.stats().snapshot());
                     o.link.close("控制端准备重连").await;
                     totals.add(&rep.snap);
                     fresh_frames = rep.snap.decoded > 0;
@@ -1289,6 +1295,16 @@ async fn run_headless(
             println!("  请求帧率   : {} fps（被控端当前编码帧率）", s.cfg_fps);
         }
         println!("  解码器重建 : {} 次（被控端换过分辨率）", s.resizes);
+        // 这两行以前只有窗口模式才有：headless 是脚本/夜批唯一的观测面，
+        // 少了它们「剪贴板发送 0」在日志里就无迹可寻。
+        println!(
+            "  输入上报   : 移动 {} / 按键 {} / 文本 {} / 点击 {} / 滚轮 {}（未送出 {}；被控端拒绝 {}）",
+            ins.moves, ins.keys, ins.chars, ins.buttons, ins.wheels, ins.dropped, ins.host_errors
+        );
+        println!(
+            "  剪贴板同步 : 发送 {} / 接收 {}（本机写入失败 {} / 本机读取失败 {}）",
+            ins.clips_sent, ins.clips_recv, ins.clip_errors, ins.clip_read_errors
+        );
         println!("  会话       : 建立 {} 条 / 断线接回 {} 次", sessions, reconnects);
     }
 

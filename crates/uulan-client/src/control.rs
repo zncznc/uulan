@@ -67,6 +67,21 @@ impl InputStatsSnapshot {
     pub fn total(&self) -> u64 {
         self.moves + self.keys + self.chars + self.buttons + self.wheels
     }
+
+    /// 把另一份计数累加进来（headless 跨会话汇总用：每条会话一个 `ControlLink`）。
+    pub fn accumulate(&mut self, o: &InputStatsSnapshot) {
+        self.moves += o.moves;
+        self.keys += o.keys;
+        self.chars += o.chars;
+        self.buttons += o.buttons;
+        self.wheels += o.wheels;
+        self.dropped += o.dropped;
+        self.host_errors += o.host_errors;
+        self.clips_sent += o.clips_sent;
+        self.clips_recv += o.clips_recv;
+        self.clip_errors += o.clip_errors;
+        self.clip_read_errors += o.clip_read_errors;
+    }
 }
 
 impl InputStats {
@@ -436,6 +451,28 @@ mod tests {
         let n = s.snapshot();
         assert_eq!((n.moves, n.keys), (1, 1));
         assert_eq!(n.total(), 2, "Ping 不属于输入，不该计数");
+    }
+
+    /// headless 跨会话汇总靠它：两段会话的计数必须逐项相加，别漏字段。
+    #[test]
+    fn snapshot_accumulates_every_field() {
+        let mut a = InputStatsSnapshot {
+            moves: 1, keys: 2, chars: 3, buttons: 4, wheels: 5, dropped: 6,
+            host_errors: 7, clips_sent: 8, clips_recv: 9, clip_errors: 10,
+            clip_read_errors: 11,
+        };
+        let b = InputStatsSnapshot {
+            moves: 100, keys: 200, chars: 300, buttons: 400, wheels: 500, dropped: 600,
+            host_errors: 700, clips_sent: 800, clips_recv: 900, clip_errors: 1000,
+            clip_read_errors: 1100,
+        };
+        a.accumulate(&b);
+        assert_eq!(a.moves, 101);
+        assert_eq!(a.clips_sent, 808);
+        assert_eq!(a.clips_recv, 909);
+        assert_eq!(a.clip_errors, 1010);
+        assert_eq!(a.clip_read_errors, 1111);
+        assert_eq!(a.total(), 101 + 202 + 303 + 404 + 505);
     }
 
     #[test]

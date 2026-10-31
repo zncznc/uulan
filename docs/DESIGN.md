@@ -681,6 +681,8 @@ Windows 剪贴板（`OpenClipboard` 一律 `ERROR_ACCESS_DENIED(5)`，连 `clip.
 - **`None` 必须能分清「空」与「打不开」**：轮询分支里 `cur.is_none()` 且 `last_error()` 非空时
   才计 `clip_read_errors`，首条与每 100 条打一次 WARN（2Hz 轮询，不加节流会把日志刷满）。
 - 收工统计：`剪贴板同步：发送 N / 接收 M（本机写入失败 K / 本机读取失败 R）`。
+  **headless 也要打这两行**（`InputStatsSnapshot::accumulate` 跨会话累加）：脚本与夜批唯一看得见的
+  就是 headless 的收工统计，以前只有窗口模式有这两行，等于校验脚本永远抓不到目标行。
 - 跨机验收脚本 `scripts/verify-clipboard-cross.sh`（新增）：第 0 步先自证「本会话能读写剪贴板」，
   不能就**退出 2** 并明说「不要据此判定不通」；两个方向各一条断言 +
   控制端统计「发送/接收 ≥ 1」。它必须跑在交互式桌面会话里（无人值守会话拿不到 Windows 剪贴板）。

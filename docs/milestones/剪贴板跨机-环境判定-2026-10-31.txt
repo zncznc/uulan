@@ -81,9 +81,11 @@
   验完已把 `org.ukui.screensaver idle-activation-enabled` 改回 `true`。
 
 【下一步（留给下一轮）】
-1. headless 的收工统计里**没有**「输入上报 / 剪贴板同步」这两行（只有窗口模式有）。
-   脚本判「剪贴板到底同没同步」时只能看启动那句「剪贴板不可用」或去跑窗口模式 ——
-   应在 headless 里按会话累加 `ControlLink::stats()` 再打两行。
+1. ~~headless 收工统计没有「输入上报 / 剪贴板同步」两行~~ —— **本轮已补**（提交见下）：
+   跨会话累加 `InputStatsSnapshot::accumulate`，headless 收工统计现在也打这两行。
+   实测（`--headless --seconds 8`）：`输入上报 : 移动 0 / …`、`剪贴板同步 : 发送 0 / 接收 0
+   （本机写入失败 0 / 本机读取失败 0）`。`scripts/verify-clipboard-cross.sh` 依赖的正是这一行，
+   之前它在 headless 下永远抓不到 —— 那才是脚本真正会假红的地方。
 2. 跨机剪贴板两个方向：等一个交互式桌面会话跑 `scripts/verify-clipboard-cross.sh`。
 3. M5 root 系统装：需要人到机器跟前（sudo 口令）。
 
