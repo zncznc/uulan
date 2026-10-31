@@ -1776,6 +1776,44 @@ pub async fn resolve_screen(capture: &CaptureInput, cfg: &HostConfig) -> Screen 
     }
 }
 
+/// 会话开头重探一次屏幕尺寸（缓存可能已经过期）。
+///
+/// [`resolve_screen`] 只在**进程启动**时跑一次，结果被之后所有会话复用。可屏幕是会在
+/// 进程活着的期间变的：有人改了分辨率、插拔显示器、缩放了虚拟机窗口。缓存过期时的代价
+/// 很具体 —— `HostInfo` 把旧尺寸告诉控制端（它的输入映射、首帧画幅都按这个算），
+/// 编码器又按旧尺寸开 x11grab，抓到一块比当前屏幕大的区域**当场退出**
+/// （2026-11-01 真机日志原样是「视频源结束 frames=0 bytes=0」），只能等 1 秒探针再重开。
+///
+/// 探不到就**沿用缓存**，不要退回 [`resolve_screen`] 的 1920x1080 兜底：
+/// 一次 `xdpyinfo` 失败不该把本来正确的会话尺寸改错。
+pub async fn refresh_screen(capture: &CaptureInput, cfg: &HostConfig, cached: Screen) -> Screen {
+    if cfg.screen_width > 0 && cfg.screen_height > 0 {
+        return Screen { w: cfg.screen_width, h: cfg.screen_height };
+    }
+    if let Some(disp) = capture.display() {
+        return match crate::capture::detect_x11_screen(&disp).await {
+            Some((w, h)) => {
+                if (w, h) != (cached.w, cached.h) {
+                    info!(
+                        from_w = cached.w,
+                        from_h = cached.h,
+                        to_w = w,
+                        to_h = h,
+                        "屏幕尺寸与进程启动时缓存的不同，本会话按新尺寸开始"
+                    );
+                }
+                Screen { w, h }
+            }
+            None => cached,
+        };
+    }
+    // 合成源：spec 能抠到就用它（配置/命令行可能被换过），抠不到沿用缓存。
+    match capture {
+        CaptureInput::Lavfi { spec, .. } => parse_size_from_spec(spec).unwrap_or(cached),
+        _ => cached,
+    }
+}
+
 /// 从 lavfi 的 spec 里抠 `size=WxH`。
 fn parse_size_from_spec(spec: &str) -> Option<Screen> {
     let idx = spec.find("size=")? + "size=".len();
@@ -2285,6 +2323,34 @@ mod tests {
         cfg.screen_height = 900;
         let s = resolve_screen(&cap, &cfg).await;
         assert_eq!((s.w, s.h), (1600, 900));
+    }
+
+    #[tokio::test]
+    async fn refresh_screen_honours_a_pinned_size_without_probing() {
+        let cap = CaptureInput::parse("x11::77.0").unwrap();
+        let mut cfg = HostConfig::default();
+        cfg.screen_width = 1600;
+        cfg.screen_height = 900;
+        let s = refresh_screen(&cap, &cfg, Screen { w: 1024, h: 768 }).await;
+        assert_eq!((s.w, s.h), (1600, 900));
+    }
+
+    #[tokio::test]
+    async fn refresh_screen_follows_a_changed_synthetic_spec() {
+        let cap = CaptureInput::parse("lavfi:testsrc2=size=800x600:rate=30").unwrap();
+        let cfg = HostConfig::default();
+        let s = refresh_screen(&cap, &cfg, Screen { w: 1280, h: 720 }).await;
+        assert_eq!((s.w, s.h), (800, 600));
+    }
+
+    #[tokio::test]
+    async fn refresh_screen_keeps_the_cached_size_when_probing_fails() {
+        // `:77` 不存在（Windows 上连 xdpyinfo 都没有）—— 探测必然失败，
+        // 必须沿用缓存，而不是退回 resolve_screen 的 1920x1080 兜底。
+        let cap = CaptureInput::parse("x11::77.0").unwrap();
+        let cfg = HostConfig::default();
+        let s = refresh_screen(&cap, &cfg, Screen { w: 1024, h: 768 }).await;
+        assert_eq!((s.w, s.h), (1024, 768));
     }
 
     #[tokio::test]

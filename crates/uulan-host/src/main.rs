@@ -297,7 +297,7 @@ async fn serve_relay(
     state: &Arc<HostState>,
     ffmpeg: &PathBuf,
     cfg: &HostConfig,
-    screen: Screen,
+    mut screen: Screen,
     encoder: Encoder,
     once: bool,
     attempt: &mut u32,
@@ -402,10 +402,16 @@ async fn serve_relay(
             ToEndpoint::Incoming { session, client_name, client_addr } => {
                 // 票据只在内存/线上有意义，日志里留不可逆标签（与服务端那三条能对上）。
                 info!(session = %uulan_protocol::redact::tag(&session), %client_name, %client_addr, "有人要连进来");
+                // 每个会话开头重探一次屏幕尺寸：进程启动时缓存的那个值可能已经过期
+                // （有人改了分辨率 / 换了显示器 / 缩放了虚拟机窗口）。过期时的代价很具体：
+                // Hello 把旧尺寸报给控制端，编码器又按旧尺寸抓一块不存在的区域当场退出
+                // （真机日志就是「视频源结束 frames=0」）。探不到就沿用缓存。
+                let snap = state.snapshot();
+                screen = session::refresh_screen(&snap.capture, &snap, screen).await;
                 let params = SessionParams {
                     state: state.clone(),
                     ffmpeg: ffmpeg.clone(),
-                    capture: state.snapshot().capture,
+                    capture: snap.capture,
                     screen,
                     encoder,
                     settings,
