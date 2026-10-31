@@ -802,8 +802,10 @@ cargo check -p uulan-host --target x86_64-unknown-linux-gnu     0 警告
   探不到**沿用缓存**而不是退回 1920x1080 兜底），修后 12 分钟 journal 里 `frames=0` 命中 `0`。
 - **仍未验**：①同一条会话里「画面换代 + 输入映射器跟着换尺寸」的真机落点（本机全链路
   `resize_path.rs` / `resize_host.rs` 覆盖；控制端没有「同一会话既收画面又脚本化注入」的入口，
-  `--inject` 是独立会话）；②窗口（winit + softbuffer）在换代那一刻有没有黑屏一拍 —— 本轮全是
-  headless；③多显示器 / 副屏热插拔（这台机器 `xrandr` 没有连着的输出）。
+  `--inject` 是独立会话）；②窗口在换代那一刻**有没有黑屏一拍** —— 窗口模式跨两次换代照常呈现
+  （`painted=946`、`窗口已就绪` 只出现一次、解出 881 帧 / 丢帧 0、退出码 0），但「黑屏一拍」是
+  观感，帧计数看不出来，没人眼看过就仍算未验；③多显示器 / 副屏热插拔（这台机器 `xrandr` 没有
+  连着的输出）。
 - 数字归档：`docs/milestones/分辨率跟随-真机-2026-11-01.txt`；复跑：
   `bash scripts/verify-resolution-follow.sh --device <ID> --password-file <文件>`。
 
