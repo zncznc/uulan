@@ -143,6 +143,7 @@ pub async fn run(
     check_display(&mut r, &cfg.capture, display.as_deref()).await;
     check_xtest(&mut r, &cfg.capture, display.as_deref());
     check_ffmpeg(&mut r, ffmpeg_arg, encoder).await;
+    check_audio(&mut r, cfg);
     check_relay(&mut r, &cfg.server).await;
     check_host(&mut r);
     r
@@ -344,6 +345,23 @@ async fn check_ffmpeg(r: &mut Report, ffmpeg_arg: Option<&Path>, encoder: Encode
             format!("{detail}，但编码器列表里没有 {want}"),
             "这个 ffmpeg 没带该编码器；换一个，或用 --encoder x264（软件编码哪台都能跑）。",
         );
+    }
+}
+
+/// 音频（M7）：这台机器能不能把「正在放的声音」抓出来。
+///
+/// **只读**：显式配了源就只解析配置；没配就跑一次 `pactl` 的本地 IPC 查询，
+/// 不拉起 ffmpeg、不碰声卡 —— 自检不该把用户的音频设备吵醒。
+///
+/// 抓不到是 `WARN` 不是 `FAIL`：画面/键鼠/文件全都照常，只是没有声音。
+fn check_audio(r: &mut Report, cfg: &HostConfig) {
+    match crate::audio::probe_source(cfg.audio_source.as_deref()) {
+        Ok(src) => r.ok("音频", format!("采集源 {src}（Opus 64 kbps / 48 kHz 立体声）")),
+        Err(e) => r.warn(
+            "音频",
+            format!("没有可用的音频采集源：{e}"),
+            "要被控端的声音就得有 PulseAudio 的输出 monitor（桌面版麒麟自带）；不要声音可以忽略这一项。",
+        ),
     }
 }
 

@@ -379,6 +379,14 @@ pub async fn run(
     );
 }
 
+/// 给自检用（`--diagnose`）：只回答「能不能抓」，不拉进程、不碰声卡。
+pub fn probe_source(source: Option<&str>) -> Result<String, String> {
+    match source {
+        Some(s) => AudioSource::parse(s).map(|v| v.describe()),
+        None => autodetect().map(|v| v.describe()),
+    }
+}
+
 /// 给测试与自检用：本机能不能起音频（源能解析出来 + ffmpeg 在）。
 pub fn probe(ffmpeg: &std::path::Path, source: Option<&str>) -> Result<String, String> {
     let src = match source {
