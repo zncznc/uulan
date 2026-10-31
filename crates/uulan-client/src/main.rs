@@ -810,14 +810,22 @@ async fn main() -> Result<()> {
         while Instant::now() < deadline {
             tokio::time::sleep(Duration::from_secs(1)).await;
             let s = st.snapshot();
+            // `rtt=` 是被控端报的那个（恒 0，它在协议里如实填 0），`rtt_local=` 才是这条
+            // 链路真的往返 —— 控制端自己发 Ping 量的。还没量到时打 `-`，不写假的 0.0。
+            let rtt_local = if s.rtt_samples > 0 {
+                format!("{:.1}ms", s.rtt_local_us as f64 / 1000.0)
+            } else {
+                "-".to_string()
+            };
             println!(
-                "locked={} has_state={} cpu={:.1}% mem={}/{}MB rtt={}ms metrics={} changes={}",
+                "locked={} has_state={} cpu={:.1}% mem={}/{}MB rtt={}ms rtt_local={} metrics={} changes={}",
                 s.locked,
                 s.known,
                 s.cpu_pct_x100 as f64 / 100.0,
                 s.mem_used_mb,
                 s.mem_total_mb,
                 s.rtt_ms,
+                rtt_local,
                 s.metrics_recv,
                 s.state_changes
             );

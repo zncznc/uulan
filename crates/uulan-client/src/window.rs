@@ -59,6 +59,9 @@ pub struct Overlay {
     /// 被控端内存（MB）。`mem_total_mb == 0` = 还没收到过指标。
     pub mem_used_mb: u64,
     pub mem_total_mb: u64,
+    /// 控制端自测的链路往返（微秒）与采样次数（0 = 还没测出来）。
+    pub rtt_local_us: u64,
+    pub rtt_samples: u64,
     /// 被控端已锁屏 —— 标题上要写明「键鼠已暂停」，否则用户只会觉得「键鼠坏了」。
     pub locked: bool,
     /// 会话阶段（重连中 / 已停止重连）。画面冻住时这是标题上唯一的解释。
@@ -91,6 +94,9 @@ impl Overlay {
                 self.mem_used_mb as f64 / 1024.0,
                 self.mem_total_mb as f64 / 1024.0
             ));
+        }
+        if self.rtt_samples > 0 {
+            s.push_str(&format!(" · 延迟 {:.1}ms", self.rtt_local_us as f64 / 1000.0));
         }
         if self.locked {
             // 放在最后：锁屏是「现在为什么点不动」的直接答案，最该一眼看到。
@@ -328,6 +334,8 @@ impl App {
             self.overlay.cpu_pct = h.cpu_pct_x100 as f32 / 100.0;
             self.overlay.mem_used_mb = h.mem_used_mb;
             self.overlay.mem_total_mb = h.mem_total_mb;
+            self.overlay.rtt_local_us = h.rtt_local_us;
+            self.overlay.rtt_samples = h.rtt_samples;
             // 没收到过 SystemState 就当作「没锁」：老版本被控端不发这条，
             // 不能因为它不说话就把用户的键鼠标成暂停。
             self.overlay.locked = h.known && h.locked;

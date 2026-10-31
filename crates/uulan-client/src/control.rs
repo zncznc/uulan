@@ -119,6 +119,11 @@ pub struct HostStatus {
     mem_used_mb: AtomicU64,
     mem_total_mb: AtomicU64,
     rtt_ms: AtomicU64,
+    /// 控制端**自己**量的链路往返时延（微秒）：`C2H::Ping` → `H2C::Pong`。
+    /// 被控端报的 `rtt_ms` 恒为 0（它没有可比的时钟），所以「延迟多少」只能这边量。
+    rtt_local_us: AtomicU64,
+    /// 量到过多少次。0 = 还没测出来（标题上就不显示，免得写个假 0.0ms）。
+    rtt_samples: AtomicU64,
     /// 收到多少条 `Metrics`。
     metrics_recv: AtomicU64,
     /// 状态变化次数（每次 `SystemState` 变化 +1）。
@@ -135,6 +140,9 @@ pub struct HostStatusSnapshot {
     pub mem_used_mb: u64,
     pub mem_total_mb: u64,
     pub rtt_ms: u64,
+    /// 控制端自测的往返时延（微秒）与采样次数。
+    pub rtt_local_us: u64,
+    pub rtt_samples: u64,
     pub metrics_recv: u64,
     pub state_changes: u64,
     pub dropped_locked: u64,
@@ -153,6 +161,8 @@ impl HostStatus {
             mem_used_mb: self.mem_used_mb.load(Ordering::Relaxed),
             mem_total_mb: self.mem_total_mb.load(Ordering::Relaxed),
             rtt_ms: self.rtt_ms.load(Ordering::Relaxed),
+            rtt_local_us: self.rtt_local_us.load(Ordering::Relaxed),
+            rtt_samples: self.rtt_samples.load(Ordering::Relaxed),
             metrics_recv: self.metrics_recv.load(Ordering::Relaxed),
             state_changes: self.state_changes.load(Ordering::Relaxed),
             dropped_locked: self.dropped_locked.load(Ordering::Relaxed),
@@ -168,6 +178,12 @@ impl HostStatus {
         self.metrics_recv.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// 记一条自测时延。「这条 Pong 是不是刚发出去那条的回应」由 [`RttProbe`] 判。
+    fn note_rtt(&self, us: u64) {
+        self.rtt_local_us.store(us, Ordering::Relaxed);
+        self.rtt_samples.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// 返回 `Some(变了没)`：第一次收到也算「变了」（要打一行日志）。
     fn apply_state(&self, locked: bool, has_desktop: bool) -> bool {
         let first = !self.known.swap(true, Ordering::Relaxed);
@@ -177,6 +193,53 @@ impl HostStatus {
         }
         let _ = has_desktop;
         first || prev != locked
+    }
+}
+
+/// 控制通道的时延探针间隔。1 秒：内网开销可忽略，又能跟上「延迟刚刚变差」这件事。
+const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// 进程内的单调时钟（微秒）。
+///
+/// 用 `Instant` 而不是系统时间：墙上时钟被 NTP 拽一下，时延就会算出负数或者几十秒。
+/// 只要取时间的两处都走这里，基准点一致，差值就是真的往返时间。
+fn now_us() -> u64 {
+    use std::sync::OnceLock;
+    static T0: OnceLock<std::time::Instant> = OnceLock::new();
+    T0.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64
+}
+
+/// 时延探针：发 `C2H::Ping`，按 `H2C::Pong` 回到本机的时间算往返。
+///
+/// 为什么由控制端自己算：被控端那条 `Metrics.rtt_ms` 恒为 0（被控端没有可比的时钟，
+/// 它在协议里如实填 0 而不是编个数）。「这条链路来回多少毫秒」只有控制端量得出来 ——
+/// 它同时拥有发出时刻和到达时刻。
+///
+/// **只认最近一次发出的 seq**：网络乱序时旧 Pong 可能后到，不能让它把新数字冲掉；
+/// 同一条 Pong 重复到达也只结算一次。
+#[derive(Debug, Default)]
+pub struct RttProbe {
+    seq: u32,
+    last: Option<(u32, u64)>,
+}
+
+impl RttProbe {
+    /// 该发下一个 Ping 了：返回要发的消息，并记下发出时刻。
+    pub fn next(&mut self, now_us: u64) -> C2H {
+        self.seq = self.seq.wrapping_add(1);
+        self.last = Some((self.seq, now_us));
+        // 协议里的 `sent_ms` 是毫秒（被控端原样回带，不影响这边的计算）。
+        C2H::Ping { seq: self.seq, sent_ms: now_us / 1000 }
+    }
+
+    /// 收到 Pong：对得上最近一次就返回往返微秒数，否则 `None`（旧包/重复包）。
+    pub fn on_pong(&mut self, seq: u32, now_us: u64) -> Option<u64> {
+        let (want, sent) = self.last?;
+        if seq != want {
+            return None;
+        }
+        self.last = None;
+        Some(now_us.saturating_sub(sent))
     }
 }
 
@@ -286,6 +349,12 @@ impl ControlLink {
 
             let mut tick = tokio::time::interval(POLL_INTERVAL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // 时延探针。interval 的第一拍立刻到点，先吃掉它 —— 否则刚握手完就发一条，
+            // 量到的是握手的尾巴，不是稳态延迟。
+            let mut rtt = RttProbe::default();
+            let mut ping = tokio::time::interval(PING_INTERVAL);
+            ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ping.tick().await;
 
             loop {
                 tokio::select! {
@@ -358,11 +427,26 @@ impl ControlLink {
                                         }
                                     }
                                 }
+                                Ok(H2C::Pong { seq, .. }) => {
+                                    if let Some(us) = rtt.on_pong(seq, now_us()) {
+                                        status.note_rtt(us);
+                                    }
+                                }
                                 Ok(_) => {}
                                 Err(e) => debug!(error = %e, "控制通道上收到无法解析的 JSON"),
                             },
                             FrameKind::Bye => break,
                             _ => {}
+                        }
+                    }
+                    _ = ping.tick() => {
+                        // 兼作控制通道的心跳：这条通道半开时，这里的写入迟早会失败，
+                        // 比「等用户下次点鼠标」更早发现。
+                        let m = rtt.next(now_us());
+                        let Ok(bytes) = serde_json::to_vec(&m) else { continue };
+                        if write_frame(&mut wr, FrameKind::Json, &bytes).await.is_err() {
+                            debug!("控制通道写入失败，时延探针结束");
+                            break;
                         }
                     }
                     _ = tick.tick() => {
@@ -511,6 +595,28 @@ mod tests {
         st.apply_state(false, true);
         assert!(sender.send(C2H::MouseMoveAbs { x: 0.1, y: 0.1 }));
         assert!(matches!(rx.try_recv(), Ok(C2H::MouseMoveAbs { .. })));
+    }
+
+    #[test]
+    fn rtt_probe_only_settles_the_matching_pong() {
+        let mut p = RttProbe::default();
+        assert!(matches!(p.next(1_000_000), C2H::Ping { seq: 1, sent_ms: 1000 }));
+        // 4.5 ms 的往返
+        assert_eq!(p.on_pong(1, 1_004_500), Some(4_500));
+        // 同一条 Pong 又来一次：不重复结算
+        assert_eq!(p.on_pong(1, 1_005_000), None);
+        // 旧 seq 的 Pong 不能把新的一次冲掉
+        assert!(matches!(p.next(2_000_000), C2H::Ping { seq: 2, .. }));
+        assert_eq!(p.on_pong(1, 2_000_100), None);
+        assert_eq!(p.on_pong(2, 2_000_800), Some(800));
+    }
+
+    #[test]
+    fn rtt_probe_never_returns_a_negative_round_trip() {
+        // 时间戳比发出时刻还早（只可能是时钟基准被换过）：不许冒出天量数字。
+        let mut p = RttProbe::default();
+        let _ = p.next(5_000_000);
+        assert_eq!(p.on_pong(1, 4_999_000), Some(0));
     }
 
     #[test]

@@ -52,6 +52,27 @@ use crate::input::{default_sink, Inject, InputSink, Mapper};
 use crate::portmap::{PortMap, PortPolicy};
 use crate::probe::{self, DesktopState, LockProbe, MetricsSampler, SysSource};
 
+/// 控制端发 `Ping` 测时延时，回一条 `H2C::Pong`。
+///
+/// 回带的 `host_ms` 是被控端的墙上时钟（仅供排障时人看，控制端算往返只用它自己记的时刻）。
+/// 解不出 `C2H::Ping` 就**原样回声** —— 与这一条改动之前的行为一致，别让别的用途的 Ping
+/// 因为多了个解码步骤就断掉。
+fn pong_reply(payload: &[u8]) -> bytes::Bytes {
+    match serde_json::from_slice::<C2H>(payload) {
+        Ok(C2H::Ping { seq, sent_ms }) => {
+            let host_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            match serde_json::to_vec(&H2C::Pong { seq, sent_ms, host_ms }) {
+                Ok(v) => bytes::Bytes::from(v),
+                Err(_) => bytes::Bytes::copy_from_slice(payload),
+            }
+        }
+        _ => bytes::Bytes::copy_from_slice(payload),
+    }
+}
+
 /// 实测帧率：按固定窗口统计编码器**真正产出**的 AU 数。
 ///
 /// 为什么不是「累计帧数 / 总时长」：长会话里累计平均会越算越钝，
@@ -1139,7 +1160,8 @@ async fn control_loop(
                     In::Eof => return Ok(Closed::Eof),
                     In::Err(e) => return Err(e),
                     In::Ping(payload) => {
-                        out.send(Out::Pong(payload)).map_err(|_| "控制通道已关闭".to_string())?;
+                        out.send(Out::Pong(pong_reply(&payload)))
+                            .map_err(|_| "控制通道已关闭".to_string())?;
                     }
                     In::Blob => {
                         // bulk 通道才是数据通道，控制连接上不该出现 Blob。
@@ -1828,7 +1850,27 @@ fn parse_size_from_spec(spec: &str) -> Option<Screen> {
 mod tests {
     use super::*;
 
-    /// 记录型 sink：断言「被控端打算注入什么」，不需要真 X11。
+        #[test]
+    fn pong_reply_carries_the_ping_back_as_a_pong() {
+        let ping = serde_json::to_vec(&C2H::Ping { seq: 7, sent_ms: 1_700_000_000_123 }).unwrap();
+        let pong = pong_reply(&ping);
+        match serde_json::from_slice::<H2C>(&pong).unwrap() {
+            H2C::Pong { seq, sent_ms, host_ms } => {
+                assert_eq!((seq, sent_ms), (7, 1_700_000_000_123), "seq / sent_ms 要原样带回");
+                assert!(host_ms > 1_600_000_000_000, "host_ms 应是墙上时钟毫秒，实际 {host_ms}");
+            }
+            other => panic!("应当回 Pong，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pong_reply_echoes_payloads_it_cannot_decode() {
+        // 不是 `C2H::Ping` 的 Ping（别的用途 / 老客户端）必须原样回声 —— 与改动前一致。
+        let raw = b"not json at all";
+        assert_eq!(&pong_reply(raw)[..], raw);
+    }
+
+/// 记录型 sink：断言「被控端打算注入什么」，不需要真 X11。
     struct Recorder(Arc<std::sync::Mutex<Vec<Inject>>>);
 
     impl InputSink for Recorder {
