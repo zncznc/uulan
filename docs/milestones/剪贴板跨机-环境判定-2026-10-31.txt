@@ -1,0 +1,76 @@
+跨机剪贴板：环境判定与本轮改动（2026-10-31 夜批 22:00 起）
+
+【结论先说】
+1. 2026-10-31 早些时候记下的「Windows↔麒麟剪贴板不通，原因是 Win32 后端 OpenClipboard 争用没有重试」
+   **不成立**。重试从 M2.5 首次实现（d4f812b）起就有（6 次 × 10ms），客户端另外还每 500ms 轮询一次。
+2. 真正的事实是：**这台机器的这个会话整体拿不到剪贴板**，同一会话里 4 个互不相干的客户端全部失败。
+   因此「跨机剪贴板」在本会话内**无法验证** —— 既不能说通，也不能说不通。
+3. 本轮改的是「让这种环境现场一眼就能看出来」，不是「修一个不存在的重试缺失」。
+
+【环境取证（本机 Windows 11 / ZNC-7G4D）】
+进程上下文全部正常：
+  session=1、window station=WinSta0、desktop=Default（OpenInputDesktop 也是 Default，说明没锁屏）、
+  token=chaoc / Medium Mandatory Level / 无受限 SID / Administrators 是 deny-only（标准 UAC 过滤令牌）、
+  在 job 对象里但 job 的 UI 限制位 = 0x0（没有 UILIMIT_READCLIPBOARD / WRITECLIPBOARD）。
+可是 OpenClipboard 一律 ERROR_ACCESS_DENIED(5)：
+  · python(ctypes)：20 次全失败（20/20，100ms 间隔），随后 30 次全失败（30/30，20ms 间隔）；
+  · 传真实 HWND 也一样（CreateWindowExW 造的 STATIC 窗口，err=5）；
+  · GetOpenClipboardWindow() = NULL —— 没有任何进程「正持有剪贴板」；
+  · GetClipboardOwner() = NULL、GetClipboardSequenceNumber() = 74；
+  · Windows 自带工具同样失败：`echo x | clip.exe` → 「拒绝访问」rc=1；
+    powershell `Get-Clipboard` / `Set-Clipboard` → 「打开剪贴板失败」。
+交叉验证：`cargo test -p uulan-clip` 的 win32_roundtrip_and_restore 直接走 probe 失败分支跳过。
+结论：这是**会话/桌面层面**的拒绝，与 uulan 代码无关。具体机制没查明（令牌、桌面、job 三项都正常，
+可能是宿主沙箱对子进程的剪贴板 IPC 做了拦截）—— 如实记为「机制未知、现象可复现」。
+
+反证「不是重试不够」：一整条 12–18 秒的会话里，后端每个轮询周期都试 6 次，累计上千次尝试，成功 0 次；
+而失败是**立刻**返回（20 次尝试总共约 2 秒，没有阻塞等待，所以也不是「有程序一直占着」的表现）。
+
+【本轮的代码改动（提交 8605b2b）】
+- `uulan-clip`：`Clipboard` trait 新增 `probe()`（真开一次剪贴板）与 `last_error()`（失败原因留痕）。
+  Win32 后端：
+  (1) `probe()` 真开一次再关，不看内容；
+  (2) 失败时把 `GetLastError()` 翻成人话（5 = 拒绝访问、6/1400 = 句柄无效、0 = 没设错误码）并留在
+      `last_error`，成功一次就清空（表达「现在这一次」，不是历史）；
+  (3) 错误码必须在失败那一刻取 —— 中间 `thread::sleep` 会把 `LastError` 冲成 0，
+      本轮第一次跑出来就是「Win32 错误 0：没有错误码」，已修；
+  (4) 重试 6×10ms → 10×10ms（上限仍压到 100ms，因为它跑在 tokio 任务里，sleep 真的占 worker）。
+- `uulan-client`：声明 `Cap::Clipboard` **之前**调用 `probe()`，失败就打印原因并降级，
+  不再谎报能力（旧写法 `available()` 在 Windows 上恒为真）；
+  轮询里把「读失败」与「内容没变」分开计数（`clip_read_errors`），首条与每 100 条打一次 WARN；
+  收工统计改成「剪贴板同步：发送 N / 接收 M（本机写入失败 K / 本机读取失败 R）」。
+
+【本机实测（同一会话，改动前 vs 改动后）】
+改动前（旧 release，22:24）：进会话后统计 `发送 0 / 接收 0（本机写入失败 1）`，
+  日志只有一句 `打不开剪贴板（被其他程序占用）`，没有错误码，看不出是哪一类失败。
+改动后（22:25）：
+  剪贴板不可用：OpenClipboard 失败（Win32 错误 5：拒绝访问：剪贴板被别的程序长期占着，或被会话策略拦下）
+    → 本次会话不同步剪贴板（其它功能照常）
+  统计里不再出现「剪贴板同步」行（因为压根没声明这个能力）。
+  视频不受影响：解出 355 帧 / 丢帧 0 / 首帧 191ms / 29.6 fps。
+
+【真机验收（麒麟 192.168.223.15，从 HEAD 8605b2b 部署）】
+- 部署：`git archive HEAD` → scp → `src.in.<ts>`（保留 target/）→
+  `cargo build --release -p uulan-server -p uulan-host`（40.5s）→
+  `install.sh --userland --no-start` → `systemctl --user kill -s KILL` 两个单元 →
+  server/host 都 active、NRestarts=1、前缀与 target 的 uulan-host sha256 同为 8321f307…；
+  设备 ID 仍是 805747189（未变）。
+- `uulan-host --diagnose`：8 通过 / 0 警告 / 0 失败，退出码 0。
+- 画面基线（本轮）：1024x768、控制端解出 29.4 fps、首帧 198ms、丢帧 0、平均码率 4910 kbps、
+  与真机 `ffmpeg -f x11grab` 截图**相关系数 0.9994 / 平均绝对误差 0.54%**。
+  注：真机现在跑 1024x768（`xdpyinfo` 1024x768；`xrandr` 报 VGA-0 disconnected），
+  上一轮（10-31 早）还是 1920x1080 —— 这是机器状态变化，不是回归；比对要同分辨率做。
+- 本轮改的是控制端能力探测与统计口径，被控端行为未变；视频数字与基线同量级。
+
+【仍未验（如实）】
+- Windows ↔ 麒麟 剪贴板两个方向：本会话拿不到 Windows 剪贴板 ⇒ **无法验**。
+  要验就在交互式桌面会话里跑本轮新增的
+  `bash scripts/verify-clipboard-cross.sh --device <ID> --password-file <文件>`：
+  第 0 步先探本会话能否读写剪贴板，不能就退出 2 并说明「不要据此判定不通」；
+  A 向（Windows→麒麟）判据：麒麟 `x11_clip_probe` 的 `GET-BEFORE <<<…>>>` 出现本轮标记 +
+  控制端统计「发送 ≥ 1」；B 向（麒麟→Windows）判据：本机剪贴板等于本轮标记 + 「接收 ≥ 1」。
+  脚本已在本会话里验过「环境不行就退出 2」这条路径（EXIT=2）。
+- M5 的 root 系统装（/opt/uulan）：`sudo -n true` 仍报「需要密码」，无人值守做不了（本轮再确认一次）。
+- 真机解锁：`pkill -x ukui-screensaver-dialog` 这次**没杀掉** —— 进程 comm 被截断成
+  `ukui-screensave`（15 字符），`-x` 按完整名匹配不上。改用 `ps ... | grep screensaver` 取 PID 后
+  `kill <PID>`，当场解开（`xdotool getactivewindow getwindowname` → 「桌面」）。

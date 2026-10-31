@@ -73,41 +73,42 @@ impl WinClipboard {
         Self { last_error: None }
     }
 
-    /// 记下当前 `GetLastError()` 并翻译成一句话。
-    fn note_open_failure(&mut self) {
-        let code = unsafe { GetLastError() };
+    /// 记下 Win32 错误码并翻译成一句话。
+    ///
+    /// 错误码必须**在失败那一刻**取：中间只要睡一觉/调别的 API，`GetLastError`
+    /// 就被覆盖成 0（第一次跑出来就是「Win32 错误 0：没有错误码」）。
+    fn note_open_failure(&mut self, code: u32) {
         self.last_error =
             Some(format!("OpenClipboard 失败（Win32 错误 {code}：{}）", err_hint(code)));
     }
 
-    /// 反复试 `OpenClipboard`，成功就执行 `f` 并关掉。拿不到返回 `None`。
-    fn open_and<T>(f: impl FnOnce() -> T) -> Option<T> {
-        let mut opened = false;
-        for _ in 0..OPEN_RETRIES {
+    /// 反复试 `OpenClipboard`，成功就执行 `f` 并关掉。失败回传最后一次的错误码。
+    fn open_and<T>(f: impl FnOnce() -> T) -> Result<T, u32> {
+        let mut last = 0u32;
+        for i in 0..OPEN_RETRIES {
             if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {
-                opened = true;
-                break;
+                let out = f();
+                unsafe { CloseClipboard() };
+                return Ok(out);
             }
-            std::thread::sleep(OPEN_RETRY_GAP);
+            last = unsafe { GetLastError() };
+            if i + 1 < OPEN_RETRIES {
+                std::thread::sleep(OPEN_RETRY_GAP);
+            }
         }
-        if !opened {
-            return None;
-        }
-        let out = f();
-        unsafe { CloseClipboard() };
-        Some(out)
+        Err(last)
     }
 
     /// 拿剪贴板锁后执行 `f`；失败时留痕。`f` 不捕获 `self`（否则借用冲突）。
     fn with_open<T>(&mut self, f: impl FnOnce() -> T) -> Option<T> {
         match Self::open_and(f) {
-            Some(v) => {
+            Ok(v) => {
                 // 成功即清空：`last_error` 表达「现在这一次怎么样」，不是历史。
                 self.last_error = None;
                 Some(v)
             }
-            None => {
-                self.note_open_failure();
+            Err(code) => {
+                self.note_open_failure(code);
                 None
             }
         }
@@ -294,5 +295,21 @@ mod tests {
         assert!(err_hint(5).contains("拒绝访问"));
         assert!(err_hint(0).contains("没有错误码"));
         assert_eq!(err_hint(1234), "未收录的错误码");
+    }
+
+    /// 错误码必须原样进 `last_error` —— 现场判「争用还是整会话被拦」全靠它。
+    #[test]
+    fn failure_reason_keeps_the_win32_code() {
+        let mut c = WinClipboard::new();
+        c.note_open_failure(5);
+        let msg = c.last_error().expect("留痕失败");
+        assert!(msg.contains("错误 5"), "错误码丢了：{msg}");
+        assert!(msg.contains("拒绝访问"), "没翻译成原因：{msg}");
+
+        // 成功一次要清空：否则「曾经失败过」会被永久当成现在的状态
+        c.last_error = None;
+        if c.probe().is_ok() {
+            assert!(c.last_error().is_none(), "probe 成功后仍留着错误");
+        }
     }
 }
