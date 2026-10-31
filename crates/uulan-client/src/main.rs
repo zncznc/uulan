@@ -85,6 +85,10 @@ struct Args {
     fps: Option<u32>,
     /// 编码缩放倍率（`--scale`）。1.0 = 原始分辨率。
     scale: Option<f32>,
+    /// 要声音（`--audio`）。不给就不碰音频通道 —— 被控端那边连编码器都不会起。
+    audio: bool,
+    /// 把收到的声音落成 WAV 文件（`--audio-save`）。无人值守验收靠它给证据。
+    audio_save: Option<PathBuf>,
 }
 
 const HELP: &str = "\
@@ -103,6 +107,8 @@ uulan-client —— uulan 内网远控的控制端
   --ffmpeg <path>     ffmpeg 可执行文件（默认走 PATH）
   --save-frame <path> 退出时把最后一帧存成 PPM（排查「对面到底画的是什么」用）
   --headless          不开窗口，只打印统计（自测 / 无显示环境用）
+  --audio             接收被控端的声音（PulseAudio monitor → Opus）
+  --audio-save <path> 把声音存成 WAV（同时隐含 --audio；无人值守验收用）
   --no-input          只读模式：不上报键鼠（排障、旁观时用）
   --no-clipboard      不同步剪贴板（不希望本机剪贴板被对面改写时用）
   --json              以 JSON 输出（--headless 的统计 / --devices 的设备目录）
@@ -191,6 +197,8 @@ fn parse_args() -> Result<Args> {
         bitrate: None,
         fps: None,
         scale: None,
+        audio: false,
+        audio_save: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -217,6 +225,12 @@ fn parse_args() -> Result<Args> {
             "--save-frame" => a.save_frame = Some(PathBuf::from(it.next().unwrap_or_default())),
             "--json" => a.json = true,
             "--headless" => a.headless = true,
+            "--audio" => a.audio = true,
+            "--audio-save" => {
+                a.audio_save = Some(PathBuf::from(it.next().context("--audio-save 需要一个路径")?));
+                // 只要落盘就是「要声音」，否则用户以为给了路径就会有文件。
+                a.audio = true;
+            }
             "--no-input" => a.no_input = true,
             "--no-clipboard" => a.no_clipboard = true,
             "--forward" => {
@@ -899,6 +913,15 @@ async fn main() -> Result<()> {
         no_input: args.no_input,
         max_reconnects: args.reconnect,
         video: video_set(&args),
+        audio: if args.audio {
+            Some(match &args.audio_save {
+                Some(p) => uulan_client::audioin::Sink::Wav(p.clone()),
+                None => uulan_client::audioin::Sink::Speaker,
+            })
+        } else {
+            None
+        },
+        audio_stats: std::sync::Arc::new(uulan_client::audioin::AudioStats::default()),
     };
 
     // ── 窗口模式 ──────────────────────────────────────────────────────────
@@ -1313,6 +1336,11 @@ async fn run_headless(
             "  剪贴板同步 : 发送 {} / 接收 {}（本机写入失败 {} / 本机读取失败 {}）",
             ins.clips_sent, ins.clips_recv, ins.clip_errors, ins.clip_read_errors
         );
+        // 音频：只在要过声音时打。「有流但峰值 0」= 对面在放静音（不是断了），
+        // 这是现场区分「没声音」与「没连上」的唯一判据。
+        if plan.audio.is_some() {
+            println!("  {}", plan.audio_stats.summary());
+        }
         println!("  会话       : 建立 {} 条 / 断线接回 {} 次", sessions, reconnects);
     }
 

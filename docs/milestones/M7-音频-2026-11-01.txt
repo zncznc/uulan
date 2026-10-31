@@ -1,0 +1,68 @@
+M7 音频 · 被控端 → 控制端（2026-11-01 夜批 05:00 轮）
+========================================================
+
+为什么做
+--------
+「UU 远程级」缺的最后一块是声音：看视频、听提示音、开会的对白都在被控端上。
+DESIGN 里早就把接口留好了（`Channel::Audio` 占位、`Cap::Audio`、第 4 条连接），
+这一轮把它接通 —— 协议占位 ≠ 做完了。
+
+做法
+----
+- **通道**：`relay_open_all` 从三条拨成**四条**，一次拨齐四条再一起等 `RelayReady`
+  （「拨一条等一条」会把配对串行化，四条通道的建立时间叠加）。不做「要用再拨」：
+  多一条空闲 TCP 的代价可以忽略（内网 RTT < 1ms，不传就一个字节都没有），
+  而懒拨要多出一整套「谁先拨、谁等谁」的状态机。
+- **协议**：`C2H::AudioStart{bitrate_kbps,sample_rate,channels}`（0 = 用默认）、
+  `C2H::AudioStop`、`H2C::AudioState{running,codec,detail}`。参数由控制端给，
+  被控端当场起编码器 —— 与 `VideoSet` 同一套思路。
+- **被控端**（`crates/uulan-host/src/audio.rs`）：`pactl get-default-sink` → `<sink>.monitor`，
+  起 `ffmpeg -f pulse -i <monitor> -c:a libopus -b:a 64k -ar 48000 -ac 2
+  -application lowdelay -frame_duration 20 -f ogg -page_duration 20000 -flush_packets 1`，
+  stdout 按 16 KiB 切片写 `FrameKind::Blob` 到 audio 通道。
+  没显式配置时按 `UULAN_AUDIO_SOURCE` → 默认 sink 的 monitor → 「第一个 .monitor 源」的顺序探测。
+- **控制端**（`crates/uulan-client/src/audioin.rs`）：异步侧读帧塞进有界 std 通道（反压到 socket），
+  阻塞侧 `spawn_blocking` 里 `ffmpeg -f ogg -i pipe:0 -f s16le` 解 PCM，再写播放后端：
+  Windows 用 `waveOut`（手写 winmm FFI，同 `termx::wincon` 的理由，不动 windows-sys 特性）、
+  `--audio-save <path>` 写 WAV（无人值守验收就靠它）。
+- **能力声明**：被控端只在「真的抓得到源」时才声明 `Cap::Audio`（显式配置解析成功、
+  或 `pactl info` 能跑）。声明了却送不出声音，是上一轮刚踩过的坑。
+
+踩到的坑
+--------
+1. **`-f lavfi` 合成源默认不限速**：4 秒真时间能生成十分钟音频，链路瞬间被灌满
+   （第一版测试里 4 秒解出 598 秒 PCM）。合成源要加 `-re`；`-f pulse` 由设备自己按实时节奏喂。
+2. **Ogg 默认一页 1 秒** → 声音晚一秒才出来。`-page_duration 20000`（20 ms）+ `-flush_packets 1`
+   才能边编边吐。
+3. **控制端测试 exe 位于工作区里时写不了盘**（DESIGN 构建陷阱 2）：`audio_path` 那条集成测试
+   在本机必然跳过 —— 所以本机证据改用「把二进制拷到工作区外再跑」的
+   `scripts/verify-audio-e2e.sh`，集成测试在真机上跑（那边可写）。
+4. **`waveOut` 的缓冲区活到 `waveOutUnprepareHeader` 之后**：先 prepare/write/轮询 WHDR_DONE
+   再 unprepare、复用同一块缓冲。直接 free 会让内核指着一块已经释放的内存。
+5. **录制文件要有收尾**：WAV 头里的长度必须在 `finish()` 里按实际字节数回填 ——
+   不回填的文件播放器读出来是「0 秒」，看起来像「什么都没收到」。
+
+本机实测（`scripts/verify-audio-e2e.sh`，Windows，release 二进制，工作区外执行）
+-----------------------------------------------------------------------------
+```
+设备 ID：649430637
+客户端退出码：0
+本次会话：解出 6554 帧 / 丢帧 0 / 首帧 161ms
+音频：收到 409 帧 / 97005 字节 → 解出 8.2 秒 PCM（峰值 2981，播放 1573920 字节，错误 0）
+WAV: 1573964 字节 / 1573920 字节数据 / 48000 Hz / 2 ch / 16 bit
+时长 8.20 s / 峰值 2981
+440Hz 功率 4.157e+07 / 1000Hz 3.970e+04 = 1047 倍
+```
+即：8 秒的合成正弦，控制端拿到 8.20 秒 PCM、波形里 440 Hz 比 1000 Hz 强 1047 倍 ——
+证明解出来的**就是那个正弦波**，而不是「有字节在动」。
+
+真机实测（PulseAudio monitor → Windows 控制端）
+----------------------------------------------
+（见本文件末尾的「真机」一节；本轮若没跑成会明确写「未验」。）
+
+仍未验
+------
+- 麒麟控制端的实时播放（那边只有 `--audio-save`；`Sink::Speaker` 在非 Windows 上是明确的
+  「未实现」而不是静默失败）。
+- 麦克风方向（控制端 → 被控端）。
+- 高抖动网络下的音频（内网没有这种条件）：没有抖动缓冲，纯低延迟直出。

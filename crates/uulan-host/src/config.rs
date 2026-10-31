@@ -98,6 +98,14 @@ pub struct HostConfig {
     /// 控制端会收到 `TermError`（「声明了能力就必须给得出东西」）。
     #[serde(default)]
     pub term_shell: Option<String>,
+
+    /// 音频采集源（M7）。不写 = 自动探测（PulseAudio 默认输出的 `.monitor` 源）。
+    ///
+    /// 写法：`pulse:<设备名>`、`lavfi:<表达式>`（合成音，本机测试用）。
+    /// 写成不认识的东西**不会静默退回默认**：会话里控制端会收到一条
+    /// `AudioState{running:false}` 并带着原因，现场照着那句话就能改。
+    #[serde(default)]
+    pub audio_source: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -149,6 +157,7 @@ impl Default for HostConfig {
             fs_allow_absolute: true,
             portmap_allow: Vec::new(),
             term_shell: None,
+            audio_source: None,
         }
     }
 }

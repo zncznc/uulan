@@ -29,7 +29,11 @@ pub use rvclient::{RelaySet, RvConn, RvError};
 /// v3（M6 加固）：加密握手之后多一轮 PAKE，`Auth` 变成**一组**证明（每个候选凭据一份）、
 /// `AuthOk` 带上命中序号，会话密钥里混进 PAKE 共享点。旧端在 `CryptoHello` 阶段就会被
 /// `BadVersion` 挡掉（加密层版本也一起递增了），不会出现「一半新一半旧」的半加密状态。
-pub const PROTO_VERSION: u32 = 3;
+///
+/// v4（M7 音频）：会话从三条通道变**四条**，多一条 `audio`。这不能向后兼容 ——
+/// 新控制端会等第四条配对，老被控端根本不会拨它，双方就卡在 `relay_open_all` 里。
+/// 所以版本号必须跟着动：宁可 `ProtoMismatch` 明确报错，也不要挂在那里让人以为「连上了没声音」。
+pub const PROTO_VERSION: u32 = 4;
 
 /// 默认中继端口。
 pub const DEFAULT_PORT: u16 = 21116;

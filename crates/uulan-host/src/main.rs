@@ -37,6 +37,7 @@ struct Args {
     config: Option<PathBuf>,
     server: Option<String>,
     capture: Option<String>,
+    audio_source: Option<String>,
     ffmpeg: Option<PathBuf>,
     encoder: Option<Encoder>,
     name: Option<String>,
@@ -58,6 +59,8 @@ uulan-host —— uulan 内网远控的被控端
   --show              打印设备 ID、密码、临时码后退出（唯一会打印口令的入口）
   --diagnose          自检：显示 / XTest / ffmpeg / 中继 / 配置可写性，给一行结论 + 建议
                       只读，不注册中继、不改配置；退出码 0 = 能跑，1 = 有失败项
+  --audio-source <源> 音频采集源（M7）：`pulse:<设备>` / `lavfi:<表达式>`；
+                      不写 = 自动探测 PulseAudio 默认输出的 monitor
   --new-temp-code     生成新的一次性临时验证码，落盘后退出
   --once              收到一次会话并结束后就退出（自测用）
   -h, --help          显示本帮助
@@ -71,6 +74,7 @@ fn parse_args() -> Result<Args> {
         config: None,
         server: None,
         capture: None,
+        audio_source: None,
         ffmpeg: None,
         encoder: None,
         name: None,
@@ -85,6 +89,7 @@ fn parse_args() -> Result<Args> {
             "--config" => a.config = Some(PathBuf::from(it.next().unwrap_or_default())),
             "--server" => a.server = Some(it.next().unwrap_or_default()),
             "--capture" => a.capture = Some(it.next().unwrap_or_default()),
+            "--audio-source" => a.audio_source = Some(it.next().unwrap_or_default()),
             "--ffmpeg" => a.ffmpeg = Some(PathBuf::from(it.next().unwrap_or_default())),
             "--name" => a.name = Some(it.next().unwrap_or_default()),
             "--encoder" => {
@@ -146,6 +151,13 @@ async fn main() -> Result<()> {
         let parsed = CaptureInput::parse(c).map_err(|e| anyhow::anyhow!(e))?;
         if cfg.capture != parsed {
             cfg.capture = parsed;
+            dirty = true;
+        }
+    }
+    if let Some(s) = &args.audio_source {
+        let v = if s.trim().is_empty() { None } else { Some(s.clone()) };
+        if cfg.audio_source != v {
+            cfg.audio_source = v;
             dirty = true;
         }
     }

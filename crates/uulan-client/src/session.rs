@@ -281,6 +281,13 @@ pub struct Plan {
     /// **每条会话都要发一次**：被控端在重连之间会重开编码器，每次仍按它自己的配置起；
     /// 只在第一条会话发的话，接回之后就悄悄回到原档位了。
     pub video: Option<VideoSet>,
+    /// 音频（M7）：`None` = 这条会话不要声音。`Some(sink)` = 起来就向被控端要音频。
+    ///
+    /// 与视频不同，音频**不是每条必须有的**：被控端没声明 `Cap::Audio`（没声卡、
+    /// 没 PulseAudio）时这里会收到一句 `AudioState{running:false}` 并带原因。
+    pub audio: Option<crate::audioin::Sink>,
+    /// 音频计数：**跨会话累加**（重连后接着算），收工统计读它。
+    pub audio_stats: std::sync::Arc<crate::audioin::AudioStats>,
 }
 
 impl Plan {
@@ -402,6 +409,8 @@ pub struct Open {
     pub host: HostInfo,
     pub watcher: VideoWatcher,
     pub link: ControlLink,
+    /// 音频接收（M7）。`None` = 这条会话没开音频。Drop 时连解码器一起收掉。
+    pub audio: Option<crate::audioin::AudioIn>,
     /// 输入口。headless 不用它，但**必须留着**：全掉了控制通道的写任务会退出，
     /// 被控端看到控制通道 EOF 就会把整条会话收掉（画面跟着断）——
     /// 那就成了「客户端自己把会话关掉，然后怪网络」。
@@ -462,6 +471,35 @@ pub async fn open(
         }
     }
 
+    // 音频（M7）：先起接收端再发 AudioStart —— 反过来的话，被控端前几百毫秒的
+    // 声音会在没有读者的通道上堆着（socket 缓冲），而控制端以为「已经开始了」。
+    let audio = match (&plan.audio, c.host.caps.contains(&Cap::Audio)) {
+        (Some(sink), true) => {
+            let (rd, _wr) = c.audio.into_split();
+            let a = crate::audioin::start(
+                rd,
+                plan.ffmpeg.clone(),
+                sink.clone(),
+                plan.audio_stats.clone(),
+            );
+            if link.input().send(C2H::AudioStart {
+                bitrate_kbps: 0,
+                sample_rate: 0,
+                channels: 0,
+            }) {
+                info!(sink = ?sink, "已请求被控端发送音频");
+            } else {
+                warn!("音频请求没能下发：控制通道已经关了");
+            }
+            Some(a)
+        }
+        (Some(_), false) => {
+            warn!("这台被控端没有声明音频能力（没声卡 / 没 PulseAudio），本次会话不会有声音");
+            None
+        }
+        (None, _) => None,
+    };
+
     if let Some(l) = live {
         l.mark_live(c.host.clone(), watcher.stats(), link.status(), input.clone());
     }
@@ -472,7 +510,7 @@ pub async fn open(
         "会话已建立"
     );
 
-    Ok(Open { host: c.host, watcher, link, _input: input })
+    Ok(Open { host: c.host, watcher, link, audio, _input: input })
 }
 
 /// 会话循环（窗口模式）：连 → 跑 → 断了就退避重连，直到不再重连（或任务被 abort）。

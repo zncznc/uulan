@@ -486,7 +486,7 @@ pub async fn run_with_sink(
     peer: String,
     sink: Box<dyn InputSink>,
 ) -> SessionOutcome {
-    let RelaySet { control, video, bulk } = relays;
+    let RelaySet { control, video, bulk, audio } = relays;
     let mut control = control;
 
     // ── M6：端到端握手（X25519 + PAKE）──
@@ -565,6 +565,11 @@ pub async fn run_with_sink(
     let clip_available = clip.available();
 
     let cfg = params.state.snapshot();
+    // 音频能不能用：显式配了源就认配置（解析失败 = 不可用，会话里会带原因告诉控制端），
+    // 没配就看这台机器有没有 PulseAudio。**只在会话开头判一次** —— `Cap::Audio` 是
+    // 「这个被控端有这套东西」的声明，不是「此刻声卡在响」。
+    let audio_cfg = cfg.audio_source.clone();
+    let audio_ok = crate::audio::available(audio_cfg.as_deref());
     let client = match handshake(
         &mut control_rd,
         &mut control_wr,
@@ -573,6 +578,7 @@ pub async fn run_with_sink(
         params.screen,
         &peer,
         clip_available,
+        audio_ok,
     )
     .await
     {
@@ -598,6 +604,10 @@ pub async fn run_with_sink(
     control_wr.rekey(final_ctl.sending(Role::Host));
     let video = SecConn::new(video, &keys.channel(Channel::Video), Role::Host, Channel::Video);
     let bulk = SecConn::new(bulk, &keys.channel(Channel::Bulk), Role::Host, Channel::Bulk);
+    // 音频（M7）：通道一直开着，但**只有在控制端发 AudioStart 之后才会有字节**。
+    // 不开 `--audio` 的控制端也会拨这条连接（协议 v4 四条通道一起拨），
+    // 这里就先握着，什么都不发 —— 空闲 TCP 不产生流量。
+    let audio_conn = SecConn::new(audio, &keys.channel(Channel::Audio), Role::Host, Channel::Audio);
 
     // 视频参数的热更新通道：控制端改画质/帧率时不需要断开重连。
     let (set_tx, set_rx) = watch::channel(params.settings);
@@ -748,6 +758,9 @@ pub async fn run_with_sink(
         }
     }
 
+    // 音频控制：只在控制端发 AudioStart 时才拉起 ffmpeg。
+    let mut audio_ctl = AudioCtl::new(audio_conn, params.ffmpeg.clone(), audio_cfg, out_tx.clone());
+
     let outcome = control_loop(
         &mut in_rx,
         &out_tx,
@@ -762,11 +775,13 @@ pub async fn run_with_sink(
         &mut metrics,
         &lock,
         &mut sent_state,
+        &mut audio_ctl,
     )
     .await;
 
     // 会话结束（正常/异常/断线）都要把还按着的键松开、把全局状态还原，
     // 否则被控端上会留下一个「一直按住 Ctrl」的键盘。
+    audio_ctl.shutdown().await;
     input.finish().await;
     info!(
         events = input.events,
@@ -827,6 +842,7 @@ async fn handshake<R, W>(
     screen: Screen,
     peer: &str,
     clip_available: bool,
+    audio_available: bool,
 ) -> Result<Option<uulan_protocol::msg::ClientHello>, String>
 where
     R: AsyncRead + Unpin,
@@ -855,6 +871,11 @@ where
     // 终端：`portable-pty` 两端都能编；起不来（比如配置里的 shell 不存在）会回 TermError，
     // 所以能力位可以如实声明 —— 声明了却打不开和「假装没实现」是两回事。
     caps.push(Cap::Terminal);
+    // 音频：这台机器真的能抓（有 PulseAudio 的 monitor 源，或配置里指定了源）。
+    // 不能抓就不声明 —— 否则控制端会显示「音频已开」而实际一个字节都不来。
+    if audio_available {
+        caps.push(Cap::Audio);
+    }
     send_h2c(
         wr,
         &H2C::HelloOk(HostHelloOk {
@@ -1119,6 +1140,90 @@ impl InputLoop {
 /// 这样「等一帧」「写一条」「剪贴板轮询」「等文件操作结果」互不干扰，
 /// 也不必为一个 `select!` 的取消安全担心（见 [`read_loop`] 的说明）。
 #[allow(clippy::too_many_arguments)]
+/// 音频任务的控制柄（M7）。
+///
+/// 一次会话最多起一路音频：控制端发 `AudioStart` 时才 spawn，`AudioStop` /
+/// 会话结束就 abort（`kill_on_drop` 让 ffmpeg 一起收掉）。
+///
+/// 为什么不支持「会话中途改码率就换一路」：`SecConn::into_write_half()` 是移动语义，
+/// 写半端只能交出去一次。真要热改，得像视频那样把「参数」和「写端」都放进同一个
+/// 任务里用 `select!` 收 —— 那是另一个量级的改动，而现场没有这种需求
+/// （音频码率在会话开头定一次就够）。改了就回一句「重开会话才生效」，别装作生效了。
+struct AudioCtl {
+    conn: Option<SecConn>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    ffmpeg: PathBuf,
+    /// 配置里的音频源原文（`pulse:…` / `lavfi:…`），`None` = 自动探测。
+    source: Option<String>,
+    out: mpsc::UnboundedSender<Out>,
+}
+
+impl AudioCtl {
+    fn new(conn: SecConn, ffmpeg: PathBuf, source: Option<String>, out: mpsc::UnboundedSender<Out>) -> Self {
+        AudioCtl { conn: Some(conn), task: None, ffmpeg, source, out }
+    }
+
+    fn running(&self) -> bool {
+        self.task.as_ref().is_some_and(|t| !t.is_finished())
+    }
+
+    /// 起一路音频。已经在跑就只回一句状态，不重启。
+    fn start(&mut self, p: crate::audio::AudioParams) {
+        if self.running() {
+            warn!("音频已经在跑，忽略重复的 AudioStart（改码率要重开会话）");
+            let _ = self.out.send(Out::Json(H2C::AudioState {
+                running: true,
+                codec: String::new(),
+                detail: "音频已在运行；改码率需要重开会话".into(),
+            }));
+            return;
+        }
+        let Some(conn) = self.conn.take() else {
+            // 会话开头已经交出过一次写端（理论上到不了这里）。
+            warn!("音频通道已经用掉了，无法再起");
+            let _ = self.out.send(Out::Json(H2C::AudioState {
+                running: false,
+                codec: String::new(),
+                detail: "音频通道已被占用".into(),
+            }));
+            return;
+        };
+        let ffmpeg = self.ffmpeg.clone();
+        let source = self.source.clone();
+        let tx = self.out.clone();
+        let notify: Box<dyn Fn(H2C) + Send + Sync> = Box::new(move |m: H2C| {
+            let _ = tx.send(Out::Json(m));
+        });
+        self.task = Some(tokio::spawn(async move {
+            crate::audio::run(ffmpeg, source, p, conn.into_write_half(), notify).await;
+        }));
+    }
+
+    /// 停掉音频（关掉 ffmpeg，别让它一直占着声卡）。
+    fn stop(&mut self) {
+        if let Some(t) = self.task.take() {
+            t.abort();
+            info!("音频已停止（控制端关掉的）");
+            let _ = self.out.send(Out::Json(H2C::AudioState {
+                running: false,
+                codec: String::new(),
+                detail: "控制端关闭了音频".into(),
+            }));
+        }
+    }
+
+    /// 会话收尾：先 abort，再等它真的退出（ffmpeg 是 `kill_on_drop`，drop 即收尸）。
+    async fn shutdown(&mut self) {
+        let Some(t) = self.task.take() else {
+            self.conn = None;
+            return;
+        };
+        t.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(2), t).await;
+        self.conn = None;
+    }
+}
+
 async fn control_loop(
     in_rx: &mut mpsc::Receiver<In>,
     out: &mpsc::UnboundedSender<Out>,
@@ -1133,6 +1238,7 @@ async fn control_loop(
     metrics: &mut MetricsSampler,
     lock: &Option<LockProbe>,
     sent_state: &mut Option<DesktopState>,
+    audio: &mut AudioCtl,
 ) -> Result<Closed, String> {
     let mut tick = tokio::time::interval(POLL_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1263,6 +1369,18 @@ async fn control_loop(
                                 }
                             }
                             // ── 剪贴板 ──
+                            C2H::AudioStart { bitrate_kbps, sample_rate, channels } => {
+                                let p = crate::audio::AudioParams::normalized(
+                                    bitrate_kbps,
+                                    sample_rate,
+                                    channels,
+                                );
+                                info!(?p, "控制端要求开始送音频");
+                                audio.start(p);
+                            }
+                            C2H::AudioStop => {
+                                audio.stop();
+                            }
                             C2H::Clip { text } => {
                                 if let Some(t) = clip_sync.inbound(&text) {
                                     match clip.set_text(&t) {

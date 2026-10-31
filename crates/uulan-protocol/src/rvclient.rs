@@ -227,7 +227,7 @@ impl RvConn {
         Ok(s)
     }
 
-    /// 一次拨齐三条通道，并等三条都配对完成。
+    /// 一次拨齐四条通道，并等四条都配对完成。
     ///
     /// 两端都要调用它；它会阻塞到对端也拨号为止。
     pub async fn relay_open_all(
@@ -235,16 +235,23 @@ impl RvConn {
         session: &str,
         role: Role,
     ) -> Result<RelaySet, RvError> {
-        // 先把三条都拨出去，再一起等 ready。
+        // 先把四条都拨出去，再一起等 ready。
         // 若改成「拨一条等一条」，对端在第一条上就会和我们互相等待（虽然也能成，
-        // 但会把配对串行化，三条通道的建立时间叠加）。
+        // 但会把配对串行化，四条通道的建立时间叠加）。
+        //
+        // **音频通道也在这里一次拨齐**（M7）。做成「要用了再拨」的话，两端都得
+        // 在会话中途协商谁先拨、谁等谁，多出一整条状态机；而多一条空闲 TCP
+        // 连接的代价是可以忽略的（内网 RTT < 1ms，不传就一个字节都没有）。
+        // 用不用它由控制端的 `C2H::AudioStart` 决定 —— 通道开着 ≠ 有声音在传。
         let mut control = self.relay_dial(session, Channel::Control, role).await?;
         let mut video = self.relay_dial(session, Channel::Video, role).await?;
         let mut bulk = self.relay_dial(session, Channel::Bulk, role).await?;
+        let mut audio = self.relay_dial(session, Channel::Audio, role).await?;
         await_relay_ready(&mut control).await?;
         await_relay_ready(&mut video).await?;
         await_relay_ready(&mut bulk).await?;
-        Ok(RelaySet { control, video, bulk })
+        await_relay_ready(&mut audio).await?;
+        Ok(RelaySet { control, video, bulk, audio })
     }
 
     /// 拆出底层流（需要自己读循环时用）。
@@ -270,11 +277,13 @@ pub async fn await_relay_ready(stream: &mut TcpStream) -> Result<Channel, RvErro
     }
 }
 
-/// 一次会话的三条通道。
+/// 一次会话的四条通道。
 pub struct RelaySet {
     pub control: TcpStream,
     pub video: TcpStream,
     pub bulk: TcpStream,
+    /// 音频（M7）。控制端不开 `--audio` 时它只是一条空闲连接。
+    pub audio: TcpStream,
 }
 
 // ───────────────────────── 会合连接的读写两半 ─────────────────────────

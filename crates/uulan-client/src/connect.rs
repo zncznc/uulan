@@ -3,10 +3,10 @@
 //! 顺序（M6 起多了端到端握手与 PAKE，见 [`uulan_protocol::crypto`] 与 [`uulan_protocol::pake`]）：
 //!
 //! ```text
-//! 会合（中继）→ 三条 relay 连接 → CryptoHello 交换 → PAKE 交换 → Hello/HelloOk → Auth/AuthOk
+//! 会合（中继）→ 四条 relay 连接 → CryptoHello 交换 → PAKE 交换 → Hello/HelloOk → Auth/AuthOk
 //! ```
 //!
-//! 握手之后三条连接上的**每个帧都是密文**；PAKE 之后密钥里还混进了「只有知道口令才能
+//! 握手之后四条连接上的**每个帧都是密文**；PAKE 之后密钥里还混进了「只有知道口令才能
 //! 算出来的共享点」，所以中继即使被拿下、即使它主动冒充两端，也解不开任何一个字节。
 
 use std::time::Duration;
@@ -43,7 +43,7 @@ pub use uulan_protocol::msg::HostHelloOk as HostInfo;
 
 /// 一条已建立并已通过鉴权的会话。
 ///
-/// 三个通道都是**已加密的连接**：`into_split()` 出来的两半自己加解密，
+/// 四个通道都是**已加密的连接**：`into_split()` 出来的两半自己加解密，
 /// 上层 `read_frame` / `write_frame` 的用法一字未变。
 #[derive(Debug)]
 pub struct Connected {
@@ -53,6 +53,8 @@ pub struct Connected {
     pub video: SecConn,
     /// 文件传输 / 端口映射的数据通道。M4 起使用。
     pub bulk: SecConn,
+    /// 音频（M7）：被控端 → 控制端的 Opus/Ogg 流。不开 `--audio` 时这条连接是空闲的。
+    pub audio: SecConn,
     /// 服务端下发的会话票据（排障用）。
     pub session: String,
 }
@@ -64,7 +66,7 @@ impl Connected {
     }
 }
 
-/// 连到一台被控端：会合 → 三条通道 → 端到端握手 → 握手鉴权。
+/// 连到一台被控端：会合 → 四条通道 → 端到端握手 → 握手鉴权。
 pub async fn connect(
     server: &str,
     device_id: &str,
@@ -76,7 +78,7 @@ pub async fn connect(
     let (session, back_id, device_name) = rv.client_connect(device_id, client_name).await?;
 
     let relays = rv.relay_open_all(&session, Role::Client).await?;
-    let RelaySet { control, video, bulk } = relays;
+    let RelaySet { control, video, bulk, audio } = relays;
     let mut control = control;
 
     // 握手也要有超时：被控端可能连上了中继但自己的会话线程卡住。
@@ -183,6 +185,7 @@ pub async fn connect(
         control: ctl,
         video: SecConn::new(video, &keys.channel(Channel::Video), Role::Client, Channel::Video),
         bulk: SecConn::new(bulk, &keys.channel(Channel::Bulk), Role::Client, Channel::Bulk),
+        audio: SecConn::new(audio, &keys.channel(Channel::Audio), Role::Client, Channel::Audio),
         session,
     })
 }

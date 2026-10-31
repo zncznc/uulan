@@ -82,6 +82,25 @@ pub enum C2H {
     // ── 画面设置 ──
     VideoSet(VideoSet),
 
+    // ── 音频（M7）──
+    /// 开始送音频。被控端收到就拉起采集+编码，往 audio 通道写 Opus（Ogg 封装）。
+    ///
+    /// 参数由控制端给（而不是被控端配置里写死）：同一条会话中途改码率也只是
+    /// 再发一条，被控端当场重启编码器 —— 与 `VideoSet` 是同一套思路。
+    AudioStart {
+        /// 目标码率，kbps。0 = 用默认（64）。
+        #[serde(default)]
+        bitrate_kbps: u32,
+        /// 采样率，0 = 48000。
+        #[serde(default)]
+        sample_rate: u32,
+        /// 声道数，0 = 2。
+        #[serde(default)]
+        channels: u16,
+    },
+    /// 停掉音频（关掉 ffmpeg，别让它一直占着声卡）。
+    AudioStop,
+
     // ── 剪贴板 ──
     Clip { text: String },
     /// 只声明"我这里有新的剪贴板内容"，不携带正文（大内容时省一次往返）。
@@ -334,6 +353,17 @@ pub enum H2C {
 
     /// RTT 探测回应。
     Pong { seq: u32, sent_ms: u64, host_ms: u64 },
+
+    /// 音频状态（M7）。`running=false` 时 `detail` 说明为什么没起来 ——
+    /// 现场「没声音」十有八九是这一句：没有 PulseAudio、没有 monitor 源、
+    /// 没装 libopus。控制端要把它原样打给用户，别让它只留在被控端日志里。
+    AudioState {
+        running: bool,
+        #[serde(default)]
+        codec: String,
+        #[serde(default)]
+        detail: String,
+    },
 
     /// 被控端主动道别（比如用户点了「断开」）。
     Bye { reason: String },

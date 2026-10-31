@@ -11,6 +11,7 @@
 //!
 //! 窗口（winit + softbuffer）是 [`watch`] 之上的一层，不参与协议。
 
+pub mod audioin;
 pub mod connect;
 pub mod control;
 pub mod forward;

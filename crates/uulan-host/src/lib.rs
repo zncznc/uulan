@@ -10,6 +10,7 @@
 //! 注意：被控端**不依赖任何 X11 头文件或库**。抓屏是交给 `ffmpeg -f x11grab` 子进程做的，
 //! 所以这个 crate 在 Windows 上也能完整编译和跑测试 —— 只是 `x11` 采集源要真的连上 X 才能用。
 
+pub mod audio;
 pub mod capture;
 pub mod config;
 pub mod diagnose;
