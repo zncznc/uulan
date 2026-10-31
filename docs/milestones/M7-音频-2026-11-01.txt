@@ -56,9 +56,42 @@ WAV: 1573964 字节 / 1573920 字节数据 / 48000 Hz / 2 ch / 16 bit
 即：8 秒的合成正弦，控制端拿到 8.20 秒 PCM、波形里 440 Hz 比 1000 Hz 强 1047 倍 ——
 证明解出来的**就是那个正弦波**，而不是「有字节在动」。
 
-真机实测（PulseAudio monitor → Windows 控制端）
-----------------------------------------------
-（见本文件末尾的「真机」一节；本轮若没跑成会明确写「未验」。）
+真机实测（麒麟 PulseAudio monitor → Windows 控制端，2026-11-01 05:17–05:20）
+----------------------------------------------------------------------------
+部署：从 HEAD 打包 → 真机换源码（保留 target/）→ `cargo build --release -p uulan-server
+-p uulan-host`（37 s）+ `-p uulan-client`（36 s）→ `install.sh --userland --no-start`
+→ `systemctl --user kill -s KILL uulan-host uulan-server`（自愈拉起）。
+结果：两个单元都 `active`、设备 ID 仍 **805747189**、前缀里的 host/client 都是 05:17 的新二进制、
+中继日志 `proto=4`。
+
+声音（`uulan-client --headless --seconds 12 --audio --audio-save out.wav`，真机上 `paplay` 循环放 440 Hz WAV）：
+```
+音频：收到 299 帧 / 121017 字节 → 解出 10.6 秒 PCM（峰值 2858，播放 2034720 字节，错误 0）
+被控端 journal：音频已开始（Opus/Ogg） source=pulse:alsa_output.usb-Generic_USB_Audio-00.analog-stereo-spdif-output.monitor
+              bitrate=64 rate=48000 channels=2          （期间 WARN/ERROR 0 条）
+逐 2 秒窗口的 440Hz/1000Hz 功率比：1502 / 3635 / 3327 / 6 / 21885（尾部 2 秒 19682）
+```
+t=6 s 那个窗口比值只有 6，是 `paplay` 两段循环之间的换段瞬间（峰值没掉，只是主导频率换了）——
+另外 4 段都是 440 Hz 压倒性主导，说明到控制端的**就是被控端在放的那个正弦波**。
+
+同会话的视频（顺带核对没被音频挤坏）：
+```
+解出 354 帧 / 丢帧 0 / 29.1 fps / 首帧 265ms / 约 5.0 Mbps
+存帧与真机 x11grab 截图：相关系数 0.9977 / MAE 0.92%（1024x768，基线是 0.9982/0.71%）
+```
+
+真机上的集成测试（不是本机那条「跳过」）：
+`cargo test -p uulan-client --test audio_path` → **1 passed**，
+WAV 3.88 s / 峰值 2945 / 440Hz 功率是 1000Hz 的 **1741 倍**。
+
+真机踩到的两件事
+----------------
+1. **麒麟的 `pactl` 没有 `get-default-sink` 子命令**（回「未指定有效的命令」）。自动探测因此
+   实际走的是「第一个 `.monitor` 源」那条兜底路径 —— 这台机器上正好就是 USB 声卡的 spdif 输出
+   monitor。显式配 `--audio-source pulse:<设备>` 时不受影响。
+2. 直接跑 `target/release/uulan-client.exe`（在工作区里）**写不了 WAV/存帧**（拒绝访问，os error 5）——
+   构建陷阱 2 的老问题，把 exe 拷到 `D:/uulan-bin/` 下再跑就正常。第一遍因此只拿到统计、
+   没拿到文件；第二遍才留下证据。
 
 仍未验
 ------
