@@ -427,14 +427,20 @@ impl ControlLink {
                                         }
                                     }
                                 }
-                                Ok(H2C::Pong { seq, .. }) => {
-                                    if let Some(us) = rtt.on_pong(seq, now_us()) {
-                                        status.note_rtt(us);
-                                    }
-                                }
                                 Ok(_) => {}
                                 Err(e) => debug!(error = %e, "控制通道上收到无法解析的 JSON"),
                             },
+                            FrameKind::Pong => {
+                                // 被控端对上面那条 Ping 的回应（带 seq）。
+                                match f.decode_json::<H2C>() {
+                                    Ok(H2C::Pong { seq, .. }) => {
+                                        if let Some(us) = rtt.on_pong(seq, now_us()) {
+                                            status.note_rtt(us);
+                                        }
+                                    }
+                                    _ => debug!("Pong 帧里的内容解不出来，忽略"),
+                                }
+                            }
                             FrameKind::Bye => break,
                             _ => {}
                         }
@@ -444,7 +450,9 @@ impl ControlLink {
                         // 比「等用户下次点鼠标」更早发现。
                         let m = rtt.next(now_us());
                         let Ok(bytes) = serde_json::to_vec(&m) else { continue };
-                        if write_frame(&mut wr, FrameKind::Json, &bytes).await.is_err() {
+                        // **帧级 Ping，不是 Json 帧**：被控端只对 `FrameKind::Ping` 走回声那条路，
+                        // 包成 Json 会被当成「尚未实现的控制消息」静默丢掉（第一版就这么错的）。
+                        if write_frame(&mut wr, FrameKind::Ping, &bytes).await.is_err() {
                             debug!("控制通道写入失败，时延探针结束");
                             break;
                         }

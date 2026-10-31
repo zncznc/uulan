@@ -1,0 +1,50 @@
+控制端链路时延 · 真机实测（2026-11-01 夜批 01:00 轮）
+=======================================================
+
+为什么做
+--------
+`Metrics.rtt_ms` 一直被如实填 0（被控端没有可比的时钟），而控制端标题上也没有任何延迟数字。
+「这条链路来回多少毫秒」只有控制端量得出来 —— 它同时有发出时刻和到达时刻。
+
+做法
+----
+- 控制通道每 1 秒一条**帧级** `Ping`，payload 是 `C2H::Ping{seq, sent_ms}` 的 JSON；
+- 被控端 `pong_reply()` 解出 `C2H::Ping` 就回 `H2C::Pong{seq, sent_ms, host_ms}`，
+  解不出来原样回声（与改动前一致，别的用途的 Ping 不受影响）；
+- 控制端 `RttProbe` 只结算最近一次 seq（重复到达不重复算，乱序旧包不冲掉新值），
+  用进程内 `Instant` 算差值（不用墙上时钟，免得 NTP 一拽就出现负数）；
+- 显示：窗口标题「· 延迟 0.5ms」、`--status` 每行多一个 `rtt_local=`（未量到时为 `-`）。
+
+踩到的坑
+--------
+第一版把 Ping 包成普通控制消息（`FrameKind::Json`）发出去，被控端主循环把它当
+「尚未实现的控制消息，已忽略」，控制端永远等不到 Pong —— `--status` 里 `rtt_local` 一直是 `-`。
+被控端只对 `FrameKind::Ping` 走回声那条路，必须发**帧级** Ping。
+
+实测（真机 mis-pc，HEAD b8bab42 + 上面那条修正，1024x768，正式服务）
+----------------------------------------------------------------------
+```
+--status 6：
+  locked=false has_state=true cpu=0.0% mem=2350/32025MB rtt=0ms rtt_local=-        metrics=1
+  locked=false has_state=true cpu=1.1% mem=2348/32025MB rtt=0ms rtt_local=0.5ms    metrics=2
+  ...
+  locked=false has_state=true cpu=0.3% mem=2348/32025MB rtt=0ms rtt_local=1.0ms    metrics=4
+12 秒 headless（同一次部署）：
+  解出 29.5 fps / 丢帧 0 / 首帧 264ms / 4905 kbps / 当前画幅 1024x768
+  存帧与真机 x11grab 截图：相关系数 0.9997 / MAE 0.49%
+被控端 journal（同期）：
+  grep -c "尚未实现|无法解析|Pong" = 0；WARN/ERROR = 0
+```
+即：内网往返 0.5–1.0 ms；加了每秒一条 Ping 之后画面数字没有变化（对比同轮 0.9997/0.49%
+与分辨率验收同口径）。
+
+单测
+----
+- `RttProbe` 只结算对得上的那条 Pong、不重复结算、旧 seq 不冲掉新值、不出现负往返；
+- `title_shows_measured_latency_only_after_a_sample`：没样本时不显示「延迟」，有样本显示 0.5ms；
+- 被控端 `pong_reply` 带回 seq/sent_ms 且 `host_ms` 是墙上时钟毫秒；解不出来的 payload 原样回声。
+
+仍未验
+------
+- 高延迟/抖动链路（内网没有这种条件）：`RttProbe` 在丢包、乱序下的行为只有单测覆盖。
+- 窗口标题里的「· 延迟」只有单测 + `--status` 的数字，没有人眼看过标题（无人值守）。

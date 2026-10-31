@@ -591,6 +591,16 @@ mod tests {
     }
 
     #[test]
+    fn title_shows_measured_latency_only_after_a_sample() {
+        let mut o = Overlay { host_name: "KIRIN".into(), screen: (1024, 768), ..Default::default() };
+        // 还没量到：不写「延迟 0.0ms」那种假数字
+        assert!(!o.title(1024, 768).contains("延迟"), "{}", o.title(1024, 768));
+        o.rtt_local_us = 450;
+        o.rtt_samples = 1;
+        assert!(o.title(1024, 768).contains("延迟 0.5ms"), "{}", o.title(1024, 768));
+    }
+
+    #[test]
     fn title_shows_host_load_and_lock_state() {
         let mut o = Overlay { host_name: "KIRIN".into(), screen: (1920, 1080), ..Default::default() };
         // 还没收到指标：标题里不该冒出「CPU」「内存」这些空字段
