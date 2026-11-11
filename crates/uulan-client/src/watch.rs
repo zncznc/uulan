@@ -31,6 +31,7 @@ use uulan_media::ffmpeg;
 use uulan_media::VideoDecoder;
 use uulan_protocol::frame::{read_frame, video, write_frame, FrameKind};
 use uulan_protocol::msg::{H2C, HostVideoCfg};
+use uulan_protocol::shape::Shape;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WatchError {
@@ -280,7 +281,7 @@ impl VideoWatcher {
                         }
                         H2C::Bye { reason } => return Err(WatchError::HostRefused(reason)),
                         other => {
-                            debug!(?other, "视频通道上的其他控制消息，忽略");
+                            debug!(shape = other.shape(), "视频通道上的其他控制消息，忽略");
                         }
                     }
                 }

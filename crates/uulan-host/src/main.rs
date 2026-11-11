@@ -22,6 +22,7 @@ use uulan_host::session::{self, HostState, SessionOutcome, SessionParams, VideoS
 use uulan_media::ffmpeg::{self, Encoder};
 use uulan_protocol::msg::Screen;
 use uulan_protocol::rv::{Role, ToEndpoint};
+use uulan_protocol::shape::Shape;
 use uulan_protocol::rvclient::{RelaySet, RvConn};
 
 /// 向中继发心跳的间隔。远小于服务端的设备超时，避免被误判离线。
@@ -466,7 +467,7 @@ async fn serve_relay(
                 // 单个请求出错不该要了进程的命，记下来继续待连。
                 warn!(?code, %message, "中继报错");
             }
-            other => tracing::debug!(?other, "中继推送"),
+            other => tracing::debug!(shape = other.shape(), "中继推送"),
         }
     }
 }

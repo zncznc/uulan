@@ -13,6 +13,7 @@ pub mod pake;
 pub mod redact;
 pub mod rv;
 pub mod rvclient;
+pub mod shape;
 pub mod vk;
 
 pub use frame::{
