@@ -175,9 +175,9 @@ async fn query_reports_online_and_offline() -> Result<()> {
     Ok(())
 }
 
-/// 主流程：注册 → 发起会话 → 两端各拨三条通道 → 通道上互通字节（含业务帧）。
+/// 主流程：注册 → 发起会话 → 两端各拨全部通道（v4 起是 4 条，含音频）→ 通道上互通字节（含业务帧）。
 #[tokio::test]
-async fn two_endpoints_pair_three_channels_and_exchange_application_frames() -> Result<()> {
+async fn two_endpoints_pair_all_channels_and_exchange_application_frames() -> Result<()> {
     let addr = spawn_server().await?;
 
     // 被控端上线
@@ -199,13 +199,18 @@ async fn two_endpoints_pair_three_channels_and_exchange_application_frames() -> 
         other => bail!("期望 Incoming，得到 {other:?}"),
     }
 
-    // 故意让被控端先把三条都拨出去，控制端再拨 —— 服务端必须挂住先到的一方。
+    // 故意让被控端先把**所有通道**都拨出去，控制端再拨 —— 服务端必须挂住先到的一方。
     //
     // 必须用 `relay_dial`（只拨不等）：`relay_open_all` 要等对端到齐才返回，
     // 而控制端要等我们返回之后才会去拨 ⇒ 两边互等，死锁到服务端 30 秒后回收会话。
+    //
+    // 这里必须和被控端真实实现拨**同样多**的通道。协议升到 v4 后多了 `Audio`，
+    // 而 `relay_open_all` 会一并拨音频，少拨一条就会让对端一直等不到配对，
+    // 表现为 30 秒后超时失败（曾经就是这样挂的）。
     let mut hc = host.relay_dial(&session, Channel::Control, Role::Host).await?;
     let mut hv = host.relay_dial(&session, Channel::Video, Role::Host).await?;
     let mut hb = host.relay_dial(&session, Channel::Bulk, Role::Host).await?;
+    let mut ha = host.relay_dial(&session, Channel::Audio, Role::Host).await?;
 
     let client_relays = client.relay_open_all(&session, Role::Client).await?;
 
@@ -213,6 +218,7 @@ async fn two_endpoints_pair_three_channels_and_exchange_application_frames() -> 
     await_relay_ready(&mut hc).await?;
     await_relay_ready(&mut hv).await?;
     await_relay_ready(&mut hb).await?;
+    await_relay_ready(&mut ha).await?;
 
     // 两条控制通道上各跑一遍真实的业务握手
     let mut cc = client_relays.control;

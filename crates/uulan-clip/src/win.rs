@@ -240,8 +240,27 @@ mod tests {
     /// 这是本机唯一能真正执行的剪贴板后端 —— X11 那个只能在麒麟上验。
     /// 剪贴板打不开时（无人值守会话里可能是整条会话被拦）**跳过并说明原因**，
     /// 不硬断言：环境一变就是一片假红，把真问题埋掉。
+    /// 真剪贴板测试要不要跑。**默认不跑。**
+    ///
+    /// Windows 剪贴板是**机器级单例**，而 `cargo test --workspace` 会并发跑多个
+    /// 测试二进制；两个进程同时抢 `OpenClipboard` 会让 Win32 层直接堆损坏
+    /// （`STATUS_HEAP_CORRUPTION 0xc0000374`），整个测试套件当场中止 ——
+    /// 真正的失败反而被埋掉（实测：全量跑到 140 个就崩在这）。
+    ///
+    /// 要验真剪贴板就单独跑：
+    /// ```text
+    /// UULAN_CLIPBOARD_TESTS=1 cargo test -p uulan-clip -- --test-threads=1
+    /// ```
+    fn real_clipboard_tests_enabled() -> bool {
+        std::env::var("UULAN_CLIPBOARD_TESTS").map(|v| v == "1").unwrap_or(false)
+    }
+
     #[test]
     fn win32_roundtrip_and_restore() {
+        if !real_clipboard_tests_enabled() {
+            eprintln!("跳过真剪贴板测试（默认关闭；UULAN_CLIPBOARD_TESTS=1 才跑）");
+            return;
+        }
         let mut c = WinClipboard::new();
         if let Err(why) = c.probe() {
             eprintln!("跳过：本机剪贴板现在打不开 —— {why}");
@@ -267,6 +286,10 @@ mod tests {
     /// `probe` 的结论必须和真实可读写性一致 —— 这是「能力声明是否可信」的地基。
     #[test]
     fn probe_agrees_with_reality() {
+        if !real_clipboard_tests_enabled() {
+            eprintln!("跳过真剪贴板测试（默认关闭；UULAN_CLIPBOARD_TESTS=1 才跑）");
+            return;
+        }
         let mut c = WinClipboard::new();
         match c.probe() {
             Ok(()) => {
@@ -308,7 +331,8 @@ mod tests {
 
         // 成功一次要清空：否则「曾经失败过」会被永久当成现在的状态
         c.last_error = None;
-        if c.probe().is_ok() {
+        // 只有显式开启时才真去碰剪贴板（理由见 real_clipboard_tests_enabled）
+        if real_clipboard_tests_enabled() && c.probe().is_ok() {
             assert!(c.last_error().is_none(), "probe 成功后仍留着错误");
         }
     }
