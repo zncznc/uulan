@@ -1,0 +1,68 @@
+剪贴板跨显示 + 锁屏状态切换 · 真机实测（2026-11-11 夜批 22:00 轮）
+=====================================================================
+
+本轮没有产品代码改动：工作区 HEAD（2e39e4d）与下午会话一致，
+本轮产出 = 三项真机验收 + 部署完整性核对 + 文档更正。
+
+环境
+----
+- 真机 mis@mis-pc（银河麒麟 V10 SP1，海光 C86），开机 11 天，:0 分辨率 1920x1080（xdpyinfo 实测）
+- 正式服务：uulan-server / uulan-host 双双 active（systemd 用户单元，host 起于 11-03 23:09，稳定 8 天）
+- 部署完整性：`git archive HEAD` → 真机换源码（保留 target/ 缓存）→
+  `cargo build --release -p uulan-server -p uulan-host` 37s **零警告**；
+  新产物与已部署 bin/ **逐字节一致**（server sha256 前缀 c66483bd，host 7d9838bf）——
+  即 2e39e4d 相对 11-01 构建只动了测试/README/Windows-only 代码，正式服务跑的就是 HEAD，
+  **不需要也没动任何服务**。
+- 控制端：Windows，HEAD 重编（uulan-client.exe，3,530,240 字节，sha 前缀 a2da91c5，零警告），
+  拷到 D:/uulan-bin 后执行（工作区写盘限制）。
+- 本机基线：cargo test --workspace = **454 通过 / 0 失败 / 1 忽略，0 警告**（与 2e39e4d 自述一致）。
+
+一、M4 剪贴板：麒麟 ↔ 麒麟跨显示整链（真 v4 加密链路）双向 ✅
+---------------------------------------------------------------
+测试台：scripts/remote-xvfb-testbed.sh（Xvfb :99 + 独立中继 127.0.0.1:21995 +
+独立配置 /tmp/uulan-input-app/host.json，设备 460405305，全程不碰正式服务的身份与口令）。
+控制端 = 真机自编 uulan-client（sha 前缀 ea34b9d6，v4）跑在**物理 :0**（剪贴板跟 $DISPLAY），
+被控端 = 测试台 uulan-host `--capture x11::99.0`（剪贴板后端跟 capture 显示号走，
+见 host/session.rs `params.capture.display()`）。两边是两条 X 连接上的独立进程。
+
+判据（x11_clip_probe 当外部读写方，见 crates/uulan-clip/examples/）：
+  1) :0  探针 SET `XCLIPA-1794409123`（探针自己 GET-BEFORE=none，基线不外推，符合设计）
+  2) :99 探针 `GET-BEFORE len=17 <<<XCLIPA-1794409123>>>`   ← 方向 A 通（client→wire→host 写入）
+  3) :99 探针顺手 SET `XCLIPB-1794409123`
+  4) :0  探针 `GET-BEFORE len=17 <<<XCLIPB-1794409123>>>`   ← 方向 B 通（host→wire→client 写入）
+
+统计（与判据互证）：
+  控制端  剪贴板同步 : 发送 2 / 接收 1（本机写入失败 0 / 本机读取失败 0）
+  被控端  剪贴板同步统计 sent=1 recv=2 errors=0 skipped_oversize=0 skipped_empty=0 skipped_same=44
+  同场画面 解出 895 帧 / 丢帧 0 / 首帧 195ms / 29.8 fps（麒麟控制端照常）
+
+诚实边界：判据探针与生产后端是同一份 X11 代码（uulan-clip），进程与 X 连接相互独立，
+但独立性弱于 2024-10-24 那轮「与第三方 xclip 类外部客户端」互验；
+**Windows ↔ 麒麟那半条仍未验**——夜批会话照旧拿不到系统剪贴板，控制端如实打印
+「剪贴板不可用：OpenClipboard 失败（Win32 错误 5）」且**不声明 Cap::Clipboard**（10-31 改的行为，本轮再现 ✅）。
+测试台已 down，/tmp/uulan-xclip 与脚本、真机与本机两侧口令临时文件均已删除。
+
+二、M6 锁屏门禁：解锁后的 locked=true → false 切换 ✅（真机，同一会话）
+--------------------------------------------------------------------------
+会话 A：Windows 控制端 `--headless --status 40` 起时 :0 锁着（ukui-screensaver-dialog pid 1179372）：
+  前 20 行 `locked=true has_state=true`，第 18 秒（kill 屏保 dialog，同 uid、不带 -9）后
+  **后 20 行 `locked=false has_state=true`**；汇总「指标 21 条 / 状态变化 2 次 / 锁屏丢弃键鼠 0 条」。
+  解锁判据：`xdotool getactivewindow getwindowname` 返回「桌面」。
+会话 C：解锁后 `--inject move:640,400` → 真机 `xdotool getmouselocation` 读回 `x:640 y:400`，
+  被控端 journal「会话开局的桌面状态（已先于任何输入告知控制端） locked=false has_desktop=true」
+  + 「键鼠事件统计 events=1 inject_errors=0 dropped_locked=0」——解锁侧行为照常。
+收尾：`idle-activation-enabled` 改回 true、指针还原到 (420,378)。
+
+三、M2 画面回归（解锁态正式设备 805747189）✅ 无回归
+------------------------------------------------------
+12 秒 headless：解出 354 帧 / 丢帧 0 / 29.5 fps（被控端自报 30.00）/ 首帧 236ms / 码率 11.1–13.2 Mbps；
+存帧 vs 真机 `ffmpeg -f x11grab` 截图逐像素：**corr=0.998708 / MAE=0.7692%**
+（基线 2026-10-22：0.9982 / 0.71% —— 同水平）。
+
+仍未验（本轮结束时状态）
+------------------------
+- Windows ↔ 麒麟 剪贴板两个方向（要交互式桌面会话跑 scripts/verify-clipboard-cross.sh）。
+- 换代瞬间「黑屏一拍」观感（要人眼）；多显示器热插拔（真机无接着的副屏输出）。
+- 同会话「画面换代 + 注入按新尺寸落点」——缺一个「边看画面边脚本化注入」的入口（--inject 是独立会话）。
+- M5 root 系统装（/opt/uulan）：真机 sudo -n 仍要密码，无人值守做不了。
+- uinput 兜底（M3 遗留）；PAKE 无第三方审计（M6 已知）。
