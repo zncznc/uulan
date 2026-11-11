@@ -1,0 +1,175 @@
+剪贴板内容日志脱敏 · 真机金丝雀（2026-11-12 夜批 01:00 轮）
+=====================================================
+
+本轮产出：把「剪贴板内容不进日志」从**只有代码级证据**补成**真机金丝雀实测**（四类哨兵 +
+journald 一起搜），顺带完成 HEAD 部署一致性核对与 M2 画面回归。产品代码零改动 ——
+静态审查询出的结论是「本来就没打过内容」，本轮做的是**证明**它，而不是改它。
+
+背景：DESIGN.md 的已知限制里这条一直写着「没做」，理由是「真机 :0 上没有能当剪贴板
+所有者的外部工具（xclip/xsel 不在、python3 不带 tkinter）」。这个理由不成立：仓库自带
+`crates/uulan-clip/examples/x11_clip_probe` 就是独立所有者/请求者，再写一个百来行裸 Xlib
+的 python 持有者就能挂任意大小的内容。
+
+环境
+----
+- 开发机 ZNC-7G4D（Windows 11，实时 `hostname` 核对），HEAD = 7998c18，工作区**干净**（与开工时一致，本轮只动 docs/）。
+- 本机基线：`cargo test --workspace` = **454 通过 / 0 失败 / 1 忽略 / 0 警告**。
+- 真机 mis@mis-pc（银河麒麟 V10 SP1，海光 C86）：`:0` 实测 **1920x1080**；开工时锁屏
+  （`ukui-screensaver-dialog --session-idle` pid 2888998），按既有做法以 mis 身份 kill 屏保
+  进程解开（`xdotool getactivewindow getwindowname` → 「桌面」），**验完把
+  `idle-activation-enabled` 改回 true**（已确认）。全程没有向锁屏注入任何按键。
+- 正式服务 `uulan-server` / `uulan-host` 全程未动（开工前后 are `active active`），本轮所有
+  真机动作都在 /tmp 下的独立测试台里。
+
+一、部署一致性（HEAD ↔ 真机）
+------------------------------
+- `git archive HEAD`（171 个文件）与真机 `~/.local/uulan/src`（去掉 target/ 后 170 个文件）
+  逐文件 md5 对照：**唯一差异是 `docs/milestones/剪贴板跨显示-真机-2026-11-11.txt` 没传过去**
+  （上一轮只同步了代码）—— 代码与脚本一字不差。
+- 真机 `cargo build --release -p uulan-server -p uulan-host`：**0.35 秒完成、无重编**，
+  产物 md5 与已部署的 `~/.local/uulan/bin/` **完全一致**
+  （server `9bf200ca…`、host `591e5531…`）⇒ 正式服务跑的就是 HEAD，不需要也没重装任何东西。
+- 控制端本轮重编（HEAD 全量）：真机 `-p uulan-client` 34.96 秒零警告；
+  Windows 侧 `target/release/uulan-client.exe` 3,530,240 字节、0 警告，拷到 D:/uulan-bin 外执行。
+- 判据工具构建：`cargo build --release --example x11_clip_probe -p uulan-clip` 5.58 秒。
+
+二、M4/M6 交叉项：剪贴板内容的真机金丝雀 ✅（此前只有代码级证据）
+---------------------------------------------------------------
+台子（与 2026-11-11 同一套跨显示做法）：
+- 被控端：Xvfb `:99` + `uulan-host --capture x11::99.0 --config /tmp/uucan-1112/host.json
+  --server 127.0.0.1:21996 --name UUCAN`，`RUST_LOG=trace NO_COLOR=1`，独立中继与独立配置
+  （设备 102026894，**与正式设备的身份/口令无关**，日志写 /tmp/uucan-1112/host.log）。
+- 控制端：真机自编 `uulan-client` 跑**物理 :0**（剪贴板跟 `$DISPLAY`），`RUST_LOG=trace`，
+  `--headless --seconds`，口令走 `--password-file`（0600 临时文件，跑完即删）。
+- 剪贴板外部读写方：`x11_clip_probe` + 一个独立 python 裸 Xlib 持有者
+  （应答 `SelectionRequest`，code 30；字段顺序与 `uulan-clip/src/x11.rs` 的
+  `SelectionRequestEvent` 一致）。
+
+静态审查询出的「最该担心」的点（因此值得跑）：`C2H`/`H2C` 都 `#[derive(Debug)]`，而被控端
+`main.rs` 有兜底 `debug!(?other, "中继推送")` —— TRACE 打开时任何打印整条消息的路径都会
+把哨兵原文落进日志。实测没有发生。
+
+哨兵四个，两个方向都走真链路：
+  A = 20,000 字符（:0 上由探针 SET → 控制端读 → 线上 → 被控端写 :99）
+  B = 20,000 字符（:99 上 SET → 被控端读 → 线上 → 控制端写 :0）
+  超限 = 200,000 字节（必须被 ClipSync 拒发，只许留字节数）
+  小对照 = 21 字节（同会话对照组，证明「拒发」不是链路死了）
+
+「确实同步过」的互证（不是空跑）：
+  控制端   剪贴板同步 : 发送 2 / 接收 1（本机写入失败 0 / 本机读取失败 0）
+  被控端   剪贴板同步统计 sent=1 recv=2 errors=0 skipped_oversize=0 skipped_empty=0 skipped_same=61
+  外部探针读回：:99 `GET-BEFORE len=20000`（收到 A）；:0 `GET-BEFORE len=20000`（收到 B）
+  第二轮     控制端 发送 1 / 被控端 recv=1 skipped_same=22（小对照走通）
+  超限路径   DEBUG uulan_clip: 剪贴板内容超过上限，不同步 bytes=200000 cap=196608
+             （同一次持有被轮询到 3 次，全部只留数字，一个字内容都没落盘）
+  同会话画面  1280x800 测试台：解出 1345 帧 / 丢帧 0 / 首帧 186ms（麒麟控制端照常）
+
+「哨兵没进日志」（本轮的主张）：
+  四份 TRACE 日志 host.log / server.log / client.log / client2.log 分别搜 A / B / 超限 / 小哨兵
+  的前 17 字符 ⇒ **全部 0 命中**（host 0 0 0 0 / server 0 0 0 0 / client 0 0 0 / client2 0 0 0）。
+  journald（`journalctl --user --since "-2 h"`，363 行，含正式服务）对四个哨兵 **0 命中**。
+  测试台口令（`/tmp/uucan-1112/host.json` 的 password 字段）在这四份日志里也 **0 命中**。
+  反向对照（证明搜的不是空文件）：`bytes=` 命中 host 7 / client 2 / client2 19 = **28 处**，
+  即「只记字节数」这条被真的执行过；server.log 是盲中继，本来就不解消息。
+
+诚实边界：
+  - 判据探针 `x11_clip_probe` 与被控端生产后端是**同一份 X11 代码**（进程与 X 连接独立），
+    独立性弱于第三方 xclip；因此第二轮改由**独立 python 所有者**挂哨兵，并用 21 字节
+    小对照同时钉「链路活着」与「拒发不是死路径」。
+  - 超限哨兵只能走「文件 → python 持有者」这条路：argv 传 300KB 会被内核拒
+    （`/usr/bin/env: 参数列表过长`，第一轮那步 rc=126 就是这个，与产品无关）。
+  - 哨兵文件、测试台、真机与本机两侧口令临时文件**全部已删**；`:0`/`:99` 不残留哨兵
+    （X11 剪贴板随持有者进程退出失效，符合设计）。测试台 down、中继 21996 已停。
+
+三、M2 画面回归（正式设备 805747189，解锁态）✅ 无回归
+------------------------------------------------------
+12 秒 headless（Windows 控制端，HEAD 二进制）：解出 **355 帧 / 丢帧 0 / 首帧 235ms /
+实测 29.6 fps / 被控端自报 30.60 fps / 平均码率 10658 kbps**；
+存帧 vs 真机 `ffmpeg -f x11grab` 截图逐像素（1920x1080，6,220,800 字节全量比对）：
+  **corr=0.998708 / MAE=1.964（0.7702%）/ 差>32 的通道值 4971 个（0.080%）**
+基线 2026-10-22 = 0.9982 / 0.71%，上一轮 2026-11-11 = 0.998708 / 0.7692% ⇒ 同水平，无回归。
+
+仍未验（本轮结束时）
+--------------------
+- **Windows ↔ 麒麟剪贴板两个方向**：本轮 01:15 在同一会话里实测 `Set-Clipboard`/`Get-Clipboard`
+  仍失败（`CLIP-FAIL`，与 2026-10-31/11-11 一致，机制未查明）⇒ 夜批做不了，
+  要人在交互式桌面会话里跑 `scripts/verify-clipboard-cross.sh`。
+- **M5 root 系统装（/opt/uulan）**：本机侧审批层现在**直接拦截把口令喂进 sudo 的 -S 用法**（视为暴力猜测向量），比「mis 无免密 sudo」更死：无人值守下这条完全做不了，
+  只能有人在真机终端上亲手 `sudo bash install.sh --user mis --server …`。
+- 换代瞬间「黑屏一拍」观感（要人眼）；多显示器热插拔（真机无副屏输出）。
+- 同会话「画面换代 + 注入按新尺寸落点」（缺一个边看画面边注入的入口，--inject 是独立会话）。
+- uinput 兜底（M3 遗留）；PAKE 无第三方审计（M6 已知）。
+
+四、M6 日志脱敏的代码改动（新增 Shape 层）+ 新二进制的真机复跑
+--------------------------------------------------------------
+金丝雀跑完后回头审「还有哪条路径能把原文写进日志」，静态查出**两处兜底日志把整条消息用
+Debug 打出来**，而这两个枚举里正躺着原文与凭据：
+
+| 位置 | 原来 | 消息里躺着的秘密 |
+|---|---|---|
+| 控制端 `watch.rs` 视频通道兜底 | `debug!(?other, "视频通道上的其他控制消息，忽略")` | `H2C::Clip{text}` 剪贴板原文、`H2C::TermOut{data}` 终端原文 |
+| 被控端 `main.rs` 中继推送兜底 | `debug!(?other, "中继推送")` | `ToEndpoint::ClientReady{session}` **会话票据原值** |
+
+`RUST_LOG=debug/trace` 一开就是原文落 journal，而这两条恰恰是「对面发了我没预料的东西」
+那条路径 —— 排障时最可能打开日志的场合。修法不是删日志（排障必须知道是哪一类消息），
+而是新增 `crates/uulan-protocol/src/shape.rs`：`Shape::shape()` 对每个变体返回 `'static`
+类名，实现是 exhaustive match，以后新增消息忘了考虑脱敏就编译不过。两处调用点改成
+`shape = other.shape()`。提交 **a9e55f4**。
+
+三条新单测：`debug_derivation_really_does_leak_payloads`（把「Debug 确实带原文」钉住，
+记录为什么必须有这一层）、`shape_carries_only_the_variant_name`（剪贴板/终端/票据/设备 ID
+四类哨兵都不在 shape 里）、`shape_names_are_greppable_identifiers`。
+
+本机：**cargo test --workspace = 457 通过 / 0 失败 / 1 忽略 / 0 警告**（基线 454 + 这 3 条）；
+cargo build --release 零警告；协议一个字节没动，两端不需要同批升级。
+
+真机复跑（全部换成 a9e55f4 的新二进制：中继 127.0.0.1:21997 + Xvfb :98 + 独立配置，
+被控端 `RUST_LOG=debug`、控制端 `RUST_LOG=trace`，设备 177396270）：
+```text
+方向 A（:0 外部 python 持有者 920 字符 → 线上 → 被控端写 :98）
+  会话进行中用**独立探针**读回：GET-BEFORE len=920 ✅
+方向 B（:98 探针 SET MIRROR 串 → 线上 → 控制端写 :0）
+  统计互证：控制端 发送 1 / 接收 1（写入失败 0 / 读取失败 0）；被控端 sent=1 recv=1 errors=0 ✅
+超限（200,000 字节）
+  DEBUG uulan_clip: 剪贴板内容超过上限，不同步 bytes=200000 cap=196608（3 拍轮询，只留数字）✅
+哨兵命中：host.log 0 / client4.log 0 / server.log 0 ✅
+同会话画面：解出 1015 帧 / 丢帧 0 / 首帧 180ms ✅
+（第二轮 21 字节小对照：控制端 发送 1、被控端 recv=1 errors=0，同样 0 命中）
+```
+诚实边界：那两条兜底分支在正常会话里**不会触发**（要有对端把 Clip/TermOut 发到视频通道、
+或中继给被控端推一条没预料的消息），所以**本轮没有真机命中记录**（journal 近 12 分钟
+`shape=` 命中 0）—— 它们的证据是三条单测 + exhaustive match 的编译期约束。
+
+五、部署与回滚（真机正式服务）
+------------------------------
+- 部署内容：`git archive a9e55f4` → 换源码（保留 target/ 缓存与旧源码留底）→
+  `cargo build --release -p uulan-server -p uulan-host -p uulan-client` 39.69s **零警告** +
+  `--example x11_clip_probe` 5.62s → `install.sh --userland --no-start`（不碰服务生命周期）。
+- 一致性核对：单元文件 md5 **一字未变**（host `5fedb666…`、server `22f84d88…`）；
+  前缀二进制 = target 产物（host `588550cf…` 变了、server `9bf200ca…` 没变 —— 本轮没动服务端代码）；
+  `host.json` 的 mtime 仍是 **2026-11-03 23:09:05**（配置没被这次安装碰过），设备 ID 仍 805747189。
+- 生效方式：`systemctl --user kill -s KILL uulan-host`（systemd 自己发信号，绕开审批拦截），
+  MainPID 1442032 → **2911020**、NRestarts 24 → 25，6 秒后 `active`，journal 里
+  「已用原有设备 ID 上线 device_id=805747189」；`uulan-host --diagnose` **9 项全 [ OK ]**
+  （身份/配置/可写/显示 1920x1080 锁屏否/XTest 2.2/ffmpeg 4.2.2 libx264/音频 monitor/中继/本机 16 核）。
+- 新二进制的画面回归（正式设备，Windows 控制端 a9e55f4）：解出 **355 帧 / 丢帧 0 / 首帧 234ms /
+  29.5 fps / 被控端自报 30.40 fps / 10656 kbps**；存帧 vs 真机截图
+  **corr=0.998708077 / MAE=1.963907（0.7702%）**，与改动前那一次（corr=0.998708084 /
+  MAE=1.963919）差在小数点第七位 —— 无回归。
+- **怎么撤**：备份在真机 `~/.local/uulan/rollback.20261112_015552/`
+  （`bin/` 是装之前的三个二进制、`units/` 是两个单元文件、`host.json` 是配置副本）。
+  回滚 = 把 `bin/*` 覆盖回 `~/.local/uulan/bin/`，再 `systemctl --user kill -s KILL uulan-host`
+  让 systemd 用旧二进制起来；单元文件本轮没变，不需要动。
+  旧源码也留在 `~/.local/uulan/src.old.20261112_015552/`（`cargo build` 若要退回源码级）。
+- 测试台与临时文件已清：`/tmp/uucan-1112`、`/tmp/uucan-b`、`~/uucan*.sh`、`~/clipowner*.py`、
+  真机与本机两侧口令临时文件（本机那份已用 python os.remove 删掉并确认 False）。
+  `:0` 的 `idle-activation-enabled` 已改回 true（实测 gsettings 回读 true）。
+
+
+可回滚性
+--------
+前半轮（金丝雀）确实没动任何持久状态；后半轮**改了真机的正式被控端二进制**：
+a9e55f4 的新 host 已装进前缀并由 systemd 用 KILL 方式生效（MainPID 变、NRestarts 25），
+设备 ID、host.json、两个单元文件都未变，回滚路径见第五节。
+开发机侧只多了一个 crate 文件与两条日志调用点的改动，产物与临时脚本都在工作区外
+（D:/uulan-bin）。
