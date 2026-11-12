@@ -57,7 +57,12 @@ say "== 跨机剪贴板验收（server=$SERVER ssh=$SSH_HOST client=$CLIENT）==
 
 # ── 0. 环境：本会话到底能不能碰 Windows 剪贴板 ──────────────────────────
 # 这一步是整件事的关键：能写能读，后面的断言才有意义。
-get_clip() { powershell.exe -NoProfile -Command 'Get-Clipboard -Raw' 2>/dev/null | tr -d '\r'; }
+get_clip() {
+    # 必须显式把 PowerShell 的输出编码设成 UTF-8：默认的 OEM 代码页会把非 ASCII
+    # 直接吐成 （U+FFFD），于是「麒麟送来的中文标记」永远比对失败 ——
+    # 那是**判据坏了**，不是剪贴板不通。2026-11-12 就是被这条误判过一次。
+    powershell.exe -NoProfile -Command '[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-Clipboard -Raw' 2>/dev/null | tr -d '\r'
+}
 set_clip() { powershell.exe -NoProfile -Command "Set-Clipboard -Value '$1'" >/dev/null 2>&1; }
 
 PROBE_TAG="uulan-env-$$"
