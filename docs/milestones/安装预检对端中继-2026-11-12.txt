@@ -1,0 +1,51 @@
+安装预检：对端中继 / 端口占用 —— 2026-11-12 夜批（真机通过）
+
+背景（白天踩的坑，见 `M5-系统装root-2026-11-12.txt` 第 1 条）：
+  系统装与用户态装各有一套 uulan-server 单元，都监听 21116。root 装之前必须人工先
+  `systemctl --user disable --now uulan-server.service` 让位；当时 install.sh 不查，
+  撞车会装到一半才炸 —— prefix 已建、二进制已换、单元已写，restart 那步才失败，
+  与当年 uulan-wait-x 的「半装前缀」是同一种病。
+
+本轮改动（deploy/install.sh，只加预检，未动任何 Rust 代码）：
+  在 `install -d $PREFIX` 之前新增只读预检：
+    - 用户态装查系统单元：`systemctl is-active / is-enabled uulan-server.service`
+    - 系统装查目标用户的用户单元：is-active 走总线；enabled 直接看
+      `~/.config/systemd/user/default.target.wants/uulan-server.service` 符号链接
+      （root 的 ssh 会话常连不上目标用户的 bus，「连不上」不等于「没开自启」）
+    - active 或 enabled 命中任一条 → 退出码 1 + 给出确切的 disable --now 命令
+      （只 stop 挡不住下次开机，所以 enabled 也要拦）
+    - 兜底：`ss -ltn` 查 --bind 端口；但**本形态自己的中继在跑不算对端** ——
+      「就地升级」（服务活着重装一遍，M5 验过的正式路径）必须放行
+    - `--no-server` 时整块跳过（不装中继就无所谓抢端口）
+  测试开关（不构成提权：真非 root 时写不进 /etc）：`UULAN_FAKE_ROOT=1` 放行 root 检查、
+  `UULAN_SYSTEM_UNIT_DIR=<dir>` 把系统单元目录指进沙箱。
+
+验收：
+  scripts/verify-install-preflight.sh 从 15 条扩到 34 条（对端 active / 只开自启 /
+  端口被占 / 系统装被用户单元自启挡 / 总线判据 / 就地升级放行 + 用户态与系统装
+  两条正常路径）。
+    本机 Windows git-bash：32 通过 / 0 失败（3 条正常路径在 MSYS 标 SKIP）
+    真麒麟 mis@mis-pc（Linux，正常路径真跑）：34 通过 / 0 失败
+  实弹（真机现网就是「系统单元在跑」，install.sh 用真 systemctl / 真 ss）：
+    bash deploy/install.sh --userland --bin ~/.local/uulan/src/target/release \
+        --prefix /tmp/uulan-livecheck --server 127.0.0.1:21116 --no-start
+    → 退出码 1；/tmp/uulan-livecheck 未被创建；报错给出
+      `sudo systemctl disable --now uulan-server.service`；`ss -ltn` 确认 21116 恰有 1 个监听。
+
+同轮回归（HEAD 053650f，协议 v4，真机）：
+  真机部署与 HEAD 构建产物逐字节一致：/opt/uulan/bin/{uulan-server,uulan-host} 的
+  sha256 == ~/.local/uulan/src/target/release 同二进制（c66483bd…/55a01605…），
+  cargo build --release 报 Finished 2.27s（无重编 = 源码与产物同 HEAD）。
+  Windows 控制端（从 HEAD 现编 uulan-client，1m00s 零警告，拷出工作区跑）12 s headless：
+    解出 355 帧 / 解码丢帧 0 / 首帧 222 ms / 29.6 fps（被控端自报 29.90）
+    平均码率 9775 kbps；画幅 1920x1080；解码器重建 0 次；会话建立 1 条 / 接回 0 次
+    存帧 vs 真机 ffmpeg x11grab 截图（xdpyinfo 实测 1920x1080）：
+    相关系数 0.9989 / MAE 1.30/255 = 0.51%（基线 0.9982 / 0.71%，无回归）
+  本机 cargo test --workspace（本轮开工基线，Rust 一字未动）：463 通过 / 0 失败 / 1 忽略，零警告。
+
+现网形态（记牢，别再手工 nohup / run.sh server）：
+  中继   = 系统单元（/opt/uulan/bin/uulan-server，active+enabled，0.0.0.0:21116）
+  被控端 = 用户单元（uulan-host.service，active），设备 ID 805747189
+  用户态中继单元 = disabled（白天让位留下的状态 —— 正是新预检要求的让位形态；
+  要回到用户态装须先 `sudo systemctl disable --now uulan-server.service`）
+  /etc/sudoers.d/ 里**没有** uulan（deploy/uulan.sudoers 还没装上去，装它需要人输一次口令）

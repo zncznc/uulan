@@ -272,11 +272,11 @@ Error: 期望 Pong，收到 Incoming {...}
 | 文件传输 | ✅ 真二进制 6 MiB 往返 sha256 一致 |
 | 端口映射 | ✅ 真二进制 256 KiB 单流 + 两条并发流逐字节一致 |
 | 终端（PTY） | ✅ 本机真 PTY + **真麒麟**（`/dev/ptmx`、termios、winsize、退出码、SIGHUP→SIGKILL）；**尺寸跟随 ✅ 真机验**（本地窗口 100x30→132x43，远端 `stty size` 同步变，`--term-size` 钉死时不跟随） |
-| 分辨率变化后重建解码器 | ✅ 两端都做了，本机全链路实测（真机分辨率热切未验） |
+| 分辨率变化后重建解码器 | ✅ 两端都做了，本机全链路 + **真机已验（2026-11-01：会话中途 `xrandr --fb` 不断线、相关系数 0.9999/0.9997）** |
 | `actual_fps` | ✅ 被控端 1 秒窗口 `FpsMeter`，每 2 秒用 `VideoCfg.actual_fps` 推（真机自报 30.0 fps） |
 | 端到端加密 + PAKE | ✅ 强制加密（协议 v3 / 加密层 v2）；主动 MITM 既解不开也撞不了口令 |
-| systemd 自启（用户态装） | ✅ `enabled`+`active`+`Linger=yes`，`kill -s KILL` 后自动拉起；**整机重启后的自启仍未验** |
-| root 系统装（/opt/uulan） | 未验（真机 `sudo` 要口令） |
+| systemd 自启（用户态装） | ✅ `enabled`+`active`+`Linger=yes`，`kill -s KILL` 后自动拉起；**整机重启后的自启 ✅（2026-10-31 实测）** |
+| root 系统装（/opt/uulan） | ✅ 2026-11-12 用户授权后代跑通过（中继=系统单元、被控端=用户单元；见 `milestones/M5-系统装root-2026-11-12.txt`） |
 
 ## 8. 输入注入（M3）在麒麟上的编译与验证
 
@@ -525,7 +525,7 @@ systemctl --user kill -s KILL uulan-host
 # journal 里重新出现「已用原有设备 ID 上线 device_id=805747189」
 ```
 
-**未验**：整机重启后的自启、root 系统装路径（都要 root）。
+**已补验**（2026-11-12 更正）：整机重启后的自启 —— 2026-10-31 实测（`systemctl reboot` 后 43 秒 SSH 恢复、48 秒双服务 active）；root 系统装 —— 2026-11-12 用户授权代跑（§14.2 与 `milestones/M5-系统装root-2026-11-12.txt`）。以下两段保留，是 2026-10-23 当时的取证过程。
 2026-10-23 夜间批复核过：真机上 `sudo -n -l` 直接回「需要密码」，`systemctl reboot` 走 polkit
 也要认证 —— 无人值守不能重启那台机器（也不该动别人的桌面会话）。
 有 root 口令的人可以这样收尾：`sudo systemctl reboot`，等 40 秒，再
@@ -660,12 +660,40 @@ host+server 的半装前缀，`systemctl --user status` 显示 failed，而安�
 
 ```bash
 bash scripts/verify-install-preflight.sh
-# 期望：15 通过 / 0 失败
-# 四条失败路径都断言「退出码非 0 且 prefix 未被创建」，外加一条正常路径
+# 期望：真机 34 通过 / 0 失败（git-bash/MSYS 上 32/0，3 条正常路径标 SKIP）
+# 每条失败路径都断言「退出码非 0 且 prefix 未被创建」；2026-11-12 起多了「对端中继 / 端口占用」8 条，正常路径也分用户态与系统装两条
 ```
 
 （在 git-bash/MSYS 上跑时，正常路径会标 SKIP —— MSYS 的 `install -d -m 0700`
 改目录权限不可靠；以真机上的结果为准。）
+
+### 14.2 对端中继 / 端口预检（2026-11-12 夜批新增，真机实弹复现）
+
+系统装与用户态装各有一套 `uulan-server` 单元，都监听 `--bind` 的端口（默认 21116）。
+白天那次 root 系统装靠人工先让对端让位才没撞车（`milestones/M5-系统装root-2026-11-12.txt`），
+现在 `install.sh` 在**动磁盘之前**自己会查：
+
+- 装用户态时，若**系统单元** active 或 enabled → 退出码 1，并给出
+  `sudo systemctl disable --now uulan-server.service`；
+- 系统装时，若目标用户的**用户单元**在跑或开着自启 → 退出码 1，并给出带
+  `XDG_RUNTIME_DIR=/run/user/<uid>` 的完整让位命令；enabled 直接看
+  `~/.config/systemd/user/default.target.wants/` 的符号链接，不依赖能否连上对端总线；
+- 两边单元都没撞、但端口被**别的进程**占着 → 退出码 1，提示 `ss -ltnp | grep :<端口>`；
+- **本形态自己的中继在跑不算对端**：「就地升级」（§14，服务活着重装一遍）照常放行；
+- `--no-server`（只装被控端）整块跳过。
+
+要的是 `disable --now` 而不是只 `stop`：只 stop 的话下次开机对端又抢回来，
+所以「enabled 但没在跑」也拦。真实现场复现（真机现网就是系统单元在跑，真 systemctl、真 ss）：
+
+```bash
+bash deploy/install.sh --userland --bin ~/.local/uulan/src/target/release \
+    --prefix /tmp/uulan-livecheck --server 127.0.0.1:21116 --no-start
+# 退出码 1；/tmp/uulan-livecheck 未被创建；报错给出确切的让位命令
+```
+
+回归测试就是 §14.1 那条命令（`verify-install-preflight.sh` 已扩到 34 条；沙箱用
+`UULAN_FAKE_ROOT=1` 与 `UULAN_SYSTEM_UNIT_DIR=<dir>` 两个覆盖项演「系统装」分支 ——
+真非 root 时写不进 `/etc`，不构成提权）。
 
 ## 15. 控制端（uulan-client）在麒麟上编与装（2026-10-24 实测）
 

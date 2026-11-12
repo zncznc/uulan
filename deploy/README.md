@@ -35,7 +35,8 @@ bash install.sh --userland --server 192.168.223.15:21116
    用户态装 → `~/.config/systemd/user/uulan-server.service`；
 3. 被控端 → `~/.config/systemd/user/uulan-host.service`（**两种装法都是用户单元**）；
 4. `loginctl enable-linger <user>` —— 开机不等登录就起用户管理器；
-5. 首次安装生成 `~/.config/uulan/host.json`（随机 12 位密码，0600）。
+5. 首次安装生成 `~/.config/uulan/host.json`（随机 12 位密码，0600）；
+6. **预检对端中继与端口（2026-11-12 起）**：另一套装法的中继还在跑或开着自启、或目标端口被占 → 动磁盘之前退出码 1 并给出让位命令；本套自己在跑（就地升级）照常放行。详见 `docs/DEPLOY-KYLIN.md` §14.2。
 
 装完看状态：
 

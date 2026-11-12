@@ -53,7 +53,9 @@ if [ "$USERLAND" = 1 ]; then
     UULAN_USER="$(id -un)"
     PREFIX="${PREFIX:-$HOME/.local/uulan}"
 else
-    [ "$(id -u)" = 0 ] || die "系统装需要 root：sudo bash install.sh（没有 root 就用 --userland）"
+    # UULAN_FAKE_ROOT=1 只给 scripts/verify-install-preflight.sh 在沙箱里跑「系统装」分支用。
+    # 它不构成提权：真非 root 时，后面写 /opt、写系统单元目录本来就没有权限，一步都走不远。
+    [ "${UULAN_FAKE_ROOT:-}" = 1 ] || [ "$(id -u)" = 0 ] || die "系统装需要 root：sudo bash install.sh（没有 root 就用 --userland）"
     PREFIX="${PREFIX:-/opt/uulan}"
 fi
 id "$UULAN_USER" >/dev/null 2>&1 || die "用户不存在: $UULAN_USER"
@@ -61,7 +63,7 @@ id "$UULAN_USER" >/dev/null 2>&1 || die "用户不存在: $UULAN_USER"
 USER_HOME="$(getent passwd "$UULAN_USER" | cut -d: -f6)"
 USER_UID="$(id -u "$UULAN_USER")"
 USER_UNIT_DIR="$USER_HOME/.config/systemd/user"
-SYSTEM_UNIT_DIR=/etc/systemd/system
+SYSTEM_UNIT_DIR="${UULAN_SYSTEM_UNIT_DIR:-/etc/systemd/system}"   # 覆盖项同上，仅预检测试用
 [ -d "$USER_HOME" ] || die "读不到 $UULAN_USER 的家目录"
 
 # 二进制从哪来：--bin > 包内 ./bin > 源码树 target/release
@@ -111,6 +113,62 @@ as_user() {
     fi
 }
 user_ctl() { as_user systemctl --user "$@"; }
+
+# ---------- 预检：对端中继与目标端口（2026-11-12 真机系统装踩的坑）----------
+# 系统装与用户态装各有一套 uulan-server 单元，抢同一个监听端口。白天那次 root 装
+# 是靠人工先跑了 `systemctl --user disable --now uulan-server.service` 才没撞车 ——
+# 而对端不让位时，失败要到 restart 才暴露，那时 prefix 已建、二进制已换、单元已写，
+# 中继起不来、机器却被改了一半，正是「先落盘、后失败」要防的形态。
+# 所以动磁盘之前查三件事：
+#   1) 对端单元 active  —— 此刻就在占着端口
+#   2) 对端单元 enabled —— 现在不占，下次开机就抢（所以让位必须 disable，不能只 stop）
+#   3) 端口被陌生进程占 —— 兜底；但**本形态自己的中继在跑不算**，
+#      否则「就地升级」（服务活着重装一遍，M5 验过的正式路径）会被自己的端口挡死
+if [ "$DO_SERVER" = 1 ]; then
+    RELAY_PORT="${BIND##*:}"
+    [ "$RELAY_PORT" != "$BIND" ] || die "--bind 里没带端口: $BIND"
+    PEER=""
+    if [ "$USERLAND" = 1 ]; then
+        if systemctl is-active --quiet uulan-server.service 2>/dev/null; then
+            PEER="系统单元 uulan-server.service 正在运行"
+        elif systemctl is-enabled --quiet uulan-server.service 2>/dev/null; then
+            PEER="系统单元 uulan-server.service 开着开机自启（下次开机就会抢端口 $RELAY_PORT）"
+        fi
+        # 本形态自己的中继（用户单元）在跑 → 端口占着也算正常，就地升级要放行
+        OWN_ACTIVE=0
+        user_ctl is-active --quiet uulan-server.service 2>/dev/null && OWN_ACTIVE=1
+    else
+        if user_ctl is-active --quiet uulan-server.service 2>/dev/null; then
+            PEER="用户 $UULAN_USER 的用户单元 uulan-server.service 正在运行"
+        elif [ -e "$USER_HOME/.config/systemd/user/default.target.wants/uulan-server.service" ]; then
+            # 用户单元的「enabled」直接查 enable 落下的符号链接，不走总线：
+            # root 的 ssh 会话里 systemctl --user 经常连不上目标用户的 bus，
+            # 而「连不上」不等于「没开自启」，宁可用文件判据。
+            PEER="用户 $UULAN_USER 的用户单元 uulan-server.service 开着开机自启（下次开机就会抢端口 $RELAY_PORT）"
+        fi
+        OWN_ACTIVE=0
+        systemctl is-active --quiet uulan-server.service 2>/dev/null && OWN_ACTIVE=1
+    fi
+    if [ -n "$PEER" ]; then
+        if [ "$USERLAND" = 1 ]; then
+            FIX="sudo systemctl disable --now uulan-server.service"
+        else
+            FIX="sudo -u $UULAN_USER XDG_RUNTIME_DIR=/run/user/$USER_UID systemctl --user disable --now uulan-server.service"
+        fi
+        die "对端中继没让位：$PEER。
+     本次安装要装的是另一套中继单元，两边都监听 $RELAY_PORT，装到一半必炸。
+     请先让位再重跑（要 disable 而不是只 stop：只 stop 的话下次开机又抢回来）：
+         $FIX
+     这次不需要装中继的话，也可以加 --no-server 只装被控端。"
+    fi
+    if [ "$OWN_ACTIVE" = 0 ] && command -v ss >/dev/null 2>&1; then
+        if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${RELAY_PORT}\$"; then
+            die "端口 $RELAY_PORT 已被占用，而占用者不是本次要重装的那套中继。
+     先看是谁在听：ss -ltnp | grep :$RELAY_PORT
+     处理掉再重跑，或 --bind 换一个端口。"
+        fi
+    fi
+fi
 
 say "安装到 $PREFIX（$([ "$USERLAND" = 1 ] && echo 用户态 || echo 系统装)，运行身份 $UULAN_USER，中继 $SERVER）"
 install -d -m 0755 "$PREFIX" "$PREFIX/bin" "$PREFIX/doc" "$PREFIX/state"
