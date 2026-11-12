@@ -1,0 +1,14 @@
+# uulan 日常运维的最小 sudo 授权（放到真机 /etc/sudoers.d/uulan，权限 440）
+#
+# 故意不包含的东西（都是提权面，别加）：
+#   - NOPASSWD:ALL                     → 整个账号变 root
+#   - /tmp/uulan-*/install.sh 这类通配  → /tmp 任何本地用户可写，等于给任意脚本开免密 root
+#   - bash / sh / vim / less 等可逃逸命令
+#
+# 只放开日常真的会用到的窄操作。安装/升级仍需人亲自输一次 sudo 口令。
+mis ALL=(root) NOPASSWD: /bin/systemctl daemon-reload
+mis ALL=(root) NOPASSWD: /bin/systemctl start uulan-server.service
+mis ALL=(root) NOPASSWD: /bin/systemctl stop uulan-server.service
+mis ALL=(root) NOPASSWD: /bin/systemctl restart uulan-server.service
+mis ALL=(root) NOPASSWD: /bin/systemctl status uulan-server.service
+mis ALL=(root) NOPASSWD: /usr/bin/journalctl -u uulan-server*
