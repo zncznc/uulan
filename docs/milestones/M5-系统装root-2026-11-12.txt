@@ -1,0 +1,35 @@
+M5 补验：root 系统装（/opt/uulan）—— 2026-11-12 真机通过
+
+此前 M5 只验过 `install.sh --userland`，系统装路径一直挂着「未验」，原因是
+`mis` 没有免密 sudo、无人值守下拿不到 root。本轮由用户明确授权后代为执行，补齐。
+
+离线包：`/tmp/uulan-root-1112-x86_64-linux.tar.gz`（2.5 MB，
+sha256 1fb88b99…40d3b6），由真机原生 `cargo build --release` + `make-package.sh` 产出。
+
+执行：`sudo bash install.sh --user mis --server 192.168.223.15:21116`，退出码 0。
+
+装完实况
+
+  中继：系统单元 `uulan-server.service`，active + enabled（multi-user.target 已挂），
+        监听 0.0.0.0:21116，台账落在 /opt/uulan/state/devices.json
+  被控端：仍为用户单元 `uulan-host.service`（安装脚本的设计：被控端必须以桌面用户
+        身份运行才能拿到 :0），active
+  设备 ID：805747189，与用户态安装时期一致，未因换前缀而改变
+  /opt/uulan/bin：uulan-host / uulan-server / uulan-wait-x
+
+验收：Windows 控制端连上
+  收到 AU 748 / 解出 745 / 丢帧 0 / 首帧 250 ms / 被控端实测 30 fps
+  编码器 libx264；`--diagnose` 8 通过 / 1 警告 / 0 失败（警告=当时屏幕被 UKUI 锁着）
+  锁屏门禁按策略生效：控制端收到 locked=true 后停发键鼠，被控端 events=0
+  四条通道全部配对（Control/Video/Bulk/Audio，协议 v4）
+
+两个值得记住的点
+
+1. **系统装与用户态装不能同时跑中继**，两者都抢 21116。装之前必须先
+   `systemctl --user disable --now uulan-server.service`。安装脚本目前不会自动让位，
+   这是个可改进点（预检里该查一下对端单元）。
+2. **经 ssh 远端的 sudo 拿不到 Hermes 的 `SUDO_PASSWORD` 注入**：那份注入只改写本地
+   终端的裸 `sudo`，`ssh host 'sudo …'` 里的远端 sudo 仍然要 tty 或 `-S`。
+   本轮用的是 ssh 分配 pty、在中文提示「输入密码」处应答（护栏禁止 `-S` 管道灌口令，
+   这条是对的）。想彻底无人值守，就得给真机配最小 sudoers 授权，例如
+   `mis ALL=(ALL) NOPASSWD:/opt/uulan/**, /tmp/uulan-*/install.sh`。

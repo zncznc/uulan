@@ -112,8 +112,8 @@ ffmpeg 4.2.2-1kylin1k23.8，glibc 2.31。
   剪贴板（`OpenClipboard` 报 Win32 错误 5「拒绝访问」，与 uulan 无关），需在交互式
   桌面会话里跑 `scripts/verify-clipboard-cross.sh`。控制端会**显式打印不可用原因**，
   不会假装发送成功。
-- **系统装（root，`/opt/uulan`）路径未验**：`mis` 没有免密 sudo，无人值守下验不了。
-  已验证的是用户态安装（`install.sh --userland`）。
+- **系统装（root，`/opt/uulan`）已验**（2026-11-12）；用户态装（`install.sh --userland`）更早验过。
+  注意两者不能同时跑中继：都会抢 21116，切换前要先停掉用户单元的 `uulan-server.service`。
 - **PAKE 是本仓库自研实现（CPace / Ristretto255），没有第三方审计。**
 - 端口映射目前是**真二进制在本机全链路**验的，没有单独的麒麟真机记录。
 

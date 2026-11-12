@@ -57,6 +57,11 @@ struct Args {
     /// 脚本化键鼠注入（`--inject`）：只发输入、不收画面，跑完就退出。
     /// 存在的理由是「键鼠真的打进了被控端」必须能机器验证，不能靠人手点。
     inject: Option<String>,
+    /// 现场注入（`--inject-live`）：在**正在看画面的这条会话里**按脚本发键鼠。
+    /// 与 `--inject` 的区别不只是「顺便收画面」—— 关键是每一步都按**当时**的画幅换算，
+    /// 所以它是「被控端中途换分辨率之后落点跟不跟得上」唯一的机器可验路径
+    /// （`--inject` 是独立会话 + 握手时的固定尺寸，天生验不了这条）。
+    inject_live: Option<String>,
     /// 只列设备目录（`--devices`）：连中继、拉清单、打印、退出。
     /// 不需要 `--device`，也不需要口令 —— 它回答的正是「我该连哪台」。
     devices: bool,
@@ -148,6 +153,14 @@ uulan-client —— uulan 内网远控的控制端
                              type:文本 / wait:毫秒
                              例：--inject \"move:960,540; click:left; type:hello\"
                              退出码 0 = 全部注入成功；3 = 被控端报告注入失败
+  --inject-live \"<脚本>\"  在**正在看的这条会话里**发键鼠（画面照常收，窗口 / headless 都行）
+                             步骤写法与 --inject 一样，区别有两条：
+                               · 画幅是**每一步现取**的（被控端中途换分辨率，落点跟着换）
+                               · 跑完不退出，会话按 --frames / --seconds 收尾
+                             例：--headless --seconds 40 --inject-live
+                                   \"wait:4000; move:960,540; wait:12000; move:640,360\"
+                             每发一条移动打一行「注入换算 : 画幅=… → 归一化=…」，
+                             验收脚本据此把「控制端按新尺寸换算」与「被控端按新尺寸落点」对上号
 
 上次连接（本机记一个文件，**不存口令**）：
   --last              用上次连成功的那台补上空着的 --server / --device
@@ -186,6 +199,7 @@ fn parse_args() -> Result<Args> {
         term_size: None,
         term_shell: None,
         inject: None,
+        inject_live: None,
         status: None,
         devices: false,
         last: false,
@@ -256,6 +270,12 @@ fn parse_args() -> Result<Args> {
             }
             "--inject" => {
                 a.inject = Some(it.next().context("--inject 需要一个脚本，例如 \"click:left\"")?)
+            }
+            "--inject-live" => {
+                a.inject_live = Some(
+                    it.next()
+                        .context("--inject-live 需要一个脚本，例如 \"wait:8000; move:640,360\"")?,
+                )
             }
             "--quality" => {
                 let v = it.next().context("--quality 需要一个档位：auto|fast|high|hd|bluray")?;
@@ -414,6 +434,19 @@ fn parse_args() -> Result<Args> {
         bail!(
             "--quality/--bitrate/--fps/--scale 只对看画面的会话有效：--inject、文件操作、--term、--forward、--status 都不开视频通道"
         );
+    }
+    // 现场注入必须**跟着一条有画面的会话**。它和 --inject 是两种东西：含糊地两个都给，
+    // 用户以为在验的其实是另一条路（独立会话、按握手时的固定尺寸换算）。
+    if a.inject_live.is_some() {
+        if a.inject.is_some() {
+            bail!("--inject 与 --inject-live 只能选一个：前者是独立会话、后者跟着画面会话跑");
+        }
+        if a.no_input {
+            bail!("--inject-live 与 --no-input 矛盾：只读模式一条键鼠都不发，脚本一步也出不去");
+        }
+        if a.fs_op.is_some() || a.term || !a.forward.is_empty() || a.status.is_some() {
+            bail!("--inject-live 只在有画面的会话里有效：文件操作、--term、--forward、--status 都不开视频通道，没有「当时的画幅」可换算");
+        }
     }
     let env_pw = std::env::var("UULAN_PASSWORD").ok();
     a.password = resolve_password(&a.password, a.password_file.as_deref(), env_pw.as_deref())?;
@@ -899,6 +932,18 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // 现场注入：脚本现在就解析好（写错要当场退出，而不是画面跑完才发现白等一场），
+    // 并先确认对面真有个可注入的桌面 —— 合成采集源没有桌面，打进去也没人看见。
+    let live_steps: Option<Vec<uulan_client::inject::Step>> = match &args.inject_live {
+        Some(script) => {
+            if !c.host.has_desktop {
+                eprintln!("被控端没有图形会话，没有可注入的桌面（采集源是合成画面？）");
+                std::process::exit(2);
+            }
+            Some(uulan_client::inject::parse(script).context("--inject-live 脚本解析失败")?)
+        }
+        None => None,
+    };
     let started = Instant::now();
 
     // 会话配置：窗口模式与 headless 共用同一份 —— 重连就是「拿同一份参数再握一次手」。
@@ -943,10 +988,36 @@ async fn main() -> Result<()> {
             c.host.name, c.host.os, c.host.version, c.host.screen.w, c.host.screen.h
         );
 
+        // 现场注入挂在**会话槽**上：每一步现取 `live.input()` 与 `live.stats().size()`，
+        // 所以换代之后按新尺寸换算；重连期间取不到通道就等（那是常态，不算失败）。
+        let inj_handle = match &live_steps {
+            Some(steps) => Some(tokio::spawn(inject_via_live(
+                live.clone(),
+                steps.clone(),
+                (c.host.screen.w, c.host.screen.h),
+            ))),
+            None => None,
+        };
         let sup = tokio::spawn(session::drive(live.clone(), plan.clone(), c));
         let r = uulan_client::window::run(live.clone(), overlay, args.seconds);
         // 窗口关了（用户点的 / 到了 --seconds / 不再重连）：会话循环连同解码器一起收掉。
         sup.abort();
+        // 现场注入的收尾必须在这：它和下面的「输入上报」共用同一份 InputStats，
+        // 先等它发完，那行统计才包含脚本发出去的条数。
+        if let Some(h) = inj_handle {
+            match await_injection(h).await {
+                Some(out) => println!(
+                    "现场注入：发送 {} 条 / 用到过的画幅 {}（逐步换算见「注入换算」行）",
+                    out.sent,
+                    out.sizes
+                        .iter()
+                        .map(|(w, h)| format!("{}x{}", w, h))
+                        .collect::<Vec<_>>()
+                        .join(" → ")
+                ),
+                None => eprintln!("现场注入没跑完（见上面的原因）"),
+            }
+        }
 
         // 收工统计在 abort 之后读：abort 只杀任务，原子量里的计数还在。
         let si = live.input_stats().snapshot();
@@ -998,7 +1069,7 @@ async fn main() -> Result<()> {
     }
 
     // ── headless ──────────────────────────────────────────────────────────
-    run_headless(&args, &plan, c, started).await
+    run_headless(&args, &plan, c, started, live_steps).await
 }
 
 /// 一个会话的统计（收工报告用）。
@@ -1100,12 +1171,69 @@ async fn watch_session(
     (Report { snap, elapsed, kbps, video }, done)
 }
 
+/// 把「现场注入」挂到会话槽上：输入通道与画幅都从 [`session::Live`] **现取**。
+///
+/// 为什么窗口模式走 `Live` 而不是直接攥着 `ControlLink`：会话槽跨重连，脚本发的每一步
+/// 都要落在「当下这条会话」上 —— 断线期间 `live.input()` 是 `None`，那是等待而不是失败。
+async fn inject_via_live(
+    live: Arc<session::Live>,
+    steps: Vec<uulan_client::inject::Step>,
+    fallback: (u32, u32),
+) -> Result<uulan_client::inject::Outcome> {
+    let status = live.status();
+    let stats = live.input_stats();
+    let wstats = live.stats();
+    uulan_client::inject::run_with(
+        uulan_client::inject::Hooks {
+            port: Box::new(move || live.input()),
+            size: Box::new(move || {
+                let (w, h) = wstats.size();
+                if w == 0 || h == 0 {
+                    fallback
+                } else {
+                    (w, h)
+                }
+            }),
+            status,
+            stats,
+            port_wait: uulan_client::inject::PORT_WAIT,
+        },
+        &steps,
+        true,
+    )
+    .await
+}
+
+/// 等现场注入收尾（上限 20 秒）。
+///
+/// 脚本写得比 `--seconds` 长、或会话早就断了，都不能把整个进程挂住：如实打印原因，
+/// 别让它伪装成「注入成功」。取不到 `Outcome` 就返回 `None`，收工统计里不再有那一行。
+async fn await_injection(
+    h: tokio::task::JoinHandle<Result<uulan_client::inject::Outcome>>,
+) -> Option<uulan_client::inject::Outcome> {
+    match tokio::time::timeout(Duration::from_secs(20), h).await {
+        Ok(Ok(Ok(out))) => Some(out),
+        Ok(Ok(Err(e))) => {
+            eprintln!("现场注入没跑完：{e}");
+            None
+        }
+        Ok(Err(e)) => {
+            eprintln!("现场注入任务崩了：{e}");
+            None
+        }
+        Err(_) => {
+            eprintln!("现场注入超过 20 秒还没收尾（脚本比 --seconds 长？），已放弃等待");
+            None
+        }
+    }
+}
 /// headless 会话循环：和窗口模式同一套「断了就退避重连」，只是没有窗口可画。
 async fn run_headless(
     args: &Args,
     plan: &session::Plan,
     first: connect::Connected,
     started: Instant,
+    live_steps: Option<Vec<uulan_client::inject::Step>>,
 ) -> Result<()> {
     let deadline = args.seconds.map(|s| started + Duration::from_secs_f64(s));
     let host = first.host.clone();
@@ -1117,6 +1245,11 @@ async fn run_headless(
     let mut reconnects = 0u32;
     let mut totals = session::Totals::default();
     let mut report: Option<Report> = None;
+    // 现场注入只在**第一条**会话上跑一遍脚本：重连之后不重放，否则验收脚本的计数会翻倍，
+    // 而「同一个动作打进两次」在真机上根本分不清是哪一次落的点。
+    let mut inj_handle: Option<tokio::task::JoinHandle<Result<uulan_client::inject::Outcome>>> =
+        None;
+    let mut live_outcome: Option<uulan_client::inject::Outcome> = None;
     // 输入/剪贴板计数跨会话累加：headless 的收工统计也要报这两行 ——
     // `scripts/verify-clipboard-cross.sh` 与夜批判「剪贴板到底同没同步」看的就是它们，
     // 而以前只有窗口模式会打（脚本在 headless 下永远抓不到，等于断言写死成失败）。
@@ -1165,9 +1298,44 @@ async fn run_headless(
                 Ok(mut o) => {
                     sessions += 1;
                     opened = true;
+                    if inj_handle.is_none() && live_steps.is_some() {
+                        let sender = o.link.input();
+                        let status = o.link.status();
+                        let istats = o.link.stats();
+                        let wstats = o.watcher.stats();
+                        let fallback = (host.screen.w, host.screen.h);
+                        let steps = live_steps.clone().unwrap_or_default();
+                        inj_handle = Some(tokio::spawn(async move {
+                            uulan_client::inject::run_with(
+                                uulan_client::inject::Hooks {
+                                    port: Box::new(move || Some(sender.clone())),
+                                    size: Box::new(move || {
+                                        let (w, h) = wstats.size();
+                                        // 还没有任何 VideoCfg 就用握手时报的尺寸兜一下 ——
+                                        // 真到了 0x0，run_with 里还有一层「沿用上一次换算」的保护。
+                                        if w == 0 || h == 0 {
+                                            fallback
+                                        } else {
+                                            (w, h)
+                                        }
+                                    }),
+                                    status,
+                                    stats: istats,
+                                    port_wait: uulan_client::inject::PORT_WAIT,
+                                },
+                                &steps,
+                                true,
+                            )
+                            .await
+                        }));
+                    }
                     let (rep, done) =
                         watch_session(args, deadline, &mut o, &mut count, &mut last_frame, sessions == 1)
                             .await;
+                    // 现场注入同样要在 close 之前收尾：close 会吃掉控制通道。
+                    if let Some(h) = inj_handle.take() {
+                        live_outcome = await_injection(h).await;
+                    }
                     // 必须在 close 之前取：close 会把 link 吃掉，之后的计数就没了。
                     ins.accumulate(&o.link.stats().snapshot());
                     o.link.close("控制端准备重连").await;
@@ -1326,6 +1494,17 @@ async fn run_headless(
             println!("  请求帧率   : {} fps（被控端当前编码帧率）", s.cfg_fps);
         }
         println!("  解码器重建 : {} 次（被控端换过分辨率）", s.resizes);
+        if let Some(out) = &live_outcome {
+            println!(
+                "  现场注入   : 发送 {} 条 / 用到过的画幅 {}（逐步换算见「注入换算」行）",
+                out.sent,
+                out.sizes
+                    .iter()
+                    .map(|(w, h)| format!("{}x{}", w, h))
+                    .collect::<Vec<_>>()
+                    .join(" → ")
+            );
+        }
         // 这两行以前只有窗口模式才有：headless 是脚本/夜批唯一的观测面，
         // 少了它们「剪贴板发送 0」在日志里就无迹可寻。
         println!(

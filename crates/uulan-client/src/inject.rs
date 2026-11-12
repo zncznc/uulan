@@ -34,6 +34,7 @@
 //! 全在纯函数里，和窗口模式的 [`crate::input`] 用的是同一套取整规则（`max = 边长-1`），
 //! 所以两边不会各算一套。
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -42,7 +43,7 @@ use uulan_protocol::crypto::SecControl;
 use uulan_protocol::msg::{C2H, KeyInput, MouseButton};
 use uulan_protocol::vk::KeyTarget;
 
-use crate::control::ControlLink;
+use crate::control::{ControlLink, HostStatus, InputSender, InputStats};
 
 /// 一个脚本步骤。
 #[derive(Debug, Clone, PartialEq)]
@@ -191,6 +192,20 @@ pub fn px_to_norm(x: i32, y: i32, w: u32, h: u32) -> (f32, f32) {
 pub fn plan(steps: &[Step], screen_w: u32, screen_h: u32) -> Vec<Action> {
     let mut out = Vec::new();
     for st in steps {
+        out.extend(plan_one(st, screen_w, screen_h));
+    }
+    out
+}
+
+/// **一个**步骤 → 动作序列。
+///
+/// 为什么要把 `plan` 拆成逐条的：现场注入（`--inject-live`）每一步都得按「当时」的
+/// 画幅换算 —— 被控端在会话中途换了分辨率，还按开会话那一刻的尺寸乘坐标，落点就偏
+/// （偏多少取决于新旧尺寸比，1080p→720p 是 17%）。一遍循环算完整脚本的 `plan`
+/// 只能用一个尺寸，所以留出这个逐条入口，`plan` 变成它的一遍循环。
+pub fn plan_one(st: &Step, screen_w: u32, screen_h: u32) -> Vec<Action> {
+    let mut out = Vec::new();
+    {
         match st {
             Step::MovePx { x, y } => {
                 let (nx, ny) = px_to_norm(*x, *y, screen_w, screen_h);
@@ -227,45 +242,116 @@ pub fn plan(steps: &[Step], screen_w: u32, screen_h: u32) -> Vec<Action> {
             }
             Step::Wait(ms) => out.push(Action::Sleep(*ms)),
         }
+        out
     }
-    out
 }
 
-/// 跑一遍脚本。返回「被控端报告的注入错误数」（0 = 全部真的打进去了）。
-pub async fn run(control: SecControl, steps: &[Step], screen_w: u32, screen_h: u32) -> Result<u64> {
-    let link = ControlLink::start(control);
-    let input = link.input();
+/// 给日志用的一行步骤描述（只描述位置类步骤，别的返回空串就不打）。
+fn step_tag(st: &Step) -> String {
+    match st {
+        Step::MovePx { x, y } => format!("move:{},{}", x, y),
+        Step::MoveNorm { x, y } => format!("movn:{:.4},{:.4}", x, y),
+        _ => String::new(),
+    }
+}
+
+/// 端口（输入通道）取不到时最多等多久 —— 重连中的会话会在几秒内回来。
+pub const PORT_WAIT: Duration = Duration::from_secs(10);
+
+/// 一次注入的产出。
+#[derive(Debug, Clone)]
+pub struct Outcome {
+    /// 实际发出去的输入帧数（`wait:` 步骤不算）。
+    pub sent: u64,
+    /// 被控端报告的注入错误数（0 = 全部真的打进去了）。
+    pub host_errors: u64,
+    /// 按出现顺序去重的**用到过的画幅**。
+    ///
+    /// 这是「换代之后按新尺寸换算」的证据：里面出现两个画幅，就说明确实有两段
+    /// 各自的换算；只出现一个，说明这一轮压根没换过分辨率（不能拿来当已验）。
+    pub sizes: Vec<(u32, u32)>,
+}
+
+/// 「现场注入」要的三个入口，全部由调用方给 —— 同 `Mapper` / `InputSink` 的分层思路：
+/// 逻辑在这里，接线在外面，于是本机能用内存假通道把「逐步换画幅」这条路钉住。
+pub struct Hooks {
+    /// 当前的输入发送端。`None` = 这一刻没有可注入的会话（正在重连 / 已放弃）。
+    pub port: Box<dyn Fn() -> Option<InputSender> + Send + Sync>,
+    /// **当前**画幅（被控端屏幕尺寸，不是编码画幅）。会话中途换过分辨率必须报新值。
+    pub size: Box<dyn Fn() -> (u32, u32) + Send + Sync>,
+    /// 被控端状态（锁屏门禁在这里读）。
+    pub status: Arc<HostStatus>,
+    /// 输入计数：与这条会话共用同一份，收工时的「已发送 N 条」才和窗口/统计一致。
+    pub stats: Arc<InputStats>,
+    /// 端口取不到时的等待上限（单测把它调短）。
+    pub port_wait: Duration,
+}
+
+/// 在**正在跑的会话里**按脚本发键鼠：每一步发出前重新读一次画幅。
+///
+/// `annotate = true` 时每发一条移动都打一行「画幅 / 请求 / 归一化」的换算，
+/// 验收脚本据此把「客户端按新尺寸换算」和「被控端按新尺寸落点」两端对上号
+/// （只看到指针动了，分不出是哪一端跟着换了尺寸）。
+pub async fn run_with(hooks: Hooks, steps: &[Step], annotate: bool) -> Result<Outcome> {
     // 先等被控端的桌面状态（它开局就发，正常是几毫秒）。
     //
     // 不等就会有一个真踩到过的窗口：注入跑在状态到达之前，于是键鼠进了锁屏。
     // 被控端那边现在也会挡（那是权威的一侧），但脚本化验收要的是「一开始就不发」。
     // 等不到（老版本被控端不发这条）就照旧往下走，不因为等不到而失败。
-    let status = link.status();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
-    while !status.snapshot().known && tokio::time::Instant::now() < deadline {
+    while !hooks.status.snapshot().known && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let actions = plan(steps, screen_w, screen_h);
+
     let mut sent = 0u64;
-    for a in &actions {
-        match a {
-            Action::Send(m) => {
-                if !input.send(m.clone()) {
-                    bail!("控制通道已断开（已经发了 {sent} 条）");
+    let mut sizes: Vec<(u32, u32)> = Vec::new();
+    for st in steps {
+        // 每一步取一次画幅。**不能**在循环外取：那是「开会话时的尺寸」，
+        // 换过分辨率之后就变成按旧尺寸乘坐标。
+        let (mut w, mut h) = (hooks.size)();
+        if w == 0 || h == 0 {
+            // 还没有任何一条 VideoCfg 报过画幅（或对面报了 0）—— 宁可沿用上一次换算
+            // 用的尺寸，也不拿 0 去除（`px_to_norm` 会把它夹成 1.0，落点悄悄跑到右下角）。
+            match sizes.last() {
+                Some(&(pw, ph)) => {
+                    w = pw;
+                    h = ph;
                 }
-                sent += 1;
-                // 别一股脑塞进去：留一点时间给被控端和它后面的 X 客户端。
-                tokio::time::sleep(Duration::from_millis(12)).await;
+                None => bail!("还没收到被控端的画幅（0x0），换不出坐标：等画面通了再注入"),
             }
-            Action::Sleep(ms) => tokio::time::sleep(Duration::from_millis(*ms)).await,
+        }
+        if !sizes.iter().any(|s| *s == (w, h)) {
+            sizes.push((w, h));
+        }
+        let tag = step_tag(st);
+        for a in plan_one(st, w, h) {
+            match a {
+                Action::Send(m) => {
+                    let port = wait_port(&hooks).await?;
+                    if !port.send(m.clone()) {
+                        bail!("控制通道已断开（已经发了 {sent} 条）");
+                    }
+                    sent += 1;
+                    if annotate && !tag.is_empty() {
+                        if let C2H::MouseMoveAbs { x, y } = &m {
+                            println!(
+                                "注入换算 : 画幅={}x{} 步骤={} → 归一化={:.4},{:.4}",
+                                w, h, tag, x, y
+                            );
+                        }
+                    }
+                    // 别一股脑塞进去：留一点时间给被控端和它后面的 X 客户端。
+                    tokio::time::sleep(Duration::from_millis(12)).await;
+                }
+                Action::Sleep(ms) => tokio::time::sleep(Duration::from_millis(ms)).await,
+            }
         }
     }
     // 留一点时间让被控端的 InputError 回来 —— 不然「注入失败」会被当成成功。
     tokio::time::sleep(Duration::from_millis(600)).await;
 
-    let st = link.stats();
-    let si = st.snapshot();
-    let hs = status.snapshot();
+    let si = hooks.stats.snapshot();
+    let hs = hooks.status.snapshot();
     if hs.known && hs.locked {
         // 说清楚「为什么一条都没注入」：不然看图的人会以为是注入坏了。
         println!("被控端处于锁屏：键鼠按策略不发（XTest 会绕过锁屏抓取，往锁屏里打字有风险）");
@@ -274,8 +360,47 @@ pub async fn run(control: SecControl, steps: &[Step], screen_w: u32, screen_h: u
         "已发送 {} 条输入帧（移动 {} / 按键 {} / 文本 {} / 点击 {} / 滚轮 {}；未送出 {}；被控端拒绝 {}）",
         sent, si.moves, si.keys, si.chars, si.buttons, si.wheels, si.dropped, si.host_errors
     );
+    Ok(Outcome { sent, host_errors: si.host_errors, sizes })
+}
+
+/// 取输入通道；拿不到就等（会话正在重连时这是常态，不该算失败）。
+async fn wait_port(hooks: &Hooks) -> Result<InputSender> {
+    let until = tokio::time::Instant::now() + hooks.port_wait;
+    loop {
+        if let Some(p) = (hooks.port)() {
+            return Ok(p);
+        }
+        if tokio::time::Instant::now() >= until {
+            bail!(
+                "等了 {} 秒还是没有可注入的输入通道（画面已断且没接回来，或被控端没有图形会话）",
+                hooks.port_wait.as_secs()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// 跑一遍脚本（独立会话，`--inject`）。返回「被控端报告的注入错误数」。
+///
+/// 这条路的画幅是**开会话时**握手报来的，整个脚本用同一个尺寸 —— 这正是它验不了
+/// 「换分辨率之后的落点」的原因，那条走 [`run_with`]（`--inject-live`）。
+pub async fn run(control: SecControl, steps: &[Step], screen_w: u32, screen_h: u32) -> Result<u64> {
+    let link = ControlLink::start(control);
+    let sender = link.input();
+    let out = run_with(
+        Hooks {
+            port: Box::new(move || Some(sender.clone())),
+            size: Box::new(move || (screen_w, screen_h)),
+            status: link.status(),
+            stats: link.stats(),
+            port_wait: PORT_WAIT,
+        },
+        steps,
+        false,
+    )
+    .await?;
     link.close("注入脚本执行完毕").await;
-    Ok(si.host_errors)
+    Ok(out.host_errors)
 }
 
 #[cfg(test)]
@@ -420,4 +545,154 @@ mod tests {
             other => panic!("wait 变成了 {other:?}"),
         }
     }
+
+    // ── 现场注入（--inject-live）：每一步都用「当时」的画幅 ──────────────────
+    //
+    // 这台机器上没有第二个 X 服务器，所以这里用内存假通道：`InputSender::for_test`
+    // 把帧收到一个 mpsc 里，画幅由闭包按调用次数给 —— 于是「换代之后落点跟不跟得上」
+    // 这一端（控制端换算）能在本机钉死，被控端那一端的真机数字见 docs/milestones/。
+
+    use std::sync::atomic::{AtomicU64, Ordering as Ord2};
+    use tokio::sync::mpsc;
+
+    fn hooks_with(
+        sizes: Vec<(u32, u32)>,
+        port_available_after: u64,
+        port_wait: Duration,
+    ) -> (Hooks, mpsc::UnboundedReceiver<C2H>, Arc<AtomicU64>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let status = Arc::new(HostStatus::default());
+        let sender = InputSender::for_test(tx, status.clone());
+        let stats = Arc::new(InputStats::default());
+        let calls = Arc::new(AtomicU64::new(0));
+        let table: Vec<(u32, u32)> = sizes;
+        let c1 = calls.clone();
+        let c2 = calls.clone();
+        let hooks = Hooks {
+            port: Box::new(move || {
+                if c1.fetch_add(1, Ord2::SeqCst) < port_available_after {
+                    None
+                } else {
+                    Some(sender.clone())
+                }
+            }),
+            size: Box::new(move || {
+                let n = (c2.fetch_add(1, Ord2::SeqCst) as usize).min(table.len() - 1);
+                table[n]
+            }),
+            status,
+            stats,
+            port_wait,
+        };
+        (hooks, rx, calls)
+    }
+
+    fn moves(rx: &mut mpsc::UnboundedReceiver<C2H>) -> Vec<(f32, f32)> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let C2H::MouseMoveAbs { x, y } = m {
+                out.push((x, y));
+            }
+        }
+        out
+    }
+
+    /// 会话中途换了分辨率：第二条 `move:` 必须按**新**画幅换算。
+    ///
+    /// 这条就是「独立会话 + 握手尺寸」那种写法永远测不到的东西：按旧尺寸算，
+    /// 1280x720 的 (640,360) 会变成 0.3333（该 0.5004），落点偏 17%。
+    #[tokio::test]
+    async fn live_injection_replans_every_step_with_the_current_size() {
+        let (hooks, mut rx, _) = hooks_with(
+            vec![(1920, 1080), (1280, 720), (1280, 720)],
+            0,
+            Duration::from_millis(50),
+        );
+        let steps = parse("move:960,540; move:640,360").unwrap();
+        let out = run_with(hooks, &steps, false).await.unwrap();
+
+        let got = moves(&mut rx);
+        assert_eq!(got.len(), 2, "两条移动都要发出去");
+        assert!((got[0].0 - 960.0 / 1919.0).abs() < 1e-5, "第一条按 1920x1080：{:?}", got[0]);
+        assert!((got[0].1 - 540.0 / 1079.0).abs() < 1e-5);
+        // 第二步换成 1280x720：按旧尺寸的话这里是 0.3333，肉眼看得见的偏。
+        assert!((got[1].0 - 640.0 / 1279.0).abs() < 1e-5, "第二条按 1280x720：{:?}", got[1]);
+        assert!((got[1].1 - 360.0 / 719.0).abs() < 1e-5);
+        assert_eq!(out.sent, 2);
+        assert_eq!(out.sizes, vec![(1920, 1080), (1280, 720)], "用到过的画幅按顺序去重");
+    }
+
+    /// 断线重连期间没有输入通道：等它回来，而不是当失败（也不许悄悄丢计数）。
+    #[tokio::test]
+    async fn live_injection_waits_for_the_port_instead_of_failing() {
+        // 前 2 次取不到（poll 间隔 100ms，两次 200ms），第三次起有。
+        let (hooks, mut rx, _) = hooks_with(vec![(800, 600)], 2, Duration::from_millis(2000));
+        let steps = parse("click:left").unwrap();
+        let out = run_with(hooks, &steps, false).await.unwrap();
+        assert_eq!(out.sent, 2, "一次按下 + 一次松开");
+        let mut n = 0;
+        while let Ok(m) = rx.try_recv() {
+            if matches!(m, C2H::MouseButton { .. }) {
+                n += 1;
+            }
+        }
+        assert_eq!(n, 2);
+    }
+
+    /// 等不到通道就把话说清楚，别伪装成成功。
+    #[tokio::test]
+    async fn live_injection_reports_when_the_port_never_comes_back() {
+        let (hooks, _rx, _) = hooks_with(vec![(800, 600)], 1_000_000, Duration::from_millis(120));
+        let steps = parse("move:10,10").unwrap();
+        let e = run_with(hooks, &steps, false).await.unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains("没有可注入的输入通道"), "实际：{msg}");
+    }
+
+    /// 画幅报了 0x0（还没收到任何 VideoCfg）：第一步就明确失败，
+    /// 不能拿 0 去除 —— `px_to_norm` 会把它夹成 1.0，落点悄悄跑到右下角。
+    #[tokio::test]
+    async fn live_injection_refuses_a_zero_screen_before_any_conversion() {
+        let (hooks, _rx, _) = hooks_with(vec![(0, 0)], 0, Duration::from_millis(50));
+        let steps = parse("move:100,100").unwrap();
+        let e = run_with(hooks, &steps, false).await.unwrap_err();
+        assert!(format!("{e:#}").contains("换不出坐标"), "实际：{e:#}");
+    }
+
+    /// 中途报了一次 0x0（对面短暂没报画幅）：沿用上一次换算用的尺寸，而不是报错，
+    /// 也不是拿 0 去除。
+    #[tokio::test]
+    async fn live_injection_reuses_the_last_known_size_for_a_zero_reading() {
+        let (hooks, mut rx, _) = hooks_with(
+            vec![(1920, 1080), (0, 0), (1920, 1080)],
+            0,
+            Duration::from_millis(50),
+        );
+        let steps = parse("move:960,540; move:960,540").unwrap();
+        let out = run_with(hooks, &steps, false).await.unwrap();
+        let got = moves(&mut rx);
+        assert_eq!(got.len(), 2);
+        for g in &got {
+            assert!((g.0 - 960.0 / 1919.0).abs() < 1e-5, "第二步本该沿用 1920x1080：{g:?}");
+        }
+        assert_eq!(out.sizes, vec![(1920, 1080)], "0x0 不该被当成一个新画幅记进去");
+    }
+
+    /// `plan_one` 必须与 `plan` 逐条一致：`--inject`（老路）不能被这次重构改了行为。
+    #[test]
+    fn plan_one_is_plan_applied_one_step_at_a_time() {
+        let steps = parse("move:1,2; click:right; wheel:down:3; type:a; wait:5; tap:0x41").unwrap();
+        let whole = plan(&steps, 800, 600);
+        let mut piece = Vec::new();
+        for st in &steps {
+            piece.extend(plan_one(st, 800, 600));
+        }
+        let j = |v: &[Action]| serde_json::to_string(&v.iter().filter_map(|a| match a {
+            Action::Send(m) => Some(m),
+            Action::Sleep(_) => None,
+        }).collect::<Vec<_>>()).unwrap();
+        assert_eq!(j(&whole), j(&piece));
+        assert_eq!(whole.len(), piece.len(), "wait 的 Sleep 也要逐条对齐");
+    }
+
 }
