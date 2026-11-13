@@ -62,7 +62,7 @@ async fn spawn_host(server: &str, cfg: HostConfig, home: PathBuf) -> String {
     let (device_id, _) = conn.host_register(None, cfg.name.clone(), None).await.expect("注册失败");
 
     let state = std::sync::Arc::new(HostState::new(cfg.clone(), None));
-    let screen = session::resolve_screen(&cfg.capture, &cfg).await;
+    let screen = session::resolve_region(&cfg.capture, &cfg).await;
     let settings = VideoSettings::from_config(&cfg);
     let addr = conn.server_addr().to_string();
     let ffmpeg = ffmpeg::find_ffmpeg(None).unwrap_or_else(|| PathBuf::from("ffmpeg"));

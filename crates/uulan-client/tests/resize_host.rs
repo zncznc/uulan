@@ -10,7 +10,7 @@
 //!   · 换之后解出 480x360 的帧（控制端真的重建了解码器，而不是继续按旧尺寸读）
 //!   · 换之后控制端发的归一化坐标被按新尺寸换算（0.5,0.5 → 240,180）
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,12 +19,12 @@ use tokio::time::timeout;
 use uulan_client::connect;
 use uulan_client::control::ControlLink;
 use uulan_client::watch::VideoWatcher;
-use uulan_host::capture::CaptureInput;
+use uulan_host::capture::{CaptureInput, Region};
 use uulan_host::config::HostConfig;
 use uulan_host::input::{Inject, InputSink};
 use uulan_host::session::{self, HostState, SessionParams, VideoSettings};
 use uulan_media::ffmpeg::{self, Encoder};
-use uulan_protocol::msg::{C2H, Screen};
+use uulan_protocol::msg::C2H;
 use uulan_protocol::rv::{Role, ToEndpoint};
 use uulan_protocol::rvclient::RvConn;
 
@@ -83,7 +83,9 @@ async fn spawn_host(
     let probes: ProbeFactory = Arc::new(move || {
         let (pw, ph) = (sw.clone(), sh.clone());
         Arc::new(move || {
-            Some(Screen {
+            Some(Region {
+                x: 0,
+                y: 0,
                 w: pw.load(Ordering::Relaxed),
                 h: ph.load(Ordering::Relaxed),
             })
@@ -106,7 +108,7 @@ async fn spawn_host_with(
         .expect("注册失败");
 
     let state = Arc::new(HostState::new(cfg.clone(), None));
-    let initial = session::resolve_screen(&cfg.capture, &cfg).await;
+    let initial = session::resolve_region(&cfg.capture, &cfg).await;
     let settings = VideoSettings::from_config(&cfg);
     let addr = conn.server_addr().to_string();
     let ffmpeg = ffmpeg::find_ffmpeg(None).unwrap_or_else(|| std::path::PathBuf::from("ffmpeg"));
@@ -286,7 +288,7 @@ async fn source_eof_on_screen_shrink_restarts_encoder() {
             let asked = asked.clone();
             Arc::new(move || {
                 asked.fetch_add(1, Ordering::Relaxed);
-                Some(Screen { w: 480, h: 360 })
+                Some(Region::full(480, 360))
             }) as session::ScreenProbe
         })
     };
@@ -343,4 +345,88 @@ async fn source_eof_on_screen_shrink_restarts_encoder() {
     assert_eq!((s.cfg_w, s.cfg_h), (480, 360), "统计里的当前画幅没跟上");
 
     watcher.shutdown();
+}
+
+/// 多屏留下的硬格子在本机的可验部分：**尺寸没变、原点变了**（显示器重新排布 /
+/// 副屏拔掉后退回主屏）。真链路（真中继 + 真会话 + 真 lavfi 编码）里塞一个能实时
+/// 挪原点的假探针，控制端连发两条相同的归一化坐标 —— 第二条的落点必须整体平移
+/// 原点。一次钉住 video_loop 的探针比较、watch 交接、control_loop 换算前同步三段。
+#[tokio::test]
+async fn region_origin_follows_the_probe() {
+    let addr = spawn_server().await;
+    let cfg = test_config(&addr);
+    let out = Arc::new(Mutex::new(Vec::<Inject>::new()));
+    let ox = Arc::new(AtomicI32::new(0));
+    let probes: ProbeFactory = {
+        let ox = ox.clone();
+        Arc::new(move || {
+            let ox = ox.clone();
+            Arc::new(move || {
+                Some(Region {
+                    x: ox.load(Ordering::Relaxed),
+                    y: 0,
+                    w: 320,
+                    h: 240,
+                })
+            }) as session::ScreenProbe
+        })
+    };
+    let device_id = spawn_host_with(&addr, cfg.clone(), out.clone(), probes).await;
+
+    let c = timeout(
+        Duration::from_secs(30),
+        connect::connect(&addr, &device_id, &cfg.password, "原点跟随测试控制端", vec![]),
+    )
+    .await
+    .expect("连接超时")
+    .expect("连接失败");
+
+    // 视频通道必须有人把帧排掉：1 秒探针拍活在 video_loop 里，它写阻塞就会退出。
+    tokio::spawn(async move {
+        let (mut v, _vw) = c.video.into_split();
+        loop {
+            if uulan_protocol::frame::read_frame(&mut v).await.is_err() {
+                break;
+            }
+        }
+    });
+    drop(c.bulk);
+    let link = ControlLink::start(c.control);
+    let input = link.input();
+
+    async fn wait_for(out: &Arc<Mutex<Vec<Inject>>>, n: usize) -> Vec<Inject> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let v = out.lock().unwrap().clone();
+            if v.len() >= n {
+                return v;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("等到 {n} 条注入指令超时，只收到 {} 条：{v:?}", v.len());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    assert!(input.send(C2H::MouseMoveAbs { x: 0.5, y: 0.5 }));
+    let got = wait_for(&out, 1).await;
+    assert_eq!(got[0], Inject::MoveAbs { x: 160, y: 120 }, "初始区域落点应 (160,120)");
+
+    // 副屏重新排布：尺寸不变，原点挪到 +1024。探针周期 1 秒，等 1.8 秒必定生效。
+    ox.store(1024, Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(1800)).await;
+    assert!(input.send(C2H::MouseMoveAbs { x: 0.5, y: 0.5 }));
+    let got = wait_for(&out, 2).await;
+    assert_eq!(
+        got[1],
+        Inject::MoveAbs { x: 1184, y: 120 },
+        "原点挪到 +1024 后落点应整体平移（等 1.8 秒是探针周期余量，不是重试手段）"
+    );
+
+    // 反向：回到主屏（原点归零），落点也必须跟回来。
+    ox.store(0, Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(1800)).await;
+    assert!(input.send(C2H::MouseMoveAbs { x: 0.25, y: 0.25 }));
+    let got = wait_for(&out, 3).await;
+    assert_eq!(got[2], Inject::MoveAbs { x: 80, y: 60 }, "原点归零后 0.25,0.25 应落 (80,60)");
 }

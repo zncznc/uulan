@@ -110,7 +110,7 @@ async fn spawn_host(server: &str, cfg: HostConfig, cell: Cell) -> String {
         .expect("注册失败");
 
     let state = Arc::new(HostState::new(cfg.clone(), None));
-    let screen = session::resolve_screen(&cfg.capture, &cfg).await;
+    let screen = session::resolve_region(&cfg.capture, &cfg).await;
     let settings = VideoSettings::from_config(&cfg);
     let addr = conn.server_addr().to_string();
     let ffmpeg = ffmpeg::find_ffmpeg(None).unwrap_or_else(|| std::path::PathBuf::from("ffmpeg"));

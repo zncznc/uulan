@@ -75,6 +75,10 @@ impl Encoder {
 pub struct CaptureOptions {
     /// X11 显示，如 `:0.0`。
     pub display: String,
+    /// 抓取区域原点（根窗口像素）。x11grab 的地址写法是 `:0.0+X,Y`。
+    /// `0,0` = 抓整屏 —— 单屏与所有老行为。
+    pub grab_x: i32,
+    pub grab_y: i32,
     /// 采集区域尺寸。
     pub width: u32,
     pub height: u32,
@@ -96,6 +100,8 @@ impl CaptureOptions {
     pub fn new(display: impl Into<String>, width: u32, height: u32) -> Self {
         Self {
             display: display.into(),
+            grab_x: 0,
+            grab_y: 0,
             width,
             height,
             fps: 30,
@@ -151,8 +157,9 @@ pub fn x11grab_input(o: &CaptureOptions) -> Vec<String> {
         a.push(o.vaapi_device.clone());
     }
     a.push("-i".to_string());
-    // x11grab 的输入地址形如 :0.0+0,0
-    a.push(format!("{}+0,0", o.display));
+    // x11grab 的输入地址形如 :0.0+X,Y —— 偏移就是多屏「只抓第 N 块」的表达方式；
+    // 0,0（整帧缓冲）与老版本写的 `+0,0` 一字不差。
+    a.push(format!("{}+{},{}", o.display, o.grab_x, o.grab_y));
     a
 }
 
@@ -416,6 +423,19 @@ mod tests {
     /// 把参数拼成便于断言的字符串（值之间用空格）。
     fn joined(o: &CaptureOptions) -> String {
         encode_args(o).join(" ")
+    }
+
+    #[test]
+    fn grab_offset_reaches_the_x11grab_url() {
+        // 多屏「只抓第 N 块」：原点进地址，尺寸进 -video_size。
+        let mut o = opts();
+        o.grab_x = 1920;
+        o.grab_y = -400;
+        let s = joined(&o);
+        assert!(s.contains("-video_size 1280x720"), "{s}");
+        assert!(s.contains(":0.0+1920,-400"), "抓取偏移没进地址: {s}");
+        // 单屏默认（0,0）必须保持老写法一字不差 —— 真机脚本的 grep 就认这个
+        assert_eq!(x11grab_input(&opts()).last().unwrap(), ":0.0+0,0");
     }
 
     #[test]

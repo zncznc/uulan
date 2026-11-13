@@ -46,7 +46,7 @@ use uulan_fs::server::{self as fs_server, BulkPeer};
 use uulan_protocol::bulk::BulkFrame;
 use uulan_protocol::frame::FrameError;
 
-use crate::capture::CaptureInput;
+use crate::capture::{CaptureInput, Region};
 use crate::config::HostConfig;
 use crate::input::{default_sink, Inject, InputSink, Mapper};
 use crate::portmap::{PortMap, PortPolicy};
@@ -426,7 +426,9 @@ pub struct SessionParams {
     pub state: Arc<HostState>,
     pub ffmpeg: PathBuf,
     pub capture: CaptureInput,
-    pub screen: Screen,
+    /// 抓取区域（尺寸 + 原点）。多屏被控端只出所选那块屏的画面；原点在被控端
+    /// 内部消化（x11grab 偏移 + 注入换算），协议里仍然只有那幅画面的尺寸。
+    pub screen: Region,
     pub encoder: Encoder,
     pub settings: VideoSettings,
     /// 剪贴板后端。`None` = 按采集源自动挑（X11 采集 → X11 剪贴板）。
@@ -575,7 +577,7 @@ pub async fn run_with_sink(
         &mut control_wr,
         &keys,
         &params.state,
-        params.screen,
+        params.screen.screen(),
         &peer,
         clip_available,
         audio_ok,
@@ -637,6 +639,9 @@ pub async fn run_with_sink(
         sink,
         size_rx,
     );
+    // 开局就把完整区域（含原点）灌进 Mapper。第一条消息前 sync_screen 也会兜底，
+    // 但「先设对」让任何早到的换算与日志从一开始就是准的。
+    input.mapper.set_region(params.screen.x, params.screen.y, params.screen.w, params.screen.h);
     info!(sink = input.sink.name(), "键鼠注入后端");
     info!(backend = clip.name(), available = clip_available, "剪贴板后端");
 
@@ -961,15 +966,15 @@ const SYSTEM_STATE_POLL_EVERY: Duration = Duration::from_secs(1);
 /// 一次探测最多等多久。xdpyinfo 正常是几毫秒；卡住就当作「没变」。
 const SCREEN_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// 屏幕尺寸探测钩子。
+/// 屏幕探测钩子：返回**抓取区域**（尺寸 + 原点；多屏时是所选那块屏在整屏里的位置）。
 ///
-/// 做成可注入的：本机没有 X11，测试要模拟「被控端分辨率变了」只能塞一个假探针。
-/// 返回 `None` 表示这一拍探测失败 —— 调用方必须当作「没变」，
+/// 做成可注入的：本机没有 X11，测试要模拟「被控端分辨率变了 / 副屏被重新排布」
+/// 只能塞一个假探针。返回 `None` 表示这一拍探测失败 —— 调用方必须当作「没变」，
 /// 不能因为一次探测失败就把好好的画面重开一遍。
-pub type ScreenProbe = Arc<dyn Fn() -> Option<Screen> + Send + Sync>;
+pub type ScreenProbe = Arc<dyn Fn() -> Option<Region> + Send + Sync>;
 
 /// 调一次探针。阻塞型探针（跑 xdpyinfo）放到阻塞线程池里，别把 tokio worker 卡住。
-async fn probe_once(probe: &Option<ScreenProbe>) -> Option<Screen> {
+async fn probe_once(probe: &Option<ScreenProbe>) -> Option<Region> {
     let p = probe.as_ref()?.clone();
     tokio::time::timeout(
         SCREEN_PROBE_TIMEOUT,
@@ -989,8 +994,10 @@ fn production_probe(capture: &CaptureInput, cfg: &HostConfig) -> Option<ScreenPr
         return None;
     }
     let disp = capture.display()?;
+    let mon = capture.monitor_idx();
     Some(Arc::new(move || {
-        crate::capture::detect_x11_screen_blocking(&disp).map(|(w, h)| Screen { w, h })
+        // 没指定显示器时只跑一次 xdpyinfo（与老版本同一条命令）；指定了才加一次 xrandr。
+        crate::capture::detect_x11_region_blocking(&disp, mon)
     }))
 }
 
@@ -1009,9 +1016,10 @@ struct ClipStats {
 struct InputLoop {
     mapper: Mapper,
     sink: Box<dyn InputSink>,
-    /// 被控端分辨率热变化的信号。变了就把 Mapper 的屏幕尺寸换掉 ——
-    /// 控制端发来的是归一化坐标，乘以旧尺寸会让点击整体偏到别处。
-    size_rx: watch::Receiver<Screen>,
+    /// 抓取区域热变化的信号（分辨率变了、或副屏被重新排布）。变了就把 Mapper 的
+    /// 尺寸**与原点**一起换掉 —— 控制端发来的是归一化坐标，按旧区域换算会让点击
+    /// 整体偏到别处（多屏时偏出去就是一整块屏的宽度）。
+    size_rx: watch::Receiver<Region>,
     /// 收到的输入消息条数（排障与验收都看这个数）。
     events: u64,
     /// 注入失败次数（含被节流没上报的）。
@@ -1027,7 +1035,7 @@ struct InputLoop {
 }
 
 impl InputLoop {
-    fn new(mapper: Mapper, sink: Box<dyn InputSink>, size_rx: watch::Receiver<Screen>) -> Self {
+    fn new(mapper: Mapper, sink: Box<dyn InputSink>, size_rx: watch::Receiver<Region>) -> Self {
         Self {
             mapper,
             sink,
@@ -1062,12 +1070,13 @@ impl InputLoop {
         }
     }
 
-    /// 分辨率变了就同步给 Mapper。**必须在换算坐标之前调**，否则这一条消息会按旧尺寸落点。
+    /// 抓取区域变了（尺寸**或**原点）就同步给 Mapper。**必须在换算坐标之前调**，
+    /// 否则这一条消息会按旧区域落点 —— 多屏下差的就是那块屏的原点。
     fn sync_screen(&mut self) {
         if let Ok(true) = self.size_rx.has_changed() {
             let s = *self.size_rx.borrow_and_update();
-            self.mapper.set_screen(s.w, s.h);
-            debug!(w = s.w, h = s.h, "屏幕尺寸已同步到输入映射器");
+            self.mapper.set_region(s.x, s.y, s.w, s.h);
+            debug!(x = s.x, y = s.y, w = s.w, h = s.h, "抓取区域已同步到输入映射器");
         }
     }
 
@@ -1690,12 +1699,12 @@ fn op_id(op: &FsOp) -> u32 {
 async fn video_loop(
     ffmpeg: PathBuf,
     capture: CaptureInput,
-    mut screen: Screen,
+    mut screen: Region,
     encoder: Encoder,
     device_id: String,
     mut set_rx: watch::Receiver<VideoSettings>,
     probe: Option<ScreenProbe>,
-    size_tx: watch::Sender<Screen>,
+    size_tx: watch::Sender<Region>,
     video: SecConn,
 ) {
     // 视频通道在被控端是单向的（只写）：拿写半端就够，读半端直接丢掉。
@@ -1813,12 +1822,21 @@ async fn video_loop(
                     break true;
                 }
                 _ = screen_tick.tick() => {
-                    // 屏幕尺寸变了就重开编码源。探针失败（xdpyinfo 没了/暂时读不到）
-                    // 一律当作「没变」—— 不能因为一次探测失败就把好好的画面重开一遍。
+                    // 抓取区域变了（尺寸**或**原点）就重开编码源。探针失败
+                    // （xdpyinfo 没了/暂时读不到）一律当作「没变」——
+                    // 不能因为一次探测失败就把好好的画面重开一遍。
                     if let Some(s) = probe_once(&probe).await {
                         if s != screen {
-                            info!(from_w = screen.w, from_h = screen.h, to_w = s.w, to_h = s.h,
-                                  "被控端分辨率变了，重启编码源");
+                            if (s.w, s.h) == (screen.w, screen.h) {
+                                // 尺寸没变、原点变了：显示器重新排布 / 副屏拔掉后回退。
+                                // 只有多屏（`x11::<显示>@N`）下可能出现这条。
+                                info!(w = s.w, h = s.h, from_x = screen.x, from_y = screen.y,
+                                      to_x = s.x, to_y = s.y,
+                                      "分辨率未变、抓取偏移变了（显示器重新排布？），重启编码源");
+                            } else {
+                                info!(from_w = screen.w, from_h = screen.h, to_w = s.w, to_h = s.h,
+                                      "被控端分辨率变了，重启编码源");
+                            }
                             screen = s;
                             let _ = size_tx.send(screen);
                             break true;
@@ -1838,8 +1856,8 @@ async fn video_loop(
 }
 
 /// 组装一条 `VideoCfg`。周期性上报实测帧率时也用它 —— 字段只写一遍，免得两处不一致。
-fn video_cfg(screen: Screen, encoder: Encoder, s: VideoSettings, actual_fps: f32) -> H2C {
-    let (enc_w, enc_h) = s.encoded_size(screen);
+fn video_cfg(screen: Region, encoder: Encoder, s: VideoSettings, actual_fps: f32) -> H2C {
+    let (enc_w, enc_h) = s.encoded_size(screen.screen());
     H2C::VideoCfg(HostVideoCfg {
         // `w`/`h` 是**屏幕**尺寸（控制端拿它换算归一化坐标），`enc_w`/`enc_h` 是编码画幅
         // （解码器按它启动）。缩放编码时两者不同，混用就是花屏 / 点击落点整体偏移。
@@ -1857,13 +1875,16 @@ fn video_cfg(screen: Screen, encoder: Encoder, s: VideoSettings, actual_fps: f32
 
 fn make_capture_options(
     capture: &CaptureInput,
-    screen: Screen,
+    screen: Region,
     encoder: Encoder,
     s: VideoSettings,
 ) -> CaptureOptions {
     let display = capture.display().unwrap_or_else(|| ":0.0".to_string());
     let (cq, maxrate) = s.cq_and_maxrate();
     let mut o = CaptureOptions::new(display, screen.w, screen.h);
+    // 抓取区域原点：多屏「只抓第 N 块」在 x11grab 里就靠这个偏移表达。
+    o.grab_x = screen.x;
+    o.grab_y = screen.y;
     o.fps = s.fps;
     o.cq = cq;
     o.max_bitrate_kbps = maxrate;
@@ -1893,63 +1914,72 @@ async fn send_h2c<W: tokio::io::AsyncWrite + Unpin>(s: &mut W, m: &H2C) -> Resul
     write_frame(s, FrameKind::Json, &bytes).await.map_err(|e| e.to_string())
 }
 
-/// 探测采集区域尺寸：配置里写死就听配置，否则探测，再否则用安全的默认值。
-pub async fn resolve_screen(capture: &CaptureInput, cfg: &HostConfig) -> Screen {
+/// 探测抓取区域：配置里钉死尺寸就听配置，否则探测（多屏 `@N` 时连那块屏的原点一起），
+/// 再否则用安全的默认值。
+pub async fn resolve_region(capture: &CaptureInput, cfg: &HostConfig) -> Region {
     if cfg.screen_width > 0 && cfg.screen_height > 0 {
-        return Screen { w: cfg.screen_width, h: cfg.screen_height };
+        return Region::full(cfg.screen_width, cfg.screen_height);
     }
     if let Some(disp) = capture.display() {
-        if let Some((w, h)) = crate::capture::detect_x11_screen(&disp).await {
+        if let Some(r) = crate::capture::detect_x11_region(&disp, capture.monitor_idx()).await {
             // 变量名刻意不叫 `display`：tracing 里 `%display` 会被宏解析成
             // 它自己的 `display()` 辅助函数，而不是我们的局部变量。
-            info!(w, h, display = %disp, "从 xdpyinfo 探测到屏幕尺寸");
-            return Screen { w, h };
+            info!(w = r.w, h = r.h, x = r.x, y = r.y, monitor = ?capture.monitor_idx(),
+                  display = %disp, "从 xdpyinfo 探测到屏幕尺寸");
+            return r;
         }
         warn!(display = %disp, "屏幕尺寸探测失败（xdpyinfo 不可用？），回退 1920x1080；如不对请在配置里写死 screen_width/screen_height");
-        return Screen { w: 1920, h: 1080 };
+        return Region::full(1920, 1080);
     }
     // 合成源：从 spec 里抠尺寸，抠不到就用 1280x720
     match capture {
         CaptureInput::Lavfi { spec, .. } => parse_size_from_spec(spec)
-            .unwrap_or(Screen { w: 1280, h: 720 }),
-        _ => Screen { w: 1920, h: 1080 },
+            .map(|s| Region::full(s.w, s.h))
+            .unwrap_or_else(|| Region::full(1280, 720)),
+        _ => Region::full(1920, 1080),
     }
 }
 
-/// 会话开头重探一次屏幕尺寸（缓存可能已经过期）。
+/// 会话开头重探一次抓取区域（缓存可能已经过期）。
 ///
-/// [`resolve_screen`] 只在**进程启动**时跑一次，结果被之后所有会话复用。可屏幕是会在
-/// 进程活着的期间变的：有人改了分辨率、插拔显示器、缩放了虚拟机窗口。缓存过期时的代价
-/// 很具体 —— `HostInfo` 把旧尺寸告诉控制端（它的输入映射、首帧画幅都按这个算），
-/// 编码器又按旧尺寸开 x11grab，抓到一块比当前屏幕大的区域**当场退出**
+/// [`resolve_region`] 只在**进程启动**时跑一次，结果被之后所有会话复用。可屏幕是会在
+/// 进程活着的期间变的：有人改了分辨率、插拔显示器、缩放了虚拟机窗口、重新排布了副屏。
+/// 缓存过期时的代价很具体 —— `HostInfo` 把旧尺寸告诉控制端（它的输入映射、首帧画幅都按
+/// 这个算），编码器又按旧区域开 x11grab，抓到一块比当前屏幕大的区域**当场退出**
 /// （2026-11-01 真机日志原样是「视频源结束 frames=0 bytes=0」），只能等 1 秒探针再重开。
 ///
-/// 探不到就**沿用缓存**，不要退回 [`resolve_screen`] 的 1920x1080 兜底：
+/// 探不到就**沿用缓存**，不要退回 [`resolve_region`] 的 1920x1080 兜底：
 /// 一次 `xdpyinfo` 失败不该把本来正确的会话尺寸改错。
-pub async fn refresh_screen(capture: &CaptureInput, cfg: &HostConfig, cached: Screen) -> Screen {
+pub async fn refresh_region(capture: &CaptureInput, cfg: &HostConfig, cached: Region) -> Region {
     if cfg.screen_width > 0 && cfg.screen_height > 0 {
-        return Screen { w: cfg.screen_width, h: cfg.screen_height };
+        return Region::full(cfg.screen_width, cfg.screen_height);
     }
     if let Some(disp) = capture.display() {
-        return match crate::capture::detect_x11_screen(&disp).await {
-            Some((w, h)) => {
-                if (w, h) != (cached.w, cached.h) {
+        return match crate::capture::detect_x11_region(&disp, capture.monitor_idx()).await {
+            Some(r) => {
+                if r != cached {
                     info!(
                         from_w = cached.w,
                         from_h = cached.h,
-                        to_w = w,
-                        to_h = h,
+                        to_w = r.w,
+                        to_h = r.h,
+                        from_x = cached.x,
+                        from_y = cached.y,
+                        to_x = r.x,
+                        to_y = r.y,
                         "屏幕尺寸与进程启动时缓存的不同，本会话按新尺寸开始"
                     );
                 }
-                Screen { w, h }
+                r
             }
             None => cached,
         };
     }
     // 合成源：spec 能抠到就用它（配置/命令行可能被换过），抠不到沿用缓存。
     match capture {
-        CaptureInput::Lavfi { spec, .. } => parse_size_from_spec(spec).unwrap_or(cached),
+        CaptureInput::Lavfi { spec, .. } => parse_size_from_spec(spec)
+            .map(|s| Region::full(s.w, s.h))
+            .unwrap_or(cached),
         _ => cached,
     }
 }
@@ -2002,7 +2032,7 @@ mod tests {
     }
 
     fn input_loop(rec: Arc<std::sync::Mutex<Vec<Inject>>>) -> InputLoop {
-        let (_tx, rx) = watch::channel(Screen { w: 320, h: 240 });
+        let (_tx, rx) = watch::channel(Region::full(320, 240));
         let sink: Box<dyn InputSink> = Box::new(Recorder(rec));
         InputLoop::new(Mapper::new(320, 240), sink, rx)
     }
@@ -2053,11 +2083,14 @@ mod tests {
     #[test]
     fn screen_probe_only_follows_an_unpinned_x11_screen() {
         let mut cfg = HostConfig::default();
-        cfg.capture = crate::capture::CaptureInput::X11 { display: Some(":0.0".into()) };
+        cfg.capture = crate::capture::CaptureInput::X11 { display: Some(":0.0".into()), monitor: None };
         assert!(
             production_probe(&cfg.capture, &cfg).is_some(),
             "抓 X11 且没钉死尺寸时，应当跟随屏幕分辨率变化"
         );
+        // 指定了副屏（@N）：探针照样开，且要跟的是那块屏的区域（尺寸与原点）
+        let cfg_mon = crate::capture::CaptureInput::X11 { display: Some(":0.0".into()), monitor: Some(1) };
+        assert!(production_probe(&cfg_mon, &HostConfig::default()).is_some(), "指定副屏时探针要跟区域");
         // 配置里写了尺寸 = 用户要求「就抓这一块」，跟随反而会改掉他钉的区域
         cfg.screen_width = 1920;
         cfg.screen_height = 1080;
@@ -2465,7 +2498,7 @@ mod tests {
             max_bitrate_kbps: 0,
             scale: 0.5,
         };
-        let o = make_capture_options(&cap, Screen { w: 640, h: 480 }, Encoder::X264, s);
+        let o = make_capture_options(&cap, Region::full(640, 480), Encoder::X264, s);
         assert_eq!(o.fps, 25);
         assert_eq!(o.scale, 0.5);
         assert_eq!(o.width, 640);
@@ -2476,48 +2509,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_screen_prefers_explicit_config() {
+    async fn resolve_region_prefers_explicit_config() {
         let cap = CaptureInput::parse("lavfi:testsrc=size=800x600").unwrap();
         let mut cfg = HostConfig::default();
         cfg.screen_width = 1600;
         cfg.screen_height = 900;
-        let s = resolve_screen(&cap, &cfg).await;
-        assert_eq!((s.w, s.h), (1600, 900));
+        let s = resolve_region(&cap, &cfg).await;
+        assert_eq!(s, Region::full(1600, 900));
     }
 
     #[tokio::test]
-    async fn refresh_screen_honours_a_pinned_size_without_probing() {
+    async fn refresh_region_honours_a_pinned_size_without_probing() {
         let cap = CaptureInput::parse("x11::77.0").unwrap();
         let mut cfg = HostConfig::default();
         cfg.screen_width = 1600;
         cfg.screen_height = 900;
-        let s = refresh_screen(&cap, &cfg, Screen { w: 1024, h: 768 }).await;
-        assert_eq!((s.w, s.h), (1600, 900));
+        let s = refresh_region(&cap, &cfg, Region::full(1024, 768)).await;
+        assert_eq!(s, Region::full(1600, 900));
     }
 
     #[tokio::test]
-    async fn refresh_screen_follows_a_changed_synthetic_spec() {
+    async fn refresh_region_follows_a_changed_synthetic_spec() {
         let cap = CaptureInput::parse("lavfi:testsrc2=size=800x600:rate=30").unwrap();
         let cfg = HostConfig::default();
-        let s = refresh_screen(&cap, &cfg, Screen { w: 1280, h: 720 }).await;
-        assert_eq!((s.w, s.h), (800, 600));
+        let s = refresh_region(&cap, &cfg, Region::full(1280, 720)).await;
+        assert_eq!(s, Region::full(800, 600));
     }
 
     #[tokio::test]
-    async fn refresh_screen_keeps_the_cached_size_when_probing_fails() {
+    async fn refresh_region_keeps_the_cached_region_when_probing_fails() {
         // `:77` 不存在（Windows 上连 xdpyinfo 都没有）—— 探测必然失败，
-        // 必须沿用缓存，而不是退回 resolve_screen 的 1920x1080 兜底。
-        let cap = CaptureInput::parse("x11::77.0").unwrap();
+        // 必须沿用缓存（**含原点**），而不是退回 resolve_region 的 1920x1080 兜底。
+        let cap = CaptureInput::parse("x11::77.0@1").unwrap();
         let cfg = HostConfig::default();
-        let s = refresh_screen(&cap, &cfg, Screen { w: 1024, h: 768 }).await;
-        assert_eq!((s.w, s.h), (1024, 768));
+        let cached = Region { x: 1024, y: 0, w: 1024, h: 768 };
+        let s = refresh_region(&cap, &cfg, cached).await;
+        assert_eq!(s, cached);
     }
 
     #[tokio::test]
-    async fn resolve_screen_reads_synthetic_spec() {
+    async fn resolve_region_reads_synthetic_spec() {
         let cap = CaptureInput::parse("lavfi:testsrc2=size=1024x768:rate=30").unwrap();
         let cfg = HostConfig::default();
-        let s = resolve_screen(&cap, &cfg).await;
-        assert_eq!((s.w, s.h), (1024, 768));
+        let s = resolve_region(&cap, &cfg).await;
+        assert_eq!(s, Region::full(1024, 768));
     }
 }

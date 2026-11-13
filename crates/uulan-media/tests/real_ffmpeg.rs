@@ -194,6 +194,8 @@ fn encode_args_produce_a_split_table_stream() {
 
     let o = CaptureOptions {
         display: ":0.0".into(),
+        grab_x: 0,
+        grab_y: 0,
         width: 320,
         height: 240,
         fps: 20,

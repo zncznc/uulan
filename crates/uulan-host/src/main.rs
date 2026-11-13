@@ -16,11 +16,10 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use tracing::{info, warn};
 
-use uulan_host::capture::CaptureInput;
+use uulan_host::capture::{CaptureInput, Region};
 use uulan_host::config::HostConfig;
 use uulan_host::session::{self, HostState, SessionOutcome, SessionParams, VideoSettings};
 use uulan_media::ffmpeg::{self, Encoder};
-use uulan_protocol::msg::Screen;
 use uulan_protocol::rv::{Role, ToEndpoint};
 use uulan_protocol::shape::Shape;
 use uulan_protocol::rvclient::{RelaySet, RvConn};
@@ -53,7 +52,7 @@ uulan-host —— uulan 内网远控的被控端
 
   --config <path>     配置文件路径（默认 ~/.config/uulan/host.json）
   --server <addr>     中继地址，覆盖配置里的值（ip:port）
-  --capture <spec>    采集源：x11 / x11::0.0 / lavfi:<合成源>[@帧数]
+  --capture <spec>    采集源：x11 / x11::0.0 / x11::0.0@<显示器号(0基)> / lavfi:<合成源>[@帧数]
   --ffmpeg <path>     ffmpeg 可执行文件（默认走 PATH）
   --encoder <name>    x264（默认）/ nvenc / vaapi
   --name <name>       本机显示名
@@ -207,7 +206,8 @@ async fn main() -> Result<()> {
         "被控端启动"
     );
 
-    let screen = session::resolve_screen(&cfg.capture, &cfg).await;
+    let screen = session::resolve_region(&cfg.capture, &cfg).await;
+    info!(x = screen.x, y = screen.y, w = screen.w, h = screen.h, "初始抓取区域已确定");
     let state = Arc::new(HostState::new(cfg.clone(), Some(cfg_path.clone())));
 
     // Ctrl-C 只装一次：以前它装在「一条中继连接的寿命」里，重连循环会把信号处理
@@ -275,7 +275,7 @@ async fn run_forever(
     state: Arc<HostState>,
     ffmpeg: PathBuf,
     cfg: HostConfig,
-    screen: Screen,
+    screen: Region,
     encoder: Encoder,
     once: bool,
 ) -> Result<()> {
@@ -310,7 +310,7 @@ async fn serve_relay(
     state: &Arc<HostState>,
     ffmpeg: &PathBuf,
     cfg: &HostConfig,
-    mut screen: Screen,
+    mut screen: Region,
     encoder: Encoder,
     once: bool,
     attempt: &mut u32,
@@ -420,7 +420,7 @@ async fn serve_relay(
                 // Hello 把旧尺寸报给控制端，编码器又按旧尺寸抓一块不存在的区域当场退出
                 // （真机日志就是「视频源结束 frames=0」）。探不到就沿用缓存。
                 let snap = state.snapshot();
-                screen = session::refresh_screen(&snap.capture, &snap, screen).await;
+                screen = session::refresh_region(&snap.capture, &snap, screen).await;
                 let params = SessionParams {
                     state: state.clone(),
                     ffmpeg: ffmpeg.clone(),

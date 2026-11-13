@@ -84,7 +84,7 @@ async fn spawn_host(
         .expect("注册失败");
 
     let state = Arc::new(HostState::new(cfg.clone(), None));
-    let screen = host_session::resolve_screen(&cfg.capture, &cfg).await;
+    let screen = host_session::resolve_region(&cfg.capture, &cfg).await;
     let settings = VideoSettings::from_config(&cfg);
     let (done_tx, done_rx) = tokio::sync::watch::channel(0u32);
     let addr = conn.server_addr().to_string();

@@ -77,7 +77,7 @@ async fn spawn_host(server: &str, cfg: HostConfig, out: Arc<Mutex<Vec<Inject>>>)
         .expect("注册失败");
 
     let state = Arc::new(HostState::new(cfg.clone(), None));
-    let screen = session::resolve_screen(&cfg.capture, &cfg).await;
+    let screen = session::resolve_region(&cfg.capture, &cfg).await;
     let settings = VideoSettings::from_config(&cfg);
     let addr = conn.server_addr().to_string();
     // 没有 ffmpeg 也能测输入：视频任务只会自己失败退出，控制通道照常工作。

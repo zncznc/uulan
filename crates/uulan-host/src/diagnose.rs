@@ -262,6 +262,37 @@ async fn check_display(r: &mut Report, capture: &CaptureInput, display: Option<&
     } else {
         r.ok("显示", detail);
     }
+    check_monitors(r, capture, disp);
+}
+
+/// 显示器布局（**只有 `@N` 指定过副屏才探**）：xrandr 已连接顺序，0 基。
+///
+/// 探不到输出不算 FAIL —— 裸帧缓冲机器（麒麟现网）本来就没有输出，抓屏会按
+/// 「没有那个号就退回第一块 / 空表就抓全屏」的确定规则降级，画面照样有。
+fn check_monitors(r: &mut Report, capture: &CaptureInput, display: &str) {
+    let Some(m) = capture.monitor_idx() else {
+        return;
+    };
+    let mons = crate::capture::probe_monitors_blocking(display);
+    match mons.get(m as usize) {
+        Some(reg) => r.ok(
+            "显示器",
+            format!(
+                "显示器{m}: {}x{}+{}+{}（已连接 {} 块，xrandr 顺序 0 基）",
+                reg.w, reg.h, reg.x, reg.y, mons.len()
+            ),
+        ),
+        None if mons.is_empty() => r.warn(
+            "显示器",
+            format!("指定抓显示器{m}，但 xrandr 没列出任何已连接输出 —— 按整帧缓冲抓"),
+            "虚拟帧缓冲 / 裸 fb 机器常见；真双屏时确认驱动把输出点亮了。",
+        ),
+        None => r.warn(
+            "显示器",
+            format!("显示器{m} 不存在（已连接只有 {} 块）—— 退回第一块", mons.len()),
+            "副屏被拔掉时就是这个行为；插回去 1 秒内自动跟回。",
+        ),
+    }
 }
 
 /// XTest 注入能力（只查扩展，不动 autorepeat）。

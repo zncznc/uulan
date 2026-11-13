@@ -27,7 +27,8 @@ const ALT_L: u32 = 0xffe9;
 /// 一条与后端无关的注入指令。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Inject {
-    /// 绝对移动，单位是**被控端屏幕像素**（协议里是 0..1 的归一化坐标）。
+    /// 绝对移动，单位是**根窗口像素**（协议里是相对所采画面的 0..1 归一化坐标；
+    /// 多屏时 = 区域内像素 + 抓取原点）。
     MoveAbs { x: i32, y: i32 },
     /// 相对移动，单位像素。
     MoveRel { dx: i32, dy: i32 },
@@ -76,6 +77,9 @@ impl InputSink for NullSink {
 pub struct Mapper {
     w: u32,
     h: u32,
+    /// 抓取区域原点（根窗口像素），多屏「只抓第 N 块」时注入换算要把它加回去；单屏恒为 0。
+    ox: i32,
+    oy: i32,
     /// 当前按下的 KeySym。**有序保存**（不是集合）：收尾时要按「后按先松」的顺序释放，
     /// 修饰键才会最后起来 —— 集合的字典序会把 Ctrl 先松开，跟真人操作相反。
     keys: Vec<u32>,
@@ -90,6 +94,8 @@ impl Mapper {
         Self {
             w: screen_w.max(1),
             h: screen_h.max(1),
+            ox: 0,
+            oy: 0,
             keys: Vec::new(),
             buttons: Vec::new(),
             temp_mods: Vec::new(),
@@ -102,6 +108,19 @@ impl Mapper {
         self.h = h.max(1);
     }
 
+    /// 抓取区域整个换掉（多屏选屏 / 副屏拔插后重新排布）。
+    /// 尺寸与**原点**必须一起换：只换尺寸的话，点击会整体偏出去一块屏。
+    pub fn set_region(&mut self, x: i32, y: i32, w: u32, h: u32) {
+        self.set_screen(w, h);
+        self.ox = x;
+        self.oy = y;
+    }
+
+    /// 当前抓取区域（测试与日志用来核状态）。
+    pub fn region(&self) -> crate::capture::Region {
+        crate::capture::Region { x: self.ox, y: self.oy, w: self.w, h: self.h }
+    }
+
     pub fn held_keys(&self) -> usize {
         self.keys.len()
     }
@@ -110,7 +129,7 @@ impl Mapper {
         self.buttons.len()
     }
 
-    /// 归一化坐标（0..1）→ 屏幕像素。
+    /// 归一化坐标（0..1）→ 根窗口像素（区域内换算 + 抓取区域原点）。
     ///
     /// 越界一律夹到边缘：远控里把鼠标甩到窗口外面很常见，夹边比丢弃更符合直觉。
     /// NaN / 无穷直接丢弃 —— 换算出来会是个巨大的负数，X 会拒绝或者把指针扔到屏幕角落。
@@ -122,9 +141,10 @@ impl Mapper {
         let max_y = self.h.saturating_sub(1) as f32;
         let px = (x.clamp(0.0, 1.0) * max_x).round() as i32;
         let py = (y.clamp(0.0, 1.0) * max_y).round() as i32;
+        // 先夹到**区域内**再加原点：顺序反了会一笔画进隔壁显示器的坐标里去。
         Some(Inject::MoveAbs {
-            x: px.clamp(0, max_x as i32),
-            y: py.clamp(0, max_y as i32),
+            x: px.clamp(0, max_x as i32) + self.ox,
+            y: py.clamp(0, max_y as i32) + self.oy,
         })
     }
 
@@ -581,5 +601,29 @@ mod tests {
         assert_eq!(mp.mouse_abs(1.0, 1.0), Some(Inject::MoveAbs { x: 99, y: 49 }));
         mp.set_screen(0, 0); // 不能把坐标系搞成 0 宽度（会除以 0）
         assert_eq!(mp.mouse_abs(1.0, 1.0), Some(Inject::MoveAbs { x: 0, y: 0 }));
+    }
+
+    #[test]
+    fn region_offset_shifts_every_absolute_move() {
+        // 抓 +1024,0 那块副屏：0.5,0.5 应落在整屏 (1024+160, 120)，而不是主屏中间
+        let mut mp = m(320, 240);
+        mp.set_region(1024, 0, 320, 240);
+        assert_eq!(mp.mouse_abs(0.5, 0.5), Some(Inject::MoveAbs { x: 1184, y: 120 }));
+        // 角点夹在**区域**边缘再加原点，不许画进隔壁显示器
+        assert_eq!(mp.mouse_abs(1.0, 1.0), Some(Inject::MoveAbs { x: 1024 + 319, y: 239 }));
+        assert_eq!(mp.mouse_abs(2.0, 9.0), Some(Inject::MoveAbs { x: 1024 + 319, y: 239 }));
+        assert_eq!(mp.mouse_abs(0.0, 0.0), Some(Inject::MoveAbs { x: 1024, y: 0 }));
+        // 负原点：xrandr 允许把副屏摆在主屏左上
+        mp.set_region(-1280, -400, 1280, 800);
+        assert_eq!(mp.mouse_abs(0.0, 0.0), Some(Inject::MoveAbs { x: -1280, y: -400 }));
+        assert_eq!(mp.mouse_abs(1.0, 1.0), Some(Inject::MoveAbs { x: -1, y: 399 }));
+    }
+
+    #[test]
+    fn set_screen_alone_keeps_the_origin() {
+        let mut mp = m(100, 100);
+        mp.set_region(500, 600, 100, 100);
+        mp.set_screen(200, 150);
+        assert_eq!(mp.region(), crate::capture::Region { x: 500, y: 600, w: 200, h: 150 });
     }
 }
