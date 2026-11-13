@@ -52,3 +52,33 @@ ARP 解析不到 192.168.223.15，ping 的「无法访问目标主机」全部�
 scp tar → 换源码（保留 target/）→ cargo build --release -p uulan-server -p uulan-host
 → 跑脚本。**物理双屏与真实热插拔事件这台机器永远造不出** —— 那半条只能等有第二块
 屏点亮的日子，届时用真实 xrandr 走 @N 复跑即可（脚本 A/B 段可只跑 C 段口径的现网验证）。
+
+== 恢复探测补记（2026-11-14 05:00 夜批，无人值守）==
+真机仍离线，本归档的真机部分**仍未验**。探测窗口与证据：
+- 05:01-05:02 唯一一次生命迹象：ping 得到一个回包；TCP 22「connect 成功但立刻
+  Connection closed」。随后回归二层不可达，判为开机/链路瞬断，不是 sshd 故障。
+- 05:03-07:13 持续探测（直接轮询 + 两轮后台守望，间隔 75-90 s，ssh 合计约 85 次）：
+  ARP 始终解析不到 192.168.223.15（arp 表命中 0）、ping 100% 丢包、ssh 全部
+  connection closed/timeout。开发机网卡全程在 223 段（192.168.223.6/24）。
+  按 skill「真机离线判法」口径 = 真机侧断电/断链；07:13 守望以 STILL-DOWN 收口。
+- 没有因机器离线改任何代码（本仓库口径：断电只能等，不据此下产品结论）。
+
+本机侧（全部对 HEAD f6fa32e 独立复测）：
+- cargo test --workspace：**473 passed / 0 failed / 1 ignored**，39 个目标，EXIT=0，零警告
+  （热缓存 27 s；日志 D:/uulan-bin/test-r14-0500-verify.log，首尾各带时间戳）。
+- cargo build --release：通过、零警告；
+  cargo check -p uulan-host -p uulan-fs -p uulan-bulk --target x86_64-unknown-linux-gnu：通过。
+- 验收脚本静态核对：bash -n 通过；脚本 grep 的四条日志锚点在源码全部对上
+  （「初始抓取区域已确定」main.rs:210、「注入换算 :」inject.rs:338、
+  「按整帧缓冲抓」diagnose.rs:287、「键鼠事件统计」session.rs:795）。
+- 物料刷新：D:/uulan-bin/uulan-src-head-20261114-0530.tar（自 f6fa32e git archive，
+  代码与 0e0f156 一致、仅 docs 差异）；D:/uulan-bin/uulan-client.exe 的 sha256
+  55c4facf… 与当前 HEAD 构建产物逐字节一致。
+
+下一轮恢复步骤（ssh 通了照此做）：
+1) scp 上面那个 tar 到 kylin:~/ → 换源码、保留 target/ 编译缓存（时间戳目录法，见 skill）；
+2) 真机 export PATH=$HOME/.cargo/bin:$PATH && cargo build --release -p uulan-server -p uulan-host
+   （测试台脚本用 src/target/release 下的二进制，必须先建到 HEAD）；
+3) Windows 侧 bash scripts/verify-monitor-select-e2e.sh（无参数；测试台独立 relay:21997，
+   全程不动正式服务与 ~/.config/uulan/host.json）；
+4) 把 A/B/C 三段的实测数字补进本归档与 DESIGN.md「显示器选屏」小节，并把「未验」改口。
