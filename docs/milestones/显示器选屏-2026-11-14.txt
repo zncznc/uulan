@@ -1,0 +1,54 @@
+显示器选屏（多屏抓取区域 + 注入原点）· 验收归档
+日期：2026-11-14（夜批 01:00 班，收尾 2026-11-13 22:00 班留下的半成品）
+提交：0e0f156
+
+== 做了什么 ==
+- `--capture x11::<显示>@<显示器号>`（0 基，xrandr 已连接顺序）只抓/只落那一块屏。
+  协议不变：VideoCfg 报所采画面尺寸；原点在被控端内部消化 —— x11grab 走
+  `-i :0.0+X,Y`，XTest 注入 = 区域内像素 + 区域原点。
+- 新类型 capture::Region{x,y,w,h} 贯穿 SessionParams / video_loop / ScreenProbe /
+  InputLoop / Mapper::set_region；resolve_region / refresh_region（改名扫全 12 处调用点）。
+- 降级规则单点纯函数 pick_region：号存在→那块；超界且表非空→第一块（副屏拔掉自动
+  退主屏、会话不断）；无已连接输出（麒麟现网裸帧缓冲）→整帧缓冲（老行为一字不差）。
+- 1 秒探针比对区域整体：副屏「重新排布」（尺寸没变、原点变了）也重启编码源并同步
+  Mapper，日志单列「分辨率未变、抓取偏移变了（显示器重新排布？）」。
+- 修掉半成品里一个真 bug：`x11@N` 的尾巴被 `strip_prefix("::")` 的 unwrap_or("")
+  整个吞掉，「x11@2」被静默当成裸 x11。现在 x11 / x11::显[@N] / x11:显[@N] / x11@N
+  四种形态正确；不明尾巴（x11x）明确报错（反例测试钉住），不再静默降级。
+- `--diagnose` 新增「显示器」项：只有 @N 指定过才探；列不出/超界 = WARN 不是 FAIL。
+- `deploy` 侧无变更；host.json 老格式（无 monitor 字段）兼容（单测钉住）。
+
+== 本机数字（实测，2026-11-14 01:47 前）==
+- cargo test --workspace：**473 passed / 0 failed**（TEST_RC=0）
+- cargo build --release：零警告（Finished 1m03s，REL_RC=0）
+- cargo check --workspace --tests --release：零警告
+- uulan-host --lib 单测：119/119（含新 10 条：xrandr 布局解析含负偏移与未点亮口、
+  pick_region 三分支、+X,Y 进抓取地址且 (0,0) 与老写法一字不差、Mapper 区域平移含
+  负原点、set_screen 不丢原点、老 JSON 兼容、解析四形态与反例）
+- 真链路集成测试 resize_host::region_origin_follows_the_probe（真中继+真会话+假探针）：
+  原点 0→1024→0 一个来回，注入落点 (160,120)→(1184,120)→(80,60) 跟着走又跟回来。
+- scripts/verify-window-e2e.sh（本机全链路）：painted=815、首帧 73 ms、丢帧 0、rc=0。
+
+== 真机部分 ==
+**未验。** 原因（如实）：2026-11-14 01:00-01:47 多次探测，麒麟真机在二层不可达 ——
+ARP 解析不到 192.168.223.15，ping 的「无法访问目标主机」全部来自本机（192.168.223.6），
+而 21116/22 端口 TCP「connect 成功 + 5 秒无 banner」是 SYN 代理样假象（中继与 sshd
+都拿不到识别串）。开发机网卡在位（192.168.223.6/24），不是本机侧路由问题；判定为
+真机侧断电/断链，非软件回归。
+
+验收脚本已就位：`bash scripts/verify-monitor-select-e2e.sh`（无需参数；口令经标记
+过滤自动从测试台独立 host.json 落本地 0600 文件，绝不上屏）。三段断言：
+  A) Xvfb :97 帧缓冲 2048x768 + xrandr shim 合成两块已连接屏（**仅布局枚举是合成
+     数据**，x11grab 偏移 / XTest 落点 / pick_region 全走真实代码）：
+     region=(1024,0,1024,768)；存帧 vs 右半截图相关 ≥0.99、vs 左半截图 <0.98（双向）；
+     movn:0.5,0.5 落点 (1536,384)±3（xdotool 独立裁判），反面对照离 (512,384) >100px；
+     inject_errors=0。
+  B) @7 超界 → 退回第一块 region=(0,0,1024,768)（宽与整帧缓冲 2048 分得开），
+     落点 (512,384)，会话不断。
+  C) 真 :0 + 真 xrandr + @1（现网裸帧缓冲形态）→ 按整帧缓冲抓、--diagnose
+     [WARN] 显示器、无 FAIL、会话不断、存帧 vs :0 截图相关 ≥0.98。
+真机物料已备好（本轮产出）：D:/uulan-bin/uulan-src-head-20261114.tar（HEAD 打包，
+0e0f156）与 /d/uulan-bin/uulan-client.exe（release）。恢复流程照 skill「真麒麟通道」：
+scp tar → 换源码（保留 target/）→ cargo build --release -p uulan-server -p uulan-host
+→ 跑脚本。**物理双屏与真实热插拔事件这台机器永远造不出** —— 那半条只能等有第二块
+屏点亮的日子，届时用真实 xrandr 走 @N 复跑即可（脚本 A/B 段可只跑 C 段口径的现网验证）。
