@@ -19,6 +19,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use tracing::{debug, info, warn};
 
@@ -49,6 +50,12 @@ pub struct AudioStats {
 impl AudioStats {
     pub fn pcm_seconds(&self) -> f64 {
         self.pcm_bytes.load(Ordering::Relaxed) as f64 / (SAMPLE_RATE as f64 * CHANNELS as f64 * 2.0)
+    }
+
+    /// 本机到底收到过音频字节没有。用来把「对面推完了/结束了」与
+    /// 「对面说在推、其实一个字节都没到」分开 —— 两者在统计行上不能长一个样。
+    pub fn got_bytes(&self) -> bool {
+        self.ogg_bytes.load(Ordering::Relaxed) > 0
     }
 
     /// 一行给人看的总结。
@@ -87,6 +94,14 @@ impl AudioIn {
     pub fn stats(&self) -> Arc<AudioStats> {
         self.stats.clone()
     }
+
+    /// 挂一个跟着这条会话走的任务（会话结束 → `Drop` → abort）。
+    ///
+    /// 看门狗用它：那条任务既不能比会话活得久（会往已经关掉的通道里发 AudioStop），
+    /// 也不能由调用方自己拿着句柄管 —— 会话槽那边没有地方放它。
+    pub fn add_task(&mut self, t: tokio::task::JoinHandle<()>) {
+        self.tasks.push(t);
+    }
 }
 
 impl Drop for AudioIn {
@@ -105,6 +120,7 @@ pub fn start(
     ffmpeg: Option<PathBuf>,
     sink: Sink,
     stats: Arc<AudioStats>,
+    watch: Arc<AudioWatch>,
 ) -> AudioIn {
     let ffmpeg = ffmpeg.unwrap_or_else(|| PathBuf::from("ffmpeg"));
 
@@ -143,7 +159,7 @@ pub fn start(
 
     let st_out = stats.clone();
     let player = tokio::task::spawn_blocking(move || {
-        play_loop(&ffmpeg, sink, rx, st_out);
+        play_loop(&ffmpeg, sink, rx, st_out, watch);
     });
 
     AudioIn { stats, tasks: vec![reader, player] }
@@ -176,6 +192,7 @@ fn play_loop(
     sink: Sink,
     rx: std::sync::mpsc::Receiver<Vec<u8>>,
     stats: Arc<AudioStats>,
+    watch: Arc<AudioWatch>,
 ) {
     let mut child = match std::process::Command::new(ffmpeg)
         .args(decode_args())
@@ -188,6 +205,9 @@ fn play_loop(
         Err(e) => {
             warn!(error = %e, "音频解码器启动失败");
             stats.errors.fetch_add(1, Ordering::Relaxed);
+            // 本机连解码器都起不来 → 记一笔，由会话那边的看门狗发 `C2H::AudioStop`：
+            // 再让被控端一路编码下去只是白吃 CPU 与带宽，而这边永远不会有声音。
+            watch.note_local_failure(&format!("本机音频解码器起不来：{e}"));
             return;
         }
     };
@@ -510,5 +530,451 @@ mod winmm {
                 }
             }
         }
+    }
+}
+
+// ─────────────────── 被控端音频状态（`H2C::AudioState`）的观察器 ───────────────────
+
+/// `C2H::AudioStart` 发出去之后，允许被控端多久一句 `AudioState` 都不回。
+///
+/// 5 秒够了：被控端起音频是「解析/探测源 → 拉 ffmpeg」，成功那句 `running:true`
+/// 通常几百毫秒内到，失败那句 `running:false` 更是立刻到。真过了 5 秒还没回音，
+/// 只能是**对面根本不会发这条消息**（版本比它更旧）—— 那就必须说破，
+/// 不能让现场把「没声音」理解成「网络慢」。
+pub const AUDIO_ACK_GRACE_MS: u64 = 5_000;
+
+/// `detail` 进状态机之前裁到这么多个**字符**（它要上日志与统计行）。
+const DETAIL_MAX_CHARS: usize = 160;
+
+/// 把被控端给的诊断文本压成一行。换行必须去掉：现场有人把整段 ffmpeg 的 stderr
+/// 塞进配置错误里，一行统计被刷成十行就没法 grep 了。按字符裁而不是按字节 ——
+/// 中文详情按字节切会正好切在多字节中间。
+fn clip_detail(s: &str) -> String {
+    let flat = s.replace('\n', " ").replace('\r', " ");
+    if flat.chars().count() <= DETAIL_MAX_CHARS {
+        flat
+    } else {
+        let mut out: String = flat.chars().take(DETAIL_MAX_CHARS).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// 这条会话的音频到底处在什么状态。
+///
+/// 为什么要专门记它：被控端在「音频起不来」的每一条路上都会回一句
+/// `AudioState{running:false, detail=原因}`（音频源写错、这台机器没 PulseAudio、
+/// ffmpeg 起不来…），而控制端以前**一条都没接** —— `control.rs` 的兜底分支把它丢了。
+/// 于是现场只看得见「没声音」，看不见「为什么没声音」：与 2026-10-31 那个
+/// 「剪贴板恒报发送 0 却查不出原因」是同一类问题（协议先行、两端未接）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioPhase {
+    /// 没要声音（没给 `--audio`）。
+    Idle,
+    /// 要了声音，但被控端没声明 `Cap::Audio` —— 连 `AudioStart` 都没发出去。
+    Unsupported,
+    /// 已发 `AudioStart`，还没等到被控端任何一句 `AudioState`。
+    Requested,
+    /// 被控端确认在推流。
+    Running,
+    /// 从来没推起来过，被控端就明说不行（原因在 `detail`）。
+    Failed,
+    /// 推过之后被控端不再推了（编码器退出 / 会话收尾）—— 这不是「起不来」。
+    Ended,
+    /// 本机主动叫停（本机解码器起不来时发 `C2H::AudioStop`），对面那句
+    /// `running:false` 是预期内的确认，不计入失败。
+    Stopped,
+    /// `AudioStart` 发出去了，被控端**一句都没回**（版本比这条状态消息更旧）。
+    Stalled,
+}
+
+impl AudioPhase {
+    /// 一行中文说法。日志与收工统计共用，免得两处各写一套措辞、grep 规则也要写两套。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "本端没要声音",
+            Self::Unsupported => "被控端没有音频能力（没声卡 / 没 PulseAudio），没请求",
+            Self::Requested => "已请求，等被控端回话",
+            Self::Running => "被控端正在推流",
+            Self::Failed => "被控端音频起不来",
+            Self::Ended => "被控端不再推流",
+            Self::Stopped => "本机已请求停止",
+            Self::Stalled => "被控端没回过音频状态（版本比这条消息更旧？）",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Inner {
+    phase: AudioPhase,
+    /// 收到过几条 `AudioState`（含内容重复的）。
+    states: u64,
+    /// 其中「一次都没推起来过就说不行」的条数。
+    failures: u64,
+    /// 本机叫停**之后**被控端回的确认条数。
+    ///
+    /// 这一条是「`C2H::AudioStop` 真的被对面处理了」的唯一证据：`phase==Stopped`
+    /// 是本机自己记的（发之前就记了），光看它分不清「对面停了」与「对面没理我们」。
+    stop_acks: u64,
+    requested_at_ms: u64,
+    codec: String,
+    detail: String,
+    /// 本机一侧的失败原因（解码器进程都拉不起来），由看门狗取走一次。
+    local_failure: Option<String>,
+}
+
+impl Default for Inner {
+    fn default() -> Self {
+        Inner {
+            phase: AudioPhase::Idle,
+            states: 0,
+            failures: 0,
+            stop_acks: 0,
+            requested_at_ms: 0,
+            codec: String::new(),
+            detail: String::new(),
+            local_failure: None,
+        }
+    }
+}
+
+/// 音频状态观察器。纯逻辑 + **时钟由调用方给**（`now_ms`），所以每一条相位迁移
+/// 都能在 `cargo test` 里钉住 —— 不需要真链路，更不需要真声卡。
+#[derive(Debug, Default)]
+pub struct AudioWatch {
+    inner: Mutex<Inner>,
+}
+
+impl AudioWatch {
+    /// 进程内单调时钟（毫秒）。与 `control::now_us` 同一套理由：用 `Instant`，
+    /// 别用墙上时钟 —— NTP 拽一下就能把「等了 5 秒」变成「等了负 3 秒」。
+    pub fn clock_ms() -> u64 {
+        use std::sync::OnceLock;
+        static T0: OnceLock<std::time::Instant> = OnceLock::new();
+        T0.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        // 中毒也继续：这里没有跨 panic 的不变量，把原 panic 变成二次 panic 只会更难查。
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 记一次「`AudioStart` 已经发出去了」。返回相位是否真的变了。
+    pub fn note_requested(&self, now_ms: u64) -> bool {
+        let mut w = self.lock();
+        if w.phase == AudioPhase::Running {
+            // 已经在推（重连后的第二条会话重复请求）：被控端会回一句「已在运行」，
+            // 这边别把一次无害的重复请求记成「重新开始等回音」。
+            return false;
+        }
+        w.phase = AudioPhase::Requested;
+        w.requested_at_ms = now_ms;
+        w.detail.clear();
+        true
+    }
+
+    /// 对面压根没声明 `Cap::Audio`：连请求都发不出去。原因要留在状态里，
+    /// 不能只留在日志里 —— headless 的收工统计是脚本唯一的观测面。
+    pub fn note_unsupported(&self) {
+        self.lock().phase = AudioPhase::Unsupported;
+    }
+
+    /// 本机主动叫停（发 `C2H::AudioStop` 之前调）。`why` 是本机给的原因。
+    pub fn note_stop_requested(&self, why: &str) {
+        let mut w = self.lock();
+        w.phase = AudioPhase::Stopped;
+        w.detail = clip_detail(why);
+    }
+
+    /// 记一条被控端来的 `AudioState`。返回 `Some((从, 到))` = 相位变了，
+    /// 调用方只在变化时打日志（同一状态每 2 秒重复报一次会把终端刷满）。
+    ///
+    /// 计数口径是这一轮定下来的，写清楚免得以后被「顺手改回去」：
+    /// - 一次都没推起来过就说 `running:false` → **Failed**（`failures += 1`）；
+    /// - 推过之后停了 → **Ended**。这是正常收尾，记成故障会让每条会话都以红收场；
+    /// - 我们自己叫的停之后那句 `false` → 仍是 **Stopped**，不计失败。
+    pub fn on_state(
+        &self,
+        running: bool,
+        codec: &str,
+        detail: &str,
+    ) -> Option<(AudioPhase, AudioPhase)> {
+        let mut w = self.lock();
+        w.states += 1;
+        let from = w.phase;
+        let to = if running {
+            AudioPhase::Running
+        } else {
+            match from {
+                AudioPhase::Running => AudioPhase::Ended,
+                AudioPhase::Stopped => {
+                    w.stop_acks += 1;
+                    AudioPhase::Stopped
+                }
+                _ => {
+                    w.failures += 1;
+                    AudioPhase::Failed
+                }
+            }
+        };
+        if !codec.is_empty() {
+            w.codec = codec.to_string();
+        }
+        // 「我们自己叫的停」之后那句确认**不许**盖掉本机的原因。
+        // 顺序是：看门狗先 `note_stop_requested(本机原因)`，再把 AudioStop 发出去，
+        // 被控端回的那句只是「知道了」——它说的是我们已经知道的事，而对面那句
+        // 「找不到 ffmpeg」才是现场要看的根因。（这一条是被自己的单测抓出来的。）
+        if !detail.is_empty() && !(from == AudioPhase::Stopped && to == AudioPhase::Stopped) {
+            w.detail = clip_detail(detail);
+        }
+        w.phase = to;
+        if from == to {
+            None
+        } else {
+            Some((from, to))
+        }
+    }
+
+    /// 「请求了却一句回音都没有」到点了没有。**只在跨界那一次**返回 `true`。
+    pub fn check_stalled(&self, now_ms: u64, grace_ms: u64) -> bool {
+        let mut w = self.lock();
+        if w.phase != AudioPhase::Requested {
+            return false;
+        }
+        if now_ms.saturating_sub(w.requested_at_ms) < grace_ms {
+            return false;
+        }
+        w.phase = AudioPhase::Stalled;
+        true
+    }
+
+    /// 本机一侧起不来。留给看门狗去发 `C2H::AudioStop`；只记第一句（后面的是同一件事）。
+    pub fn note_local_failure(&self, why: &str) {
+        let mut w = self.lock();
+        if w.local_failure.is_none() {
+            w.local_failure = Some(clip_detail(why));
+        }
+    }
+
+    pub fn take_local_failure(&self) -> Option<String> {
+        self.lock().local_failure.take()
+    }
+
+    pub fn phase(&self) -> AudioPhase {
+        self.lock().phase
+    }
+
+    pub fn states(&self) -> u64 {
+        self.lock().states
+    }
+
+    pub fn failures(&self) -> u64 {
+        self.lock().failures
+    }
+
+    /// 本机叫停之后，被控端回过几句确认（>0 才算 `AudioStop` 真被处理了）。
+    pub fn stop_acks(&self) -> u64 {
+        self.lock().stop_acks
+    }
+
+    /// 一行可 grep 的总结（收工统计用）。
+    ///
+    /// `got_bytes` = 本机到底收到过音频字节没有。「被控端说结束了却一字节没到」
+    /// 与「放完了」在统计行上必须分得开 —— 这正是现场最容易混的两件事。
+    pub fn summary(&self, got_bytes: bool) -> String {
+        let w = self.lock();
+        let mut s = format!(
+            "音频状态 : {}（被控端回了 {} 条 / 起不来 {} 次）",
+            w.phase.label(),
+            w.states,
+            w.failures
+        );
+        if !w.codec.is_empty() {
+            s.push_str(&format!("，编码 {}", w.codec));
+        }
+        if !w.detail.is_empty() {
+            s.push_str(&format!("，最后一句：{}", w.detail));
+        }
+        if w.phase == AudioPhase::Ended && !got_bytes {
+            s.push_str("（本机一个字节都没收到 —— 采集源没起来？）");
+        }
+        // 「我们叫了停」与「对面确认停了」是两件事，必须分开说：前者只是本机的意图。
+        if w.phase == AudioPhase::Stopped {
+            s.push_str(if w.stop_acks > 0 {
+                "，被控端已确认停止"
+            } else {
+                "，被控端还没确认"
+            });
+        }
+        s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 假时钟起点。状态机的时间一律由调用方给，所以这些测试不真等 5 秒。
+    const T0: u64 = 1_000;
+
+    #[test]
+    fn idle_until_something_is_asked() {
+        let w = AudioWatch::default();
+        assert_eq!(w.phase(), AudioPhase::Idle);
+        assert_eq!(w.states(), 0);
+        // 没请求过就永远不会被判成「没回音」。
+        assert!(!w.check_stalled(T0 + 60_000, AUDIO_ACK_GRACE_MS));
+        assert!(w.summary(false).contains("本端没要声音"));
+    }
+
+    #[test]
+    fn ack_within_grace_is_not_stalled_and_repeat_logs_once() {
+        let w = AudioWatch::default();
+        assert!(w.note_requested(T0));
+        assert!(w.on_state(true, "opus/ogg 64k 48000Hz 2ch", "lavfi:sine").is_some());
+        assert_eq!(w.phase(), AudioPhase::Running);
+        // 已经回过话了，「没回音」这条判据就永远不该再触发。
+        assert!(!w.check_stalled(T0 + AUDIO_ACK_GRACE_MS + 1, AUDIO_ACK_GRACE_MS));
+        // 同一状态再来一条：不产生新日志，但计数要涨（证明消息确实到了这一层）。
+        assert!(w.on_state(true, "", "").is_none());
+        assert_eq!(w.states(), 2);
+        assert_eq!(w.failures(), 0);
+        assert!(w.summary(true).contains("正在推流"));
+        assert!(w.summary(true).contains("opus/ogg"));
+    }
+
+    #[test]
+    fn repeated_request_while_running_is_not_re_counted() {
+        let w = AudioWatch::default();
+        w.note_requested(T0);
+        w.on_state(true, "opus/ogg", "pulse:monitor");
+        // 第二条会话又发了一次 AudioStart：不该退回「等回话」。
+        assert!(!w.note_requested(T0 + 8_000));
+        assert_eq!(w.phase(), AudioPhase::Running);
+    }
+
+    #[test]
+    fn silence_past_grace_is_reported_exactly_once() {
+        let w = AudioWatch::default();
+        w.note_requested(T0);
+        assert!(!w.check_stalled(T0 + AUDIO_ACK_GRACE_MS - 1, AUDIO_ACK_GRACE_MS));
+        assert!(w.check_stalled(T0 + AUDIO_ACK_GRACE_MS, AUDIO_ACK_GRACE_MS));
+        assert!(!w.check_stalled(T0 + AUDIO_ACK_GRACE_MS * 3, AUDIO_ACK_GRACE_MS));
+        assert_eq!(w.phase(), AudioPhase::Stalled);
+        assert!(w.summary(false).contains("没回过音频状态"));
+    }
+
+    #[test]
+    fn never_started_failure_keeps_the_reason() {
+        let w = AudioWatch::default();
+        w.note_requested(T0);
+        let change = w.on_state(false, "", "不支持的音频源 \"alsa:plughw:0,0\"");
+        assert_eq!(change, Some((AudioPhase::Requested, AudioPhase::Failed)));
+        assert_eq!(w.failures(), 1);
+        let s = w.summary(false);
+        assert!(s.contains("起不来"), "{s}");
+        assert!(s.contains("不支持的音频源"), "{s}");
+    }
+
+    #[test]
+    fn streamed_then_ended_is_not_a_failure() {
+        let w = AudioWatch::default();
+        w.note_requested(T0);
+        w.on_state(true, "opus/ogg", "pulse:monitor");
+        w.on_state(false, "", "音频流结束（12 秒，96000 字节）");
+        assert_eq!(w.phase(), AudioPhase::Ended);
+        assert_eq!(w.failures(), 0, "正常收尾不能记成故障");
+        // 收到过字节 vs 一字节没到，统计行上必须分得开。
+        assert!(!w.summary(true).contains("一个字节都没收到"));
+        assert!(w.summary(false).contains("一个字节都没收到"));
+    }
+
+    #[test]
+    fn our_own_stop_ack_is_expected() {
+        let w = AudioWatch::default();
+        w.note_requested(T0);
+        w.on_state(true, "opus/ogg", "lavfi:sine");
+        w.note_stop_requested("本机音频解码器起不来：找不到 ffmpeg");
+        assert_eq!(w.phase(), AudioPhase::Stopped);
+        // 叫停刚发出去、对面还没回话：这只能算「本机意图」，不能算「对面停了」。
+        assert_eq!(w.stop_acks(), 0);
+        assert!(w.summary(false).contains("被控端还没确认"), "{}", w.summary(false));
+        // 被控端回的那句 running:false 是确认，不该变红、也不该记失败。
+        assert!(w.on_state(false, "", "控制端关闭了音频").is_none());
+        assert_eq!(w.phase(), AudioPhase::Stopped);
+        assert_eq!(w.failures(), 0);
+        assert_eq!(w.states(), 2);
+        assert_eq!(w.stop_acks(), 1, "确认条数才是 AudioStop 被处理的证据");
+        assert!(w.summary(false).contains("本机已请求停止"));
+        assert!(w.summary(false).contains("被控端已确认停止"));
+        assert!(w.summary(false).contains("找不到 ffmpeg"));
+    }
+
+    /// `running:true` 不是「确认停止」—— 集成测试以前用 `states>=1` 当判据，
+    /// 那样对面只回一句 running:true 也会算通过，等于没测。
+    #[test]
+    fn a_running_state_is_never_a_stop_ack() {
+        let w = AudioWatch::default();
+        w.note_requested(T0);
+        w.note_stop_requested("本机接不住");
+        w.on_state(true, "opus/ogg", "对面还在推");
+        assert_eq!(w.stop_acks(), 0);
+        assert_eq!(w.phase(), AudioPhase::Running, "对面还在推就该如实显示在推，别停在 Stopped 上自欺");
+    }
+
+    #[test]
+    fn recovery_after_failure_is_reported() {
+        let w = AudioWatch::default();
+        w.note_requested(T0);
+        w.on_state(false, "", "第一次探测失败");
+        assert_eq!(w.phase(), AudioPhase::Failed);
+        assert!(w.on_state(true, "opus/ogg", "换了源之后起来了").is_some());
+        assert_eq!(w.phase(), AudioPhase::Running);
+        assert_eq!(w.failures(), 1, "失败过一次要留痕");
+    }
+
+    #[test]
+    fn second_session_requests_again() {
+        // 断线接回之后是一条新会话：上一轮的原因不能把新一轮钉死。
+        let w = AudioWatch::default();
+        w.note_requested(T0);
+        w.on_state(false, "", "上一轮的原因");
+        assert!(w.note_requested(T0 + 4_000));
+        assert_eq!(w.phase(), AudioPhase::Requested);
+        assert!(w.summary(false).contains("等被控端回话"), "{}", w.summary(false));
+    }
+
+    #[test]
+    fn unsupported_is_recorded_not_only_logged() {
+        let w = AudioWatch::default();
+        w.note_unsupported();
+        assert_eq!(w.phase(), AudioPhase::Unsupported);
+        assert!(w.summary(false).contains("没有音频能力"));
+        // 对面没能力 ≠ 被控端故障。
+        assert_eq!(w.failures(), 0);
+        assert_eq!(w.states(), 0);
+    }
+
+    #[test]
+    fn long_multiline_detail_stays_one_line_and_valid_utf8() {
+        let w = AudioWatch::default();
+        w.note_requested(T0);
+        let noisy = " ffmpeg 报错\n".repeat(60);
+        w.on_state(false, "", &noisy);
+        let s = w.summary(false);
+        assert!(!s.contains('\n'), "detail 里的换行会把统计行刷成一片");
+        assert!(s.chars().count() < 300, "detail 没裁：{} 字符", s.chars().count());
+        // 裁切按字符不按字节：中文按字节切正好落在多字节中间。
+        assert!(s.ends_with('…'), "裁过的文本要留下痕迹：{s}");
+    }
+
+    #[test]
+    fn local_failure_is_handed_over_once() {
+        let w = AudioWatch::default();
+        assert!(w.take_local_failure().is_none());
+        w.note_local_failure("解码器启动失败：os error 2");
+        w.note_local_failure("第二句不该盖掉第一句");
+        assert_eq!(w.take_local_failure().as_deref(), Some("解码器启动失败：os error 2"));
+        assert!(w.take_local_failure().is_none(), "同一件事只通知一次");
     }
 }

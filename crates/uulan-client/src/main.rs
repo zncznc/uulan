@@ -967,6 +967,7 @@ async fn main() -> Result<()> {
             None
         },
         audio_stats: std::sync::Arc::new(uulan_client::audioin::AudioStats::default()),
+        audio_watch: std::sync::Arc::new(uulan_client::audioin::AudioWatch::default()),
     };
 
     // ── 窗口模式 ──────────────────────────────────────────────────────────
@@ -1519,6 +1520,12 @@ async fn run_headless(
         // 这是现场区分「没声音」与「没连上」的唯一判据。
         if plan.audio.is_some() {
             println!("  {}", plan.audio_stats.summary());
+            // 状态行：被控端关于音频说过的话（起不来时那句原因）与本机的一字节判据。
+            // 少了它，「没声音」在无人值守的日志里就无迹可寻（同剪贴板那条教训）。
+            println!(
+                "  {}",
+                plan.audio_watch.summary(plan.audio_stats.got_bytes())
+            );
         }
         println!("  会话       : 建立 {} 条 / 断线接回 {} 次", sessions, reconnects);
     }

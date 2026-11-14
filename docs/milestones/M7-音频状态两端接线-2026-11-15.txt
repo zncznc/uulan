@@ -1,0 +1,93 @@
+M7 收尾 · 控制端接住被控端音频状态（AudioState / AudioStop 双向）
+====================================================================
+日期：2026-11-15 01:00 夜批
+基线提交：e338c57（11-14 05:00 批归档）
+本轮改动：crates/uulan-client/{src/audioin.rs, src/control.rs, src/main.rs, src/session.rs, tests/audio_path.rs}
+
+背景：协议先行、两端未接（音频版）
+--------------------------------------------------
+被控端 `session.rs::AudioCtl` 在**每一条音频起不来的路上**都会发
+`H2C::AudioState{running, codec, detail}`，控制端也定义过 `C2H::AudioStop`。
+但控制端的 `control.rs` 收帧 match 里没有 `AudioState` 那条分支，落到兜底
+`Ok(_) => {}` 被静默丢弃；`C2H::AudioStop` 在协议里躺着、控制端从来没发过。
+
+后果：现场遇到「没声音」时，控制端只看得见「峰值 0 / 一字节没到」这种**症状**，
+看不见「为什么」——与被修过的剪贴板「恒报发送 0 却查不出原因」是同一类问题。
+
+本轮做的事
+-------------------------------------------
+1. `audioin::AudioWatch`：纯状态机（8 相位 Idle/Unsupported/Requested/Running/
+   Failed/Ended/Stopped/Stalled），时钟由调用方给，所有迁移用 12 条单测钉住。
+2. `control.rs`：match 里加 `H2C::AudioState` 分支，把每一句都记进 `AudioWatch`；
+   兜底改成 `debug!(kind=other.shape(), ...)`（借 HEAD 里已有的 `Shape` 层），
+   「协议里有、两端未接」的消息以后不会静默消失。
+3. `session::open`：会话开头 `note_requested`，把 `audio_watch: Arc<AudioWatch>` 放进
+   Plan，跨会话共用一份。AudioStart 发出后起一条 30 秒**看门狗**任务：
+   - 5 秒一句 `AudioState` 都没回来 → 判 Stalled（对面版本比这条消息更旧）；
+   - 本机 ffmpeg 都起不来 → 发 `C2H::AudioStop` + 记 Stopped + 保留本机原因，
+     对面那句 `running:false` 只是「已确认停止」，不计入 failures。
+4. `main.rs::run_headless`：`plan.audio.is_some()` 时统计行补一条
+   `音频状态 : …（被控端回了 N 条 / 起不来 K 次）… 最后一句：<detail>…`。
+
+本机真链路验收（D:\uulan-bin\audio_path.exe --nocapture，proto 4）
+--------------------------------------------------------------------
+`test audio_flows_from_host_to_client_wav`
+  中途统计：音频：收到 199 帧 / 50395 字节 → 解出 4.4 秒 PCM（峰值 2981，播放 848160 字节，错误 0）
+  新断言：`watch.phase() == Running`、`states() >= 1`、`failures() == 0` ✅
+
+`test client_stops_the_host_when_it_cannot_decode`
+  ffmpeg = `C:/uulan-no-such-dir/ffmpeg.exe`（本机 spawn 立刻 NotFound）
+  叫停状态行：
+    音频状态 : 本机已请求停止（被控端回了 1 条 / 起不来 0 次），
+      最后一句：本机音频解码器起不来：系统找不到指定的路径。 (os error 3)，
+      被控端已确认停止
+  断言：`phase==Stopped`、`stop_acks>=1`、`failures==0`、summary 同时含
+  「本机已请求停止」「被控端已确认停止」「本机音频解码器起不来」 ✅
+  → **`C2H::AudioStop` 真被对面处理了**（那句 `running:false` 只有
+    `AudioCtl::stop()` 会发），不再是一条「协议里有、没人发」的死消息。
+
+`test client_surfaces_a_source_that_never_produced_bytes`
+  被控端 audio-source = `pulse:alsa_input.uulan-does-not-exist`（pactl 不认，但能解析）
+  坏源状态行：
+    音频状态 : 被控端不再推流（被控端回了 2 条 / 起不来 0 次），
+      编码 opus/ogg 64k 48000Hz 2ch，
+      最后一句：音频流结束（0 秒，0 字节）（本机一个字节都没收到 —— 采集源没起来？）
+  断言：`states>=1`、phase 不在 Idle/Requested、若 Ended 则必须含
+  「本机一个字节都没收到」且 `stats.ogg_bytes==0` ✅
+
+`test missing_audio_capability_is_recorded_not_only_logged`
+  被控端不配 audio-source；本机无 PulseAudio → `available(None)==false` → 不声明 Cap::Audio。
+  无能力状态行：`Unsupported（被控端没有音频能力（没声卡 / 没 PulseAudio），没请求）`
+  断言：`phase==Unsupported`、`states==0`、`failures==0` ✅
+
+cargo test --workspace
+-----------------------
+**489 passed / 0 failed / 1 ignored / 0 warnings**（上一轮基线 473/0/1，本轮 +16 全来自这 5 个文件）
+`cargo build --release` RC=0，零警告；
+`cargo check -p uulan-host -p uulan-fs -p uulan-bulk --target x86_64-unknown-linux-gnu` RC=0。
+
+真机验收：未做
+---------------
+按 skill「断电 vs 漂移」判法（本机 TUN 关、控制探针 `.99:22` 也超时 = 扫描可信）：
+1. ARP 邻居表：`.1` `.2` 可访问，`.15` **无法访问 / 无法访问**（MAC 都解析不到）；
+2. 唤醒广播 `192.168.223.255` + 全段慢扫 22/21116（超时 2.2s，60 并发）：
+   `.3` `.9` `.20` 应答 135、`.6` `.18` 应答 80（本机网卡没问题）；
+   **整段 22/21116 无应答**，`.15` 不在本二层。
+3. 相邻网段（192.168.1.1 / 192.168.0.1 / 192.168.147.1）从本机路由不可达 ——
+   这条不能用来排除「DHCP 漂到别处」，**别据此下「断电」结论**。
+
+结论：真机本轮**仍未验**，原因不明（断电/断链/DHCP 漂移到本路由之外的子网，
+都有可能；路由器 DHCP 租约表现场看电源灯是唯一裁决路径，无人值守拿不到）。
+
+真机回来后要跑的（不改代码，按现有物料）
+-------------------------------------------------
+1. 部署 HEAD：`git archive` + scp → 真机 `tar -C src.new`，保留 target 缓存，
+   `cargo build --release -p uulan-server -p uulan-host -p uulan-client`。
+2. 让麒麟有声卡的环境跑 `audio_path` 的三条集成测试（真机是可写目录）；
+   尤其 `missing_audio_capability_is_recorded_not_only_logged` 在麒麟上
+   若声明了 Cap::Audio 会 SKIP，那是**预期**——不是不通。
+3. 真机侧手工复现一次叫停：把控制端 `--ffmpeg` 指到一个不存在的路径连上去，
+   journal 应出现 `音频已停止（控制端关掉的）`；控制端统计行
+   「被控端已确认停止」必须命中。
+4. 麒麟→Windows 反向：在 `:0` 上播一段音频（`paplay /usr/share/sounds/*.wav`），
+   Windows 控制端 `--audio --audio-save out.wav`，440 Hz/真实声音频谱验证同 M7 首版数字。

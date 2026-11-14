@@ -22,6 +22,9 @@ use tracing::{debug, info, warn};
 use uulan_clip::{poll_outbound, ClipSync, Clipboard, POLL_INTERVAL};
 use uulan_protocol::frame::{read_frame, write_frame, FrameKind};
 use uulan_protocol::msg::{C2H, H2C, Metrics};
+use uulan_protocol::shape::Shape;
+
+use crate::audioin::{AudioPhase, AudioWatch};
 
 /// 上报与回报的计数。收工时打印，作为「输入真的发出去了」的机器可查证据。
 #[derive(Debug, Default)]
@@ -331,6 +334,20 @@ impl ControlLink {
         clipboard: Option<Box<dyn Clipboard>>,
         stats: Arc<InputStats>,
     ) -> Self {
+        Self::start_full(control, clipboard, stats, Arc::new(AudioWatch::default()))
+    }
+
+    /// 同上，再加一份**调用方持有的**音频状态观察器（`H2C::AudioState` 记进那里）。
+    ///
+    /// 为什么要从外面传：`AudioState` 是在这条控制通道的读任务里收到的，
+    /// 而「音频到底怎么了」要在收工统计里打印 —— 那是会话之外、由调用方拿着的。
+    /// 两边共用一个 `Arc` 才看得见（与 [`Self::start_with`] 传 `InputStats` 同一个理由）。
+    pub fn start_full(
+        control: SecControl,
+        clipboard: Option<Box<dyn Clipboard>>,
+        stats: Arc<InputStats>,
+        audio: Arc<AudioWatch>,
+    ) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<C2H>();
         let status = Arc::new(HostStatus::default());
         let st = stats.clone();
@@ -427,7 +444,33 @@ impl ControlLink {
                                         }
                                     }
                                 }
-                                Ok(_) => {}
+                                Ok(H2C::AudioState { running, codec, detail }) => {
+                                    // 被控端关于音频的每一句都记进状态机（起不来时那句 detail
+                                    // 是唯一的原因）。以前这里落进下面的空分支被丢掉 —— 于是
+                                    // 「没声音」在控制端永远查不出为什么没声音。
+                                    match audio.on_state(running, &codec, &detail) {
+                                        Some((from, to)) => {
+                                            let msg = format!(
+                                                "被控端音频状态：{} → {}",
+                                                from.label(),
+                                                to.label()
+                                            );
+                                            if to == AudioPhase::Failed {
+                                                warn!(codec = %codec, detail = %detail, "{msg}");
+                                            } else {
+                                                info!(codec = %codec, detail = %detail, "{msg}");
+                                            }
+                                        }
+                                        None => debug!(running, "被控端重复上报同一个音频状态"),
+                                    }
+                                }
+                                Ok(other) => {
+                                    // 兜底也要留一行痕迹：这里以前是空的 `{}`，于是
+                                    // 「协议里有、两端没接」的消息会在这儿静默消失
+                                    // （`AudioState` 整个 M7 就是这么被吞掉的）。
+                                    // 只打类名，绝不带载荷（见 `uulan_protocol::shape`）。
+                                    debug!(kind = other.shape(), "控制通道上收到本端未处理的消息");
+                                }
                                 Err(e) => debug!(error = %e, "控制通道上收到无法解析的 JSON"),
                             },
                             FrameKind::Pong => {

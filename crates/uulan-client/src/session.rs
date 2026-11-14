@@ -288,6 +288,9 @@ pub struct Plan {
     pub audio: Option<crate::audioin::Sink>,
     /// 音频计数：**跨会话累加**（重连后接着算），收工统计读它。
     pub audio_stats: std::sync::Arc<crate::audioin::AudioStats>,
+    /// 被控端音频状态（`H2C::AudioState`）的观察器。也是跨会话共享一份：
+    /// 上一轮「起不来」的原因，重连之后仍然能在统计行里看见。
+    pub audio_watch: std::sync::Arc<crate::audioin::AudioWatch>,
 }
 
 impl Plan {
@@ -446,8 +449,18 @@ pub async fn open(
         None
     };
     let link = match live {
-        Some(l) => ControlLink::start_with(c.control, clip, l.input_stats()),
-        None => ControlLink::start_with_clipboard(c.control, clip),
+        Some(l) => ControlLink::start_full(
+            c.control,
+            clip,
+            l.input_stats(),
+            plan.audio_watch.clone(),
+        ),
+        None => ControlLink::start_full(
+            c.control,
+            clip,
+            Arc::new(InputStats::default()),
+            plan.audio_watch.clone(),
+        ),
     };
     let input = if c.host.has_desktop && !plan.no_input {
         Some(link.input())
@@ -476,11 +489,12 @@ pub async fn open(
     let audio = match (&plan.audio, c.host.caps.contains(&Cap::Audio)) {
         (Some(sink), true) => {
             let (rd, _wr) = c.audio.into_split();
-            let a = crate::audioin::start(
+            let mut a = crate::audioin::start(
                 rd,
                 plan.ffmpeg.clone(),
                 sink.clone(),
                 plan.audio_stats.clone(),
+                plan.audio_watch.clone(),
             );
             if link.input().send(C2H::AudioStart {
                 bitrate_kbps: 0,
@@ -488,6 +502,12 @@ pub async fn open(
                 channels: 0,
             }) {
                 info!(sink = ?sink, "已请求被控端发送音频");
+                // 先记「已请求」再起看门狗：回话由控制通道的读任务写进同一份状态。
+                plan.audio_watch.note_requested(crate::audioin::AudioWatch::clock_ms());
+                a.add_task(spawn_audio_watchdog(
+                    plan.audio_watch.clone(),
+                    link.input(),
+                ));
             } else {
                 warn!("音频请求没能下发：控制通道已经关了");
             }
@@ -495,6 +515,8 @@ pub async fn open(
         }
         (Some(_), false) => {
             warn!("这台被控端没有声明音频能力（没声卡 / 没 PulseAudio），本次会话不会有声音");
+            // 光打日志不够：headless 的收工统计是脚本唯一的观测面，那里也要看得见原因。
+            plan.audio_watch.note_unsupported();
             None
         }
         (None, _) => None,
@@ -511,6 +533,50 @@ pub async fn open(
     );
 
     Ok(Open { host: c.host, watcher, link, audio, _input: input })
+}
+
+/// 音频看门狗（一条会话一个，最多活 30 秒，随 `AudioIn` 一起 abort）。
+///
+/// 只管两件**只有本机知道**的事 —— 被控端再怎么努力也替我们说不出这两句话：
+///
+/// 1. `AudioStart` 发出去了却一句 `AudioState` 都没回来：对面是比这条消息更旧的版本
+///    （或它把请求吞了）。不说的话，现场只会以为「网络慢 / 没声音」；
+/// 2. 本机解码器根本起不来（没装 ffmpeg、`--ffmpeg` 指错）：这时发一条 `C2H::AudioStop`
+///    让被控端别再白编码，并把原因留在音频状态里（这条消息在协议里定义了很久，
+///    控制端以前从来没发过）。
+fn spawn_audio_watchdog(
+    watch: Arc<crate::audioin::AudioWatch>,
+    input: InputSender,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let t0 = crate::audioin::AudioWatch::clock_ms();
+        let mut tick = tokio::time::interval(Duration::from_millis(500));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let now = crate::audioin::AudioWatch::clock_ms();
+            if watch.check_stalled(now, crate::audioin::AUDIO_ACK_GRACE_MS) {
+                warn!(
+                    waited_ms = now.saturating_sub(t0),
+                    "音频请求发出去了，被控端一句状态都没回（版本比这条消息更旧？）—— 本次会话不会有声音"
+                );
+            }
+            if let Some(why) = watch.take_local_failure() {
+                watch.note_stop_requested(&why);
+                if input.send(C2H::AudioStop) {
+                    warn!(reason = %why, "本机音频接不起来，已让被控端停止推流");
+                } else {
+                    warn!(reason = %why, "本机音频接不起来（控制通道已关，没能通知被控端）");
+                }
+                return;
+            }
+            // 解码器要么在会话开头几百毫秒内起来，要么就不会起来了；被控端的回话也在
+            // 几秒内到。30 秒之后这条看门狗没有别的事可干，别再占着一个任务。
+            if now.saturating_sub(t0) > 30_000 {
+                return;
+            }
+        }
+    })
 }
 
 /// 会话循环（窗口模式）：连 → 跑 → 断了就退避重连，直到不再重连（或任务被 abort）。
