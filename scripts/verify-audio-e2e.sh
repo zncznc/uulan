@@ -137,5 +137,13 @@ if ! grep -qE "音频：收到 [1-9][0-9]* 帧" "$WORK/client.log"; then
   echo "控制端统计里没有收到音频帧（grep 不到「音频：收到 N 帧」）"
   exit 1
 fi
+# 本轮新增：被控端那句 H2C::AudioState{running:true} 必须被控制端接住并印到状态行。
+# 这是「协议先行、两端未接」被补上的直接证据 —— 只数字节数会放过「有流但状态没接线」。
+if ! grep -qE "音频状态 : 被控端正在推流" "$WORK/client.log"; then
+  echo "控制端没把被控端的 AudioState(running:true) 记进状态行（音频状态未接线？）"
+  exit 1
+fi
+echo "音频状态行：$(grep -oE "音频状态 : .*" "$WORK/client.log" | tail -1)"
+
 echo "通过：声音从被控端到了控制端，且解出来就是那个 440 Hz 正弦波。"
 exit 0

@@ -60,6 +60,16 @@ M7 收尾 · 控制端接住被控端音频状态（AudioState / AudioStop 双�
   无能力状态行：`Unsupported（被控端没有音频能力（没声卡 / 没 PulseAudio），没请求）`
   断言：`phase==Unsupported`、`states==0`、`failures==0` ✅
 
+scripts/verify-audio-e2e.sh 增强（同轮，不依赖真机）
+--------------------------------------------------------------------
+在既有 happy-path 验收脚本末尾加一条断言：控制端统计里必须出现
+「音频状态 : 被控端正在推流」—— 这是「接线」在活链路上的直接证据，
+只数字节数会放过「有流但状态没被 control.rs 接住」这种情况。
+本机 UULAN_PORT=21993 UULAN_SECONDS=8 实跑退出码 0：
+  解出 6335 帧 / 丢帧 1 / 首帧 42ms；音频 收到 415 帧 / 98491 字节 → 解出 8.3 秒 PCM
+  音频状态 : 被控端正在推流（被控端回了 1 条 / 起不来 0 次），编码 opus/ogg 64k 48000Hz 2ch
+  WAV 1597004 字节 / 8.32 s / 峰值 2981 / 440Hz 功率是 1000Hz 的 895 倍
+
 cargo test --workspace
 -----------------------
 **489 passed / 0 failed / 1 ignored / 0 warnings**（上一轮基线 473/0/1，本轮 +16 全来自这 5 个文件）
