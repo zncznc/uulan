@@ -90,6 +90,9 @@ pub struct Totals {
     pub decoded: u64,
     pub dropped: u64,
     pub bytes: u64,
+    /// 被控端报来「编码器故障」的会话数（跨会话累加）。
+    /// 只数故障：有界合成源按计划放完不算，见 `H2C::VideoError::failed` 的口径。
+    pub video_failures: u64,
 }
 
 impl Totals {
@@ -100,6 +103,9 @@ impl Totals {
         self.decoded += s.decoded;
         self.dropped += s.dropped;
         self.bytes += s.bytes;
+        if s.video_failed {
+            self.video_failures += 1;
+        }
     }
 }
 
@@ -440,6 +446,9 @@ pub async fn open(
         WatchError::HostRefused(_) | WatchError::NoVideoCfg => {
             OpenError::Refused(format!("开视频通道失败：{e}"))
         }
+        // 被控端自己报了编码器怎么死的：重连会让它重新起一次编码器，这是有用的补救，
+        // 所以走 Transient（不是 Refused）。
+        WatchError::EncoderGone(_) => OpenError::Transient(format!("开视频通道失败：{e}")),
         _ => OpenError::Transient(format!("开视频通道失败：{e}")),
     })?;
 
@@ -633,7 +642,16 @@ pub async fn drive(live: Arc<Live>, plan: Plan, first: Connected) {
                 if s.decoded > 0 && since.elapsed() >= Duration::from_secs(2) {
                     rc.recovered();
                 }
-                if s.silent_s > 0 {
+                // 原因有三档，可信度递减，**谁说的算**必须按这个顺序：
+                // ① 被控端自己说的（`H2C::VideoError` / 道别）—— 唯一来自事实的一档；
+                // ② 本机静默看门狗的推断（「连接半开？」）—— 对面没说时才轮到它；
+                // ③ 什么都没说 —— 只能承认不知道。
+                // 以前只有 ②③：被控端编码器死掉时这里输出「画面流结束」，
+                // 看着像正常收尾，现场根本不会去查编码器。
+                let said = o.watcher.video_end();
+                if !said.is_empty() {
+                    format!("{}（本次会话解出 {} 帧）", said, s.decoded)
+                } else if s.silent_s > 0 {
                     // 半开连接判死：这条会话不是「对面道别」结束的，是看门狗掐掉的。
                     // 原因要原样带进标题/日志，否则现场只看到「画面流结束」，像正常收尾。
                     format!(
@@ -641,7 +659,7 @@ pub async fn drive(live: Arc<Live>, plan: Plan, first: Connected) {
                         s.silent_s, s.decoded
                     )
                 } else {
-                    format!("画面流结束（本次会话解出 {} 帧）", s.decoded)
+                    format!("画面流结束（本次会话解出 {} 帧，被控端未说明原因）", s.decoded)
                 }
             }
             Err(e) if !e.retryable() => {

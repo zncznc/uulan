@@ -1769,10 +1769,12 @@ async fn video_loop(
                         // 2026-10-23 真麒麟实测：1920x1080 → 1600x900，会话当场断，
                         // journal 里只有这条「视频源结束」。所以这里要和 Err 分支一样
                         // 先探一次尺寸：真的变了就按新尺寸重开，没变才收工。
+                        let (n_frames, n_keys, n_bytes) =
+                            (src.emitted(), src.keyframes(), src.bytes());
                         info!(
-                            frames = src.emitted(),
-                            keyframes = src.keyframes(),
-                            bytes = src.bytes(),
+                            frames = n_frames,
+                            keyframes = n_keys,
+                            bytes = n_bytes,
                             device_id = %device_id,
                             "视频源结束"
                         );
@@ -1786,10 +1788,23 @@ async fn video_loop(
                                 break true;
                             }
                         }
+                        // 走到这里 = 尺寸没变（或者压根探不到），**不是**分辨率引起的重启。
+                        // 通道即将关闭，而控制端只能看见「帧不来了」—— 所以先说原因再走。
+                        report_video_end(
+                            &mut video,
+                            VideoEndCause::Eof,
+                            n_frames,
+                            n_keys,
+                            n_bytes,
+                            capture.planned_frames(),
+                        )
+                        .await;
                         return;
                     }
                     Err(e) => {
                         warn!(error = %e, "读编码输出失败");
+                        let (n_frames, n_keys, n_bytes) =
+                            (src.emitted(), src.keyframes(), src.bytes());
                         let _ = src.stop().await;
                         // 抓屏源最常见的死因就是分辨率变了（按旧尺寸抓一块不存在的区域，
                         // ffmpeg 直接退出）。这时别把会话关掉，换尺寸重开一次。
@@ -1802,6 +1817,16 @@ async fn video_loop(
                                 break true;
                             }
                         }
+                        // 同上：这次是真的编不下去了，把 ffmpeg 那句原文带出去。
+                        report_video_end(
+                            &mut video,
+                            VideoEndCause::ReadErr(e.to_string()),
+                            n_frames,
+                            n_keys,
+                            n_bytes,
+                            capture.planned_frames(),
+                        )
+                        .await;
                         return;
                     }
                 },
@@ -1853,6 +1878,74 @@ async fn video_loop(
             return;
         }
     }
+}
+
+/// 编码源停止的**原因**。刻意做成枚举而不是字符串：三种情况的处理方向完全不同，
+/// 而且「ffmpeg 非零退出」在测试机上没法靠运气复现，判据必须是能直接喂参数调用的
+/// （同 `SilenceWatch` 的理由：不确定能复现的逻辑，就得把判定本身做成纯函数）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VideoEndCause {
+    /// 编码输出读到尽头（进程结束）。有界合成源放完、与抓屏进程被人杀掉，长得一模一样。
+    Eof,
+    /// 读编码输出报错，`err` 是被控端拿到的原文（含 ffmpeg 的报错）。
+    ReadErr(String),
+}
+
+/// 被控端在关视频通道之前发给控制端的那句话，以及「这算不算一次故障」。
+///
+/// 口径为什么是「计划帧数 vs 实际出帧」而不是「有界/无界」：合成源放完是**按计划收工**，
+/// 而有界源被人中途 `kill` 掉同样是 EOF —— 只看 `is_unbounded()` 会把那次真故障
+/// 报成「按计划结束」。两者在 `next_au()` 里都是 `Ok(None)`，只有把数字对上才分得开。
+/// 反方向也一样要紧：把正常结束记成故障，会让每一轮无人值守验收凭空多一个红
+/// （与音频状态「Ended 不算 Failed」同一条纪律）。
+pub fn video_end_message(
+    cause: VideoEndCause,
+    frames: u64,
+    keyframes: u64,
+    bytes: u64,
+    planned_frames: Option<u32>,
+) -> (String, bool) {
+    let counters = format!("已出帧 {frames} / 关键帧 {keyframes} / {bytes} 字节");
+    match cause {
+        VideoEndCause::ReadErr(err) => (
+            format!(
+                "被控端编码源出错：{err}（{counters}。这不是网络问题：重连会让被控端重新起一次编码器）"
+            ),
+            true,
+        ),
+        // 设了上限且真放满了 = 正常收工；设了上限却没放满 = 中途夭亡；没设上限 = 抓屏进程没了。
+        VideoEndCause::Eof if planned_frames.map(|n| (frames as u32) >= n).unwrap_or(false) => (
+            format!("被控端采集源按计划结束：合成源设的 {} 帧已放完（{counters}。不是故障）",
+                    planned_frames.unwrap_or(0)),
+            false,
+        ),
+        VideoEndCause::Eof => {
+            let short = match planned_frames {
+                Some(n) => format!(
+                    "设了 {n} 帧上限却只出到 {frames} 帧 —— 采集进程是被杀的还是自己崩的？"
+                ),
+                None => "抓屏进程退出了（X 服务器断了？被系统杀掉？）".to_string(),
+            };
+            (format!("被控端采集源意外结束：{short}（{counters}）"), true)
+        }
+    }
+}
+
+/// 把「画面为什么停了」发出去，然后调用方才关通道。
+///
+/// 发送失败**不**上报：通道本来就要关了，对面收不到只会退回看门狗判断，
+/// 而把一个已经注定的收尾再报成一个错误，会让人以为有两个故障。
+async fn report_video_end<W: AsyncWrite + Unpin>(
+    video: &mut W,
+    cause: VideoEndCause,
+    frames: u64,
+    keyframes: u64,
+    bytes: u64,
+    planned_frames: Option<u32>,
+) {
+    let (message, failed) = video_end_message(cause, frames, keyframes, bytes, planned_frames);
+    warn!(%message, failed, "编码源收尾：已把原因发给控制端");
+    let _ = send_h2c(video, &H2C::VideoError { message, failed }).await;
 }
 
 /// 组装一条 `VideoCfg`。周期性上报实测帧率时也用它 —— 字段只写一遍，免得两处不一致。
@@ -2476,6 +2569,99 @@ mod tests {
         assert_eq!(mk(Quality::Custom, 4_500).cq_and_maxrate(), (23, 4_500));
         // 自定义档但没给数字 → 0，也就是退回恒定质量
         assert_eq!(mk(Quality::Custom, 0).cq_and_maxrate(), (23, 0));
+    }
+
+    // ───────── 编码源收尾时「怎么跟控制端交代」（见 video_end_message） ─────────
+
+    #[test]
+    fn a_bounded_source_running_out_is_not_reported_as_a_failure() {
+        // 有界合成源（`lavfi:...@N`）放完是**按计划收工**。把它记成故障会让每一轮
+        // 无人值守验收凭空变红 —— 与音频状态里「Ended 不算 Failed」同一条口径。
+        let (msg, failed) = video_end_message(VideoEndCause::Eof, 12, 1, 4096, Some(12));
+        assert!(!failed, "合成源放完不该算故障：{msg}");
+        assert!(msg.contains("按计划结束"), "{msg}");
+        // 数字必须带上：现场判断「是没连上还是连上了一会儿」靠的就是它。
+        assert!(msg.contains("已出帧 12") && msg.contains("4096 字节"), "{msg}");
+    }
+
+    #[test]
+    fn an_unbounded_source_hitting_eof_is_a_real_failure() {
+        // 抓屏源的 stdout 读到尽头 = ffmpeg 退出了（X 服务器没了 / 被杀）。
+        // 同样是 Ok(None)，只有采集源自己的性质能把这两种情况分开。
+        let (msg, failed) = video_end_message(VideoEndCause::Eof, 900, 30, 4_194_304, None);
+        assert!(failed, "抓屏源意外结束必须算故障：{msg}");
+        assert!(msg.contains("意外结束"), "{msg}");
+        assert!(msg.contains("已出帧 900"), "{msg}");
+    }
+
+    #[test]
+    fn a_bounded_source_killed_halfway_is_not_reported_as_planned() {
+        // 这一条是口径收紧的理由：有界源被中途 kill 同样是 EOF，
+        // 只看「有没有设上限」会把它说成「按计划结束」—— 一次真故障被报成正常收工。
+        let (msg, failed) = video_end_message(VideoEndCause::Eof, 120, 1, 90_000, Some(600));
+        assert!(failed, "只出到 120/600 帧就是夭亡：{msg}");
+        assert!(msg.contains("意外结束"), "{msg}");
+        assert!(msg.contains("600") && msg.contains("120"),
+                "要把「设了几帧 / 实际几帧」都带上，否则现场无从判断：{msg}");
+    }
+
+    #[test]
+    fn a_read_error_carries_the_original_reason_and_blames_the_encoder_not_the_network() {
+        // 这句话的作用是把人从「网络问题」上引开：被控端编码器出错时控制端会重连，
+        // 而重连确实是对症的（每开一条会话都被控端都会重起一次编码器）。
+        let (msg, failed) =
+            video_end_message(VideoEndCause::ReadErr("ffmpeg 退出（状态 1）".into()), 0, 0, 0, None);
+        assert!(failed);
+        assert!(msg.contains("ffmpeg 退出（状态 1）"), "原文丢了就白说：{msg}");
+        assert!(msg.contains("不是网络问题"), "{msg}");
+        assert!(msg.contains("重连"), "要给出可操作的下一步：{msg}");
+    }
+
+    #[test]
+    fn the_failed_flag_survives_the_wire_and_an_old_host_shape_still_decodes() {
+        // 灰度互通：老被控端发的 JSON 里没有 failed 字段（`serde(default)`），
+        // 新控制端必须照解不误 —— 否则「两端不用同批升级」就是空话。
+        let now = H2C::VideoError { message: "编码器出错".into(), failed: true };
+        let json = serde_json::to_string(&now).expect("序列化");
+        assert!(json.contains(r#""failed":true"#), "{json}");
+        let old_shape = json.replace(r#","failed":true"#, "");
+        match serde_json::from_str::<H2C>(&old_shape).expect("老形状应能解出") {
+            H2C::VideoError { message, failed } => {
+                assert_eq!(message, "编码器出错");
+                assert!(!failed, "缺字段按「不是故障」处理");
+            }
+            _ => panic!("解出来不是 VideoError"),
+        }
+    }
+
+    /// 真链路测试只能走到「正常结束」（有界合成源），因为「ffmpeg 半路崩了」在这台
+    /// 机器上造不出来。那就把**发送机制**单独钉住：这句话必须真的变成对面读得到的
+    /// 一帧 JSON，而且带着 `failed: true` —— 否则控制端接得再好也收不到东西。
+    #[tokio::test]
+    async fn the_reason_really_goes_on_the_wire_as_a_decodable_frame() {
+        let (a, mut peer) = tokio::io::duplex(64 * 1024);
+        // `tokio::io::split` 返回 (读半端, 写半端) —— 写要的是第二个。
+        let (_r, mut w) = tokio::io::split(a);
+        report_video_end(
+            &mut w,
+            VideoEndCause::ReadErr("ffmpeg 退出（状态 1）".into()),
+            300,
+            4,
+            12345,
+            None,
+        )
+        .await;
+
+        let f = read_frame(&mut peer).await.expect("对面应当读到一帧");
+        assert_eq!(f.kind, FrameKind::Json, "画面参数/错误都走 Json 帧");
+        match serde_json::from_slice::<H2C>(&f.payload).expect("payload 必须是 H2C JSON") {
+            H2C::VideoError { message, failed } => {
+                assert!(failed, "读流出错必须标成故障，控制端据此报「编码器故障 1 条会话」");
+                assert!(message.contains("ffmpeg 退出（状态 1）"), "原文要原样到对面：{message}");
+                assert!(message.contains("已出帧 300"), "带上量才能分「没连上」与「连上后断了」");
+            }
+            other => panic!("发出去的不是 VideoError：{other:?}"),
+        }
     }
 
     #[test]

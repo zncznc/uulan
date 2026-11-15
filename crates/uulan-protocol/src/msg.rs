@@ -301,8 +301,23 @@ pub enum H2C {
 
     /// 编码器已（重）启动，参数以此为准。
     VideoCfg(HostVideoCfg),
-    /// 编码器出错（回退到 CPU / 重启）。控制端据此提示用户，而不是黑屏干等。
-    VideoError { message: String },
+    /// 编码源没能继续下去：读流出错、抓屏进程退出，或者（有界合成源）按计划放完。
+    /// 控制端据此提示用户，而不是对着定格画面干等。
+    ///
+    /// 为什么必须有这条消息：会话中途编码源死掉时，被控端以前**只是把视频通道安静地关掉**，
+    /// 控制端那边只剩「画面不再动」—— 它没法区分「编码器没了」与「连接半开」，只能等
+    /// 15 秒静默看门狗把前者判成后者（见 `uulan_client::watch::SilenceWatch`）。
+    /// 结论错了，现场修的方向也会跟着错。所以被控端在收尾之前把原因说出来。
+    ///
+    /// `failed` = 这次结束算不算故障。有界合成源（`lavfi:...@20`）放完是**正常结束**，
+    /// 记成故障会让每一轮验收都红 —— 与音频状态里「Ended 不算 Failed」同一条口径。
+    /// 老被控端不发这个字段（`serde(default)` → false），控制端行为与改动前一致，
+    /// 所以两端**不需要同批升级**。
+    VideoError {
+        message: String,
+        #[serde(default)]
+        failed: bool,
+    },
 
     /// 系统指标，被控端每 2 秒推一次。
     Metrics(Metrics),
@@ -641,7 +656,10 @@ mod tests {
             enc_w: 0,
             enc_h: 0,
         }));
-        rt_h2c(H2C::VideoError { message: "nvenc 初始化失败，已回退 libx264".into() });
+        rt_h2c(H2C::VideoError {
+            message: "nvenc 初始化失败，已回退 libx264".into(),
+            failed: true,
+        });
         rt_h2c(H2C::Metrics(Metrics { cpu: 12.5, mem_used: 1 << 30, mem_total: 1 << 32, net_rx: 1, net_tx: 2, rtt_ms: 8 }));
         rt_h2c(H2C::Clip { text: "x".into() });
         rt_h2c(H2C::ClipOffer { len: 99 });

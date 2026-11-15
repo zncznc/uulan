@@ -1076,6 +1076,8 @@ async fn main() -> Result<()> {
 /// 一个会话的统计（收工报告用）。
 struct Report {
     snap: WatchStatsSnapshot,
+    /// 被控端说的「画面为什么停了」（空 = 它没说）。收工统计里那一行的来源。
+    video_end: String,
     elapsed: Duration,
     kbps: f64,
     video: uulan_protocol::msg::HostVideoCfg,
@@ -1169,7 +1171,7 @@ async fn watch_session(
     let elapsed = o.watcher.elapsed();
     let kbps = o.watcher.stats().bitrate_kbps(elapsed);
     let video = o.watcher.info().clone();
-    (Report { snap, elapsed, kbps, video }, done)
+    (Report { snap, video_end: o.watcher.video_end(), elapsed, kbps, video }, done)
 }
 
 /// 把「现场注入」挂到会话槽上：输入通道与画幅都从 [`session::Live`] **现取**。
@@ -1259,6 +1261,10 @@ async fn run_headless(
     // headless 一直到 2026-10-30 都还是「打一句不再重连、照常出统计、退出码 0」——
     // 脚本/夜批分不清「跑完了」和「画面早冻住了」，所以这里也要按失败收尾。
     let mut gave_up: Option<String> = None;
+    // 「这一轮是到点收工」还是「画面被人掐了」：收工统计里那句
+    // 「画面结束 : …」必须分清这两者，否则每一次正常的 `--seconds` 跑完都会被
+    // 读成「被控端没说明原因」—— 把自家脚本的每一轮都写成一条疑似故障。
+    let mut ended_on_time = false;
 
     loop {
         let mut finished = false;
@@ -1357,6 +1363,7 @@ async fn run_headless(
                     }
                     report = Some(rep);
                     finished = done;
+                    ended_on_time = done;
                 }
                 Err(e) if !e.retryable() => {
                     // 对面明确拒绝：重连没用，直接把话原样交给用户。
@@ -1441,6 +1448,9 @@ async fn run_headless(
                            "first_frame_ms": s.first_frame_ms, "ended": s.ended,
                            "resizes": s.resizes,
                            "silent_s": s.silent_s,
+                           "video_end": rep.video_end,
+                           "video_failed": s.video_failed,
+                           "video_failures": totals.video_failures,
                            "host_fps": s.host_fps_x10 as f32 / 10.0 },
                 "sessions": sessions,
                 "reconnects": reconnects,
@@ -1527,6 +1537,23 @@ async fn run_headless(
                 plan.audio_watch.summary(plan.audio_stats.got_bytes())
             );
         }
+        // 画面为什么停：优先搬被控端**自己说的那句**，它没说才退到本机推断，并明说是推断。
+        // 以前这一行根本不存在，无论「编码器死了」还是「网络断了」，日志里都是同一句
+        // 「画面流结束」—— 现场照着这句话去查网络，方向从第一步就错了。
+        println!(
+            "  画面结束   : {}（被控端报编码器故障 {} 条会话）",
+            if ended_on_time && rep.video_end.is_empty() {
+                // 我们自己到点收的工：被控端什么都没做错，也不欠一句解释。
+                "本机按时限收工（不是被控端结束的画面）".to_string()
+            } else if !rep.video_end.is_empty() {
+                rep.video_end.as_str().to_string()
+            } else if s.silent_s > 0 {
+                format!("被控端未说明；本机按「静默 {} 秒」推断为连接半开", s.silent_s)
+            } else {
+                "被控端未说明（视频通道直接断了）".to_string()
+            },
+            totals.video_failures
+        );
         println!("  会话       : 建立 {} 条 / 断线接回 {} 次", sessions, reconnects);
     }
 

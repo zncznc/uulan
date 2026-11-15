@@ -143,6 +143,18 @@ impl CaptureInput {
         }
     }
 
+    /// 这个源**计划**出多少帧；`None` = 没有计划终点（X11 抓屏、不限帧数的合成源）。
+    ///
+    /// 存在的理由：判断「stdout 到尽头」是正常收工还是提前夭亡，光知道有界/无界不够 ——
+    /// 有界源被人中途 `kill` 掉也是 EOF。只有把「设了几帧」与「实际出了几帧」对上，
+    /// 才不会把一次真故障报成「按计划结束」（见 `session::video_end_message`）。
+    pub fn planned_frames(&self) -> Option<u32> {
+        match self {
+            CaptureInput::Lavfi { frames, .. } => *frames,
+            CaptureInput::X11 { .. } => None,
+        }
+    }
+
     /// 是不是无限产出（X11 抓屏永不结束；lavfi 不设帧数上限也一样）。
     pub fn is_unbounded(&self) -> bool {
         match self {

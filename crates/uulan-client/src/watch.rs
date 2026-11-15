@@ -20,7 +20,7 @@
 use uulan_protocol::crypto::{SecConn, SecReadHalf, SecWriteHalf};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, watch};
@@ -47,6 +47,12 @@ pub enum WatchError {
     NoVideoCfgTimeout(Duration),
     #[error("被控端拒绝推流：{0}")]
     HostRefused(String),
+    /// 被控端的编码器在报送画面参数之前就没跑下去，并**自己说了原因**。
+    ///
+    /// 与 `HostRefused` 分开，是因为处置方向相反：拒绝推流是对面的表态（重连没用），
+    /// 而编码器没跑起来时，重连会让被控端**重新起一次编码器** —— 那正是有效的补救。
+    #[error("被控端编码器结束：{0}")]
+    EncoderGone(String),
 }
 
 /// 视频通道「多久没有任何帧」就判定为半开。
@@ -106,8 +112,17 @@ pub struct WatchStats {
     pub enc_w: AtomicU64,
     pub enc_h: AtomicU64,
     /// 被控端当前**请求**的编码帧率（`VideoCfg.fps`，不是实测值）。
-    /// 和实测帧率分开记：`--fps 15` 有没有生效，只能靠这一项判断。
+    /// 和实测帧率一样记：`--fps 15` 有没有生效，只能靠这一项判断。
     pub cfg_fps: AtomicU64,
+    /// 被控端亲口说的「画面为什么停了」（`H2C::VideoError`，以及会话中途的 `Bye`）。
+    ///
+    /// 空串 = 对面没来得及说（老被控端、或通道被直接掐断），那时上层只能退回静默看门狗
+    /// 的推断 —— 而推断出来的「连接半开？」在编码器死掉的情况下是**错的**。
+    /// 存最后一句，与音频状态里 `detail`（「最后一句：…」）同一条口径。
+    pub video_end: Mutex<String>,
+    /// 最后那句原因算不算**故障**（口径见 `H2C::VideoError::failed`：
+    /// 有界合成源放完不是故障 —— 记成故障会让每轮无人值守验收凭空变红）。
+    pub video_failed: AtomicBool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -132,9 +147,30 @@ pub struct WatchStatsSnapshot {
     pub enc_h: u32,
     /// 被控端当前请求的编码帧率（0 = 还没报过）。
     pub cfg_fps: u32,
+    /// 被控端有没有亲口说「画面是怎么停的」，以及那句算不算故障。
+    ///
+    /// 只放布尔量：`WatchStatsSnapshot` 是 `Copy` 的，文字留在 `WatchStats` 里，
+    /// 由 `VideoWatcher::video_end()` 现取。
+    pub video_said: bool,
+    pub video_failed: bool,
 }
 
 impl WatchStats {
+    /// 记下被控端给的结束原因。`failed` 只对真正的故障置真。
+    pub fn note_video_end(&self, message: &str, failed: bool) {
+        if !message.is_empty() {
+            if let Ok(mut g) = self.video_end.lock() {
+                *g = message.to_string();
+            }
+        }
+        self.video_failed.store(failed, Ordering::Relaxed);
+    }
+
+    /// 被控端说的最后一句结束原因（空 = 它没说）。
+    pub fn video_end_text(&self) -> String {
+        self.video_end.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
     pub fn snapshot(&self) -> WatchStatsSnapshot {
         WatchStatsSnapshot {
             aus: self.aus.load(Ordering::Relaxed),
@@ -154,6 +190,8 @@ impl WatchStats {
             enc_w: self.enc_w.load(Ordering::Relaxed) as u32,
             enc_h: self.enc_h.load(Ordering::Relaxed) as u32,
             cfg_fps: self.cfg_fps.load(Ordering::Relaxed) as u32,
+            video_said: !self.video_end_text().is_empty(),
+            video_failed: self.video_failed.load(Ordering::Relaxed),
         }
     }
 
@@ -280,6 +318,12 @@ impl VideoWatcher {
                             break c;
                         }
                         H2C::Bye { reason } => return Err(WatchError::HostRefused(reason)),
+                        // 编码器一上来就没跑起来。老写法这里落到 `other => 忽略`，
+                        // 于是控制端白等 10 秒，最后报一句「被控端不应答，连接可能已半开」——
+                        // 一句准确的原因都没说，还把人往网络方向带。
+                        H2C::VideoError { message, .. } => {
+                            return Err(WatchError::EncoderGone(message));
+                        }
                         other => {
                             debug!(shape = other.shape(), "视频通道上的其他控制消息，忽略");
                         }
@@ -373,6 +417,11 @@ impl VideoWatcher {
         self.stats.snapshot()
     }
 
+    /// 被控端亲口说的「画面为什么停了」（空 = 它没说）。见 [`WatchStats::video_end`]。
+    pub fn video_end(&self) -> String {
+        self.stats.video_end_text()
+    }
+
     pub fn elapsed(&self) -> Duration {
         self.started.elapsed()
     }
@@ -427,8 +476,10 @@ impl Drop for VideoWatcher {
 enum PumpEnd {
     /// 被控端换了画幅：socket 交回来，由总管重建解码器。
     Resize(HostVideoCfg),
-    /// 通道关闭（Bye / EOF / 读错误）。
+    /// 通道关闭（EOF / 读错误），对面**没说**为什么。
     Closed,
+    /// 被控端说了画面为什么停：`H2C::VideoError`，或会话中途那句 `Bye`。
+    Ended { message: String, failed: bool },
 }
 
 /// 「视频通道已经多久没来帧了」的纯逻辑。
@@ -643,6 +694,17 @@ async fn supervise(
             }
         };
 
+        // 被控端说了原因的，先落到统计里。为什么在 `match` 之前：`Closed` 与 `Ended`
+        // 要走**同一套**收尾动作（冲刷解码器、kill ffmpeg），而 or-pattern 里
+        // `end @ A | B` 这种绑定在 Rust 中不成立（B 分支没有 `end`）。
+        if let PumpEnd::Ended { message, failed } = &end {
+            stats.note_video_end(message, *failed);
+            if *failed {
+                warn!(%message, "被控端报告编码器没能继续（原因来自对面，不是本机推断），本会话收尾");
+            } else {
+                info!(%message, "被控端报告画面结束，本会话收尾");
+            }
+        }
         match end {
             PumpEnd::Resize(cfg) => {
                 // 旧的一代整个丢掉：旧解码器的输出尺寸已经不对，留着只会出斜条纹。
@@ -664,7 +726,7 @@ async fn supervise(
                 // 新码流以关键帧开头（被控端重启编码源必然先出 IDR），不需要再补旧帧
                 continue;
             }
-            PumpEnd::Closed => {
+            PumpEnd::Closed | PumpEnd::Ended { .. } => {
                 // 让 ffmpeg 把已解出的帧冲刷出来再收工：不 abort feed ——
                 // 它会在队列排空、stdin 关闭后自然退出。
                 let _ = tokio::time::timeout(Duration::from_secs(2), &mut decoded).await;
@@ -745,8 +807,21 @@ async fn pump_generation(
                 let _ = write_frame(&mut w, FrameKind::Pong, &f.payload).await;
             }
             FrameKind::Bye => {
-                debug!("被控端道别，视频通道结束");
-                break PumpEnd::Closed;
+                // 道别里带的原因要留下：以前只进 debug 日志，现场永远看不见。
+                let reason = f
+                    .decode_json::<H2C>()
+                    .ok()
+                    .and_then(|m| match m {
+                        H2C::Bye { reason } => Some(reason),
+                        _ => None,
+                    });
+                break match reason {
+                    Some(r) => PumpEnd::Ended { message: r, failed: false },
+                    None => {
+                        debug!("被控端道别（没带原因），视频通道结束");
+                        PumpEnd::Closed
+                    }
+                };
             }
             // 画面参数/实测帧率的周期性上报。只改帧率时**绝不能**动解码器。
             FrameKind::Json => match f.decode_json::<H2C>() {
@@ -756,8 +831,11 @@ async fn pump_generation(
                     }
                 }
                 Ok(H2C::Bye { reason }) => {
-                    debug!(%reason, "被控端道别，视频通道结束");
-                    break PumpEnd::Closed;
+                    info!(%reason, "被控端道别，视频通道结束");
+                    break PumpEnd::Ended { message: reason, failed: false };
+                }
+                Ok(H2C::VideoError { message, failed }) => {
+                    break PumpEnd::Ended { message, failed };
                 }
                 Ok(_) => {}
                 Err(e) => debug!(error = %e, "视频通道上收到无法解析的 JSON 帧"),
@@ -784,6 +862,34 @@ mod tests {
             enc_w: 0,
             enc_h: 0,
         }
+    }
+
+    #[test]
+    fn the_video_end_reason_is_kept_and_only_faults_are_flagged() {
+        let st = WatchStats::default();
+        // 一开始谁都没说：既没说、也没故障
+        assert!(!st.snapshot().video_said);
+        assert!(!st.video_failed.load(Ordering::Relaxed));
+
+        st.note_video_end("被控端采集源按计划结束：合成源只有这么长", false);
+        let s = st.snapshot();
+        assert!(s.video_said && !s.video_failed);
+        assert!(st.video_end_text().contains("按计划结束"));
+
+        // 最后一句为准（与音频状态的 `detail` 同一条口径），且空消息不许把已有原因抹掉。
+        st.note_video_end("", true);
+        assert!(st.video_end_text().contains("按计划结束"), "空消息把原因抹了");
+        assert!(st.snapshot().video_failed, "failed 标志要跟着最新那句走");
+    }
+
+    #[test]
+    fn a_host_that_says_nothing_leaves_the_reason_empty_for_the_watchdog_to_infer() {
+        // 老被控端 / 通道被直接掐断：控制端只能退回静默看门狗推断。
+        // 「空」这个状态必须和「说了但不是故障」分得开，否则统计行会把两者混成一句。
+        let st = WatchStats::default();
+        assert!(st.video_end_text().is_empty());
+        st.note_video_end("被控端编码源出错：x", true);
+        assert!(!st.video_end_text().is_empty());
     }
 
     #[test]
