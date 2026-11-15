@@ -781,6 +781,7 @@ pub async fn run_with_sink(
         &lock,
         &mut sent_state,
         &mut audio_ctl,
+        &params.state,
     )
     .await;
 
@@ -1248,6 +1249,7 @@ async fn control_loop(
     lock: &Option<LockProbe>,
     sent_state: &mut Option<DesktopState>,
     audio: &mut AudioCtl,
+    state: &Arc<HostState>,
 ) -> Result<Closed, String> {
     let mut tick = tokio::time::interval(POLL_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1390,6 +1392,26 @@ async fn control_loop(
                             C2H::AudioStop => {
                                 audio.stop();
                             }
+                            C2H::Power { action } => {
+                                // 电源动作要等子进程回话（最长几秒），**绝不能在 control_loop
+                                // 里同步等** —— 同 `--forward` 的纪律：不许拖住键鼠/剪贴板。
+                                // 配置取请求那一刻的快照（热加载同口径）；拒绝/执行的回话
+                                // 由独立任务发 —— 「每一次请求必回一句」由 power::handle 保证。
+                                let snap = state.snapshot();
+                                let o = out.clone();
+                                tokio::spawn(async move {
+                                    crate::power::handle(
+                                        action,
+                                        snap.power_allow,
+                                        snap.power_test_program,
+                                        std::env::var("USER")
+                                            .ok()
+                                            .or_else(|| std::env::var("USERNAME").ok()),
+                                        o,
+                                    )
+                                    .await;
+                                });
+                            }
                             C2H::Clip { text } => {
                                 if let Some(t) = clip_sync.inbound(&text) {
                                     match clip.set_text(&t) {
@@ -1472,7 +1494,8 @@ async fn control_loop(
 }
 
 /// 控制通道的出站消息。
-enum Out {
+#[derive(Debug)]
+pub(crate) enum Out {
     Json(H2C),
     /// 心跳回应（payload 原样回给对端）。
     Pong(bytes::Bytes),
@@ -1490,7 +1513,7 @@ enum In {
     Err(String),
 }
 
-fn send_out(out: &mpsc::UnboundedSender<Out>, m: H2C) -> Result<(), String> {
+pub(crate) fn send_out(out: &mpsc::UnboundedSender<Out>, m: H2C) -> Result<(), String> {
     out.send(Out::Json(m)).map_err(|_| "控制通道已关闭".to_string())
 }
 

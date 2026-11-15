@@ -51,6 +51,7 @@ impl Shape for H2C {
             Self::PortMapErr { .. } => "PortMapErr",
             Self::Pong { .. } => "Pong",
             Self::AudioState { .. } => "AudioState",
+            Self::PowerState { .. } => "PowerState",
             Self::Bye { .. } => "Bye",
         }
     }

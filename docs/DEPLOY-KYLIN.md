@@ -943,3 +943,32 @@ DISPLAY=:0 XAUTHORITY=$HOME/.Xauthority uulan-host --diagnose; echo "退出码=$
 三个反例分别只坏一项（`DISPLAY=:77`、`--ffmpeg /bin/false`、`--server 127.0.0.1:1`），
 必须 `[FAIL]` 指对那一项且退出码 1；最后拿 `host.json` 的口令原值 grep 输出，命中 0 次。
 数字与踩到的坑见 `docs/milestones/现场自检-2026-10-31.txt`。
+
+## 21. 电源动作白名单：默认关死，开了就能锁屏/重启/关机（2026-11-16 接线）
+
+控制端 `--power <lock|logout|reboot|shutdown>` 让被控端执行电源动作。
+**默认全部拒绝**：`host.json` 不写 `power_allow` 时四种动作一个都不许，拒绝也会明说改法。
+要放开（按需最小）：
+
+```bash
+cp -a ~/.config/uulan/host.json ~/.config/uulan/host.json.bak.$(date +%Y%m%d_%H%M%S)
+# 编辑 host.json，加一个键（值必须是这四个词之一，或 "*"）：
+#   "power_allow": ["lock", "reboot"]
+systemctl --user restart uulan-host
+```
+
+- 名单里**拼错词会让服务起不来**（报错 `power_allow 有误: 不认识的动作词 …`），
+  这是刻意的：静默当成「没配」的降级，比误放行更难在现场查出来。
+- 麒麟上实际执行的命令：lock → `loginctl lock-session`；reboot → `systemctl reboot`；
+  shutdown → `systemctl poweroff`；logout → `loginctl terminate-user <当前用户>`。
+  全走 argv 数组、不经 shell；退出码与 stderr 尾部会原样回到控制端屏幕上。
+- **reboot/shutdown 之后被控端会下线**，靠 systemd 自启回来（10-31 已验：43 秒 SSH 恢复）。
+  polkit 若要求认证（当年 ssh 会话里 `systemctl reboot` 就被拒过），回话里会如实带回来 ——
+  被控端跑在 seat0 桌面会话里，与 ssh 不是同一条授权路；真要无人值守的 root 权限，
+  装 `deploy/uulan.sudoers`（那仍需人输一次口令）。
+- 回滚：删掉 `power_allow`（和 `power_test_program`，如果写过）+ 重启被控端，回到默认全拒。
+- `power_test_program` 是**验收台专用**的假执行器开关（见 `crates/uulan-host/examples/fake_power.rs`），
+  生产机器上不要写它。
+
+真机验收口径与已压着的次序见 `docs/DESIGN.md` 的「电源动作」小节与
+`docs/milestones/电源动作两端接线-2026-11-16.txt`（真机部分：未验）。

@@ -106,6 +106,21 @@ pub struct HostConfig {
     /// `AudioState{running:false}` 并带着原因，现场照着那句话就能改。
     #[serde(default)]
     pub audio_source: Option<String>,
+
+    /// 电源动作放行名单（`C2H::Power`，M4 补格 2026-11-16）。空 = **全部拒绝**（默认）。
+    ///
+    /// 有效值 `lock` / `logout` / `reboot` / `shutdown`，或 `*` 全放行；拼错词直接
+    /// 报错（服务起不来），不会静默当成「没配」。与 `portmap_allow` 同一条纪律：
+    /// **这是安全边界** —— 放开 reboot/shutdown 等于拿到口令就能关机器，只给信任的控制端开。
+    #[serde(default)]
+    pub power_allow: Vec<String>,
+
+    /// 测试钩子：把电源动作的执行程序换成这一个（参数固定为动作名，见 `power::plan`）。
+    ///
+    /// 本机验收台用它钉「命令真的被执行、退出码真的回了话」而不真碰电源
+    /// （与 `audio_source` 的 `lavfi:` 合成源同一思路）。**生产配置不要写它。**
+    #[serde(default)]
+    pub power_test_program: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -158,6 +173,8 @@ impl Default for HostConfig {
             portmap_allow: Vec::new(),
             term_shell: None,
             audio_source: None,
+            power_allow: Vec::new(),
+            power_test_program: None,
         }
     }
 }
@@ -211,6 +228,9 @@ impl HostConfig {
         }
         if !(1..=144).contains(&self.fps) {
             return Err(ConfigError::Empty(format!("fps={} 超出 1..=144", self.fps)));
+        }
+        if let Err(e) = crate::power::parse_allow(&self.power_allow) {
+            return Err(ConfigError::Power(e));
         }
         Ok(())
     }
@@ -433,6 +453,8 @@ pub enum ConfigError {
     BadPassword(String),
     #[error("配置项为空或越界: {0}")]
     Empty(String),
+    #[error("power_allow 有误: {0}")]
+    Power(String),
 }
 
 #[cfg(test)]

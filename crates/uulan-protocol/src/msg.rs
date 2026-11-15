@@ -173,6 +173,19 @@ pub enum PowerAction {
     Logout,
 }
 
+impl PowerAction {
+    /// 线上名（serde snake_case）。白名单解析、回显、假执行器的参数全用这一个口径，
+    /// 别再手拼第二份 —— 有单测把它与 serde 的拼写钉死。
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            PowerAction::Lock => "lock",
+            PowerAction::Logout => "logout",
+            PowerAction::Reboot => "reboot",
+            PowerAction::Shutdown => "shutdown",
+        }
+    }
+}
+
 /// 画面质量档位。语义对齐参考项目：静止桌面靠 CQ 决定观感，所以档位同时改码率上限和 CQ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -376,6 +389,23 @@ pub enum H2C {
         running: bool,
         #[serde(default)]
         codec: String,
+        #[serde(default)]
+        detail: String,
+    },
+
+    /// 电源动作的结果（配 `C2H::Power`，M4 补格 2026-11-16）。
+    ///
+    /// 被控端对**每次请求必回一句** —— 采纳、拒绝、失败都回；不回的话
+    /// 控制端只能靠超时猜「没放行」还是「机器已经下线」，两种排查方向完全不同。
+    /// `ok=true` = 命令成功执行或仍在执行（`detail` 会说清哪种）；
+    /// `ok=false` = 策略拒绝或命令失败，`detail` 给原因与改法（照抄就能改配置）。
+    ///
+    /// 只有新控制端会发 `Power`，老控制端永远收不到这条 —— 两端**不需要同批升级**；
+    /// 但**老被控端**不认 `Power`（解帧失败会掉会话），新控制端对着它跑 `--power`
+    /// 会看到明确报错，这是刻意口径，别再当成兼容问题。
+    PowerState {
+        action: String,
+        ok: bool,
         #[serde(default)]
         detail: String,
     },

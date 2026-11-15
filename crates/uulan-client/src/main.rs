@@ -20,7 +20,7 @@ use tracing::info;
 use uulan_client::connect::{self, ClientError};
 use uulan_client::session;
 use uulan_client::watch::WatchStatsSnapshot;
-use uulan_protocol::msg::{Cap, Quality, VideoSet};
+use uulan_protocol::msg::{Cap, PowerAction, Quality, VideoSet};
 use uulan_protocol::rv::DeviceEntry;
 use uulan_protocol::rvclient::{RvConn, RvError};
 
@@ -52,6 +52,8 @@ struct Args {
     term: bool,
     /// 列远端当前的终端会话（`--terms`）：一次性，同样不开窗口、不收画面。
     terms: bool,
+    /// 电源动作（`--power lock` 等）：发一条、等一句回话就退出，同样不开窗口不收画面。
+    power: Option<PowerAction>,
     /// 终端行列（`--term-size 140x40`）。不给就按本机终端大小来。
     term_size: Option<(u16, u16)>,
     /// 远端 shell（不给用被控端配置/环境里的）。
@@ -145,6 +147,10 @@ uulan-client —— uulan 内网远控的控制端
   --term-shell <path>         指定远端 shell，例：--term-shell /bin/bash
   --terms                     列远端当前的终端会话（id / 名称；配 --json 出单行 JSON）
 
+电源动作（一次性；被控端 power_allow 没放行的一律拒绝 —— 拒绝也必回话）：
+  --power <动作>              lock | logout | reboot | shutdown（配 --json 出单行结果）
+                              logout/reboot/shutdown 会让被控端下线，采纳后别再等画面
+
 键鼠注入（脚本化，做完就退出；不开窗口、不收画面）：
   --devices           列中继知道的设备（ID / 名称 / 在线），不连任何一台
                       不需要 --device 和口令；加 --json 输出机器可读格式
@@ -200,6 +206,7 @@ fn parse_args() -> Result<Args> {
         forward: Vec::new(),
         term: false,
         terms: false,
+        power: None,
         term_size: None,
         term_shell: None,
         inject: None,
@@ -260,6 +267,12 @@ fn parse_args() -> Result<Args> {
             "--forget" => a.forget = true,
             "--term" => a.term = true,
             "--terms" => a.terms = true,
+            "--power" => {
+                let v = it
+                    .next()
+                    .context("--power 需要一个动作: lock | logout | reboot | shutdown")?;
+                a.power = Some(uulan_client::power::parse_action(&v)?);
+            }
             "--term-size" => {
                 let v = it.next().context("--term-size 需要 COLSxROWS，例：140x40")?;
                 a.term_size = Some(parse_size(&v)?);
@@ -434,12 +447,24 @@ fn parse_args() -> Result<Args> {
         || a.fs_op.is_some()
         || a.term
         || a.terms
+        || a.power.is_some()
         || !a.forward.is_empty()
         || a.status.is_some();
     if has_video_flag && non_video_mode {
         bail!(
-            "--quality/--bitrate/--fps/--scale 只对看画面的会话有效：--inject、文件操作、--term、--terms、--forward、--status 都不开视频通道"
+            "--quality/--bitrate/--fps/--scale 只对看画面的会话有效：--inject、文件操作、--term、--terms、--power、--forward、--status 都不开视频通道"
         );
+    }
+    if a.power.is_some()
+        && (a.terms
+            || a.term
+            || a.fs_op.is_some()
+            || !a.forward.is_empty()
+            || a.status.is_some()
+            || a.inject.is_some()
+            || a.inject_live.is_some())
+    {
+        bail!("--power 与其他一次性动作只能选一个：它本身就是一条独立会话（发一条电源请求、等一句回话）");
     }
     // 现场注入必须**跟着一条有画面的会话**。它和 --inject 是两种东西：含糊地两个都给，
     // 用户以为在验的其实是另一条路（独立会话、按握手时的固定尺寸换算）。
@@ -848,6 +873,21 @@ async fn main() -> Result<()> {
         let follow = args.term_size.is_none();
         let code = uulan_client::termx::run(c.control, opts, follow).await?;
         std::process::exit(code);
+    }
+
+    // `--power`：向被控端发一条电源动作并等回话。又一次「协议先行、两端未接」：
+    // `C2H::Power` 从第一天就在协议里，两端从来没 match 过它。接上时把口径钉死：
+    // 默认全拒绝（被控端 power_allow）、每次请求必回一句（拒绝也回，且给出改法）、
+    // 未被采纳 = 非零退出码 —— 脚本要能直接当断言用。与 `--terms` 同族：独立会话。
+    if let Some(action) = args.power {
+        drop(c.video);
+        let ok = uulan_client::power::run(c.control, action, args.json)
+            .await
+            .context("电源动作失败")?;
+        if !ok {
+            std::process::exit(1);
+        }
+        return Ok(());
     }
 
     // `--terms`：列远端的 PTY 会话清单（id / 名称）。与 `--term`/`--ls` 一样是**独立会话**：

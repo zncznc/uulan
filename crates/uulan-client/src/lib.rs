@@ -22,6 +22,7 @@ pub mod inject;
 pub mod session;
 pub mod termx;
 pub mod terms;
+pub mod power;
 pub mod input;
 pub mod watch;
 

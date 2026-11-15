@@ -1,0 +1,77 @@
+电源动作两端接线（C2H::Power / H2C::PowerState）· 2026-11-16 01:00 夜批
+=====================================================================
+
+【这条躺了多久】
+C2H::Power{action: lock|logout|reboot|shutdown} 从骨架时代就写在协议枚举里，两端从来没
+match 过它 —— 「协议先行、两端未接」家族第 5 次命中（VideoSet、音频状态、画面结束原因、
+--terms 之后）。而且它连**回话消息都没有**：以前接上执行也没处报告「采纳/拒绝/失败」，
+所以这次补了 H2C::PowerState{action, ok, detail}。
+
+【三条口径（都是本轮钉下的纪律，不是顺手实现）】
+1. 默认全拒绝。host.json 的 power_allow 不写 = 四种动作一个都不许；名单拼错词让服务
+   起不来（ConfigError::Power），不留「静默当成没配」的降级路 —— 与 portmap_allow 同族
+   的安全边界：拿到口令的人本来就能看桌面传文件，「顺便关机器」必须另开一道显式的闸。
+2. 每一次请求必回一句。采纳、拒绝、失败都回；拒绝带可照抄的改法（哪个键、加哪个词）。
+   不回的代价：控制端只能靠超时猜「没放行」还是「机器已下线」—— 现场拿这两种结论会往
+   完全不同的方向修。
+3. 「算不算采纳」只在一个纯函数里判（power::compose）：退出码 0 或 3 秒宽限期未退出 =
+   采纳（「已执行」/「命令仍在执行（多半正在下线）」）；非零 = 不采纳且 stderr 尾部
+   （≤200 字）原样带回线上。执行在 spawn 的独立任务里，control_loop 绝不同步等
+   （--forward 的老纪律：一个动作不许拖住键鼠/剪贴板）。
+
+【本机证据（全部实跑，2026-11-16 01:00–03:2x）】
+一、被控端单元 11 条（crates/uulan-host/src/power.rs::tests，全过）：
+  名单解析/去重/`*` 全放行；拼错词必报错且列出有效值；wire_name 与 serde 拼写互钉；
+  compose 四条口径（退0/宽限/退非零带stderr/退非零空stderr 不许秃话）；stderr 取尾部；
+  拒绝理由含改法（power_allow、host.json、动作名）；假执行器形状 [program, 动作名]；
+  平台命令表形状（unix: loginctl/systemctl 逐条对词，logout 拿不到用户名=Impossible 不猜；
+  windows: shutdown.exe /r|/s|/l + rundll32 LockWorkStation）；**闸门先于 spawn**
+  （配了个真能跑的程序也必须死在闸门口，detail 里不许出现「退出码」）；
+  真起一个真进程带回退出码（windows: where.exe lock → 退 1；unix: /bin/false）；
+  坏名单降级为拒绝且明说「按全部拒绝处理」。
+二、控制端单元 4 条（crates/uulan-client/src/power.rs::tests）：
+  采纳与拒绝两种渲染不许长得一样；--json 单行可解析；动作名大小写宽容、错词报错列全值；
+  线上形状（"power"/"reboot"/"power_state"）。
+三、真链路 3 条（crates/uulan-client/tests/power_path.rs，真 TCP+真 server+真被控端）：
+  默认配置下 --power 在线上被拒且理由指向 power_allow；放行后真 spawn、子进程退出码 1
+  原样回线上（where.exe//bin/false，不碰电源）；名单外绝不落到执行那一步（断言「不许
+  出现退出码」）；补一条「与能力声明无关」——没放行就是没放行。
+四、真 exe 冒烟 scripts/verify-power-e2e.sh：**19 断言全过，退出码 0**（首跑即绿）。
+  A 台默认配置：--power lock → rc=1、说「未执行」、理由含 power_allow；--json 出
+  "ok":false；错词 rc≠0 且列出有效值；--power 与 --quality 同给当场报错；
+  **反向断言：A 台被控端日志「执行电源动作」出现 0 次**（闸门死在 spawn 之前）。
+  B 台放行 lock/shutdown/logout + 假执行器（examples/fake_power.rs：lock→退0，
+  shutdown→退3+stderr「模拟拒绝切断电源」，logout→睡15s）：lock 采纳 rc=0「已执行」；
+  reboot 名单外被拒且列出当前名单；shutdown 带「退出码 3」+stderr 回线上；
+  logout 超宽限回「仍在执行」rc=0 且控制端 **3 秒**拿到（3 秒宽限口径钉住）；
+  --json 出 "ok":true；B 台「执行电源动作」计数恰好 4（3 次执行 + b5 复跑 lock，
+  reboot 被拒没执行 —— 执行次数与名单严格一致）。
+五、全量与构建：cargo test --workspace **523 passed / 0 failed / 1 ignored**、零警告、rc=0
+  （本轮前基线 505/0/1，+18 = 单测 15（被控端 11 + 控制端 4）+ 真链路 3，全对上）；cargo build --release RC=0 零警告；
+  cargo check -p uulan-host -p uulan-fs -p uulan-bulk --target x86_64-unknown-linux-gnu
+  RC=0 零警告（cfg(unix) 的 loginctl/systemctl 分支与单测只有这么才类型检查）。
+
+【兼容口径（刻意如此，别当 bug）】
+两端不需要同批升级：只有新控制端会发 Power，老控制端永远收不到 PowerState。
+老被控端不认 Power（解帧失败掉会话）—— 新控制端对着它会如实报错，这是暴露不是隐瞒。
+回显 action 不是所求的那条一律忽略（多路复用通道上「等这一句」≠「只听这一句」）。
+
+【真机：未验】
+01:0x 审计（scripts/lan-presence-audit.py，退出码 1）：控制探针 192.168.223.99:22 连不上 =
+扫描可信；netsh 邻居表 11 台、慢扫 10 台有响应，**没有 .15**、全段特征端口无应答。
+与 11-15 22:00 班同结论。收工前 03:1x 复测 ssh kylin：仍超时（见当日报告）。
+机器回来后并入既压着的四条（画面结束原因 → 显示器选屏 → 音频状态 → --terms），次序在其后：
+ 1) lock（可逆）：host.json 加 "power_allow": ["lock"] → restart uulan-host →
+    --power lock 应回「已执行」→ DISPLAY=:0 xdotool getactivewindow getwindowname
+    应为屏保窗口。**若 UKUI 不理 loginctl lock-session**（LockedHint 管不到 UKUI 屏保
+    早有记录），Lock 分支改指 UKUI 自家 D-Bus —— 这是本条唯一预期可能要改代码的点。
+ 2) reboot 只验一次，顺带合并开机自启回归：回「已执行」→ SSH 43s 内回来（10-31 数字）→
+    device_id/口令一字未变 → uulan-host 自动 active。意义：电源动作走的是被控端进程自己
+    的 **seat0 桌面会话授权**，与当年「ssh 里 systemctl reboot 被 polkit 拒」不是同一条路。
+ 3) 若真回「polkit 要认证」：那不是 bug，如实把 detail 记进文档，写明需要
+    deploy/uulan.sudoers 的形态。
+ 4) 验完删回不配 power_allow —— 真机保持默认全拒。
+
+【回滚】机器侧：删 host.json 的 power_allow/power_test_program + systemctl --user restart
+uulan-host（配置不写 = 行为与改动前完全一致，老客户端也看不到任何新消息）。
+代码侧：git revert 本轮提交即可，协议新变体没有落盘状态、无迁移。
