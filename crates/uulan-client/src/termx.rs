@@ -36,7 +36,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info};
 
 use uulan_protocol::frame::{read_frame, write_frame, FrameKind};
-use uulan_protocol::msg::{C2H, H2C, TermOp};
+use uulan_protocol::msg::{C2H, H2C, TermOp, TermSession};
 
 /// 开会话时用的参数。`cols`/`rows` 为 0 表示「按本机终端大小来」。
 #[derive(Debug, Clone, Default)]
@@ -170,6 +170,36 @@ impl TermLink {
 
     pub async fn close(&self) -> Result<()> {
         self.send(C2H::Term(TermOp::Close { id: self.id })).await
+    }
+
+    /// `--terms`：在**这条**控制连接上问「本连接开过哪些会话」（id / 标题）。
+    ///
+    /// 作用域是老实的：被控端 `term` 注册表记的是**这条控制连接**开的会话，别的控制连接
+    /// 的会话不在清单里（注册表按控制会话分，不按整机分 —— 跨连接的清单是被控端的后续项，
+    /// 见 DESIGN 的「终端会话清单」一节）。所以 `--term` 干完活时用这个就能真看见自己的会话。
+    ///
+    /// 读任务照旧把无关消息（指标、剪贴板、锁屏状态）转进队列；这里照旧跳过它们。
+    /// 心跳由读任务代回，不用管。`TermError` 单条会话报错只记日志不毁清单。
+    pub async fn list(&mut self) -> Result<Vec<TermSession>> {
+        self.send(C2H::Term(TermOp::List)).await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let m = match tokio::time::timeout_at(deadline, self.msgs.recv()).await {
+                Err(_) => anyhow::bail!(
+                    "等 TermSessions 超时（8 秒）：被控端多半是不认 TermOp::List 的老版本"
+                ),
+                Ok(None) => anyhow::bail!("控制通道的读任务已经停了（连接断了？）"),
+                Ok(Some(m)) => m,
+            };
+            match m {
+                H2C::TermSessions { sessions } => return Ok(sessions),
+                H2C::TermError { id, error } => {
+                    debug!(id, error = %error, "被控端清单里有一条会话自报出错");
+                }
+                H2C::Bye { reason } => anyhow::bail!("被控端道别：{reason}"),
+                other => debug!(kind = ?std::mem::discriminant(&other), "清单途中收到无关消息，跳过"),
+            }
+        }
     }
 
     async fn send(&self, m: C2H) -> Result<()> {

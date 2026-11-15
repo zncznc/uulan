@@ -50,6 +50,8 @@ struct Args {
     forward: Vec<uulan_client::ForwardSpec>,
     /// 开一个远端终端（交互式），同样不开窗口也不收画面。
     term: bool,
+    /// 列远端当前的终端会话（`--terms`）：一次性，同样不开窗口、不收画面。
+    terms: bool,
     /// 终端行列（`--term-size 140x40`）。不给就按本机终端大小来。
     term_size: Option<(u16, u16)>,
     /// 远端 shell（不给用被控端配置/环境里的）。
@@ -116,7 +118,7 @@ uulan-client —— uulan 内网远控的控制端
   --audio-save <path> 把声音存成 WAV（同时隐含 --audio；无人值守验收用）
   --no-input          只读模式：不上报键鼠（排障、旁观时用）
   --no-clipboard      不同步剪贴板（不希望本机剪贴板被对面改写时用）
-  --json              以 JSON 输出（--headless 的统计 / --devices 的设备目录）
+  --json              以 JSON 输出（--headless 的统计 / --devices 的设备目录 / --terms 的会话清单）
   --connect-retry <N> 连接阶段最多重试 N 次（默认 3；0 = 连一次就报错退出）
                       只在「连不上」时重试；口令错/被锁直接报错，不重试
   --quality <档位>    画质档位：auto|fast|high|hd|bluray（不给 = 用被控端配置）
@@ -141,6 +143,7 @@ uulan-client —— uulan 内网远控的控制端
   --term                      在远端开一个 shell
   --term-size <COLSxROWS>     行列数，例：--term-size 140x40（不写按本机终端大小）
   --term-shell <path>         指定远端 shell，例：--term-shell /bin/bash
+  --terms                     列远端当前的终端会话（id / 名称；配 --json 出单行 JSON）
 
 键鼠注入（脚本化，做完就退出；不开窗口、不收画面）：
   --devices           列中继知道的设备（ID / 名称 / 在线），不连任何一台
@@ -196,6 +199,7 @@ fn parse_args() -> Result<Args> {
         fs_op: None,
         forward: Vec::new(),
         term: false,
+        terms: false,
         term_size: None,
         term_shell: None,
         inject: None,
@@ -255,6 +259,7 @@ fn parse_args() -> Result<Args> {
             "--last" => a.last = true,
             "--forget" => a.forget = true,
             "--term" => a.term = true,
+            "--terms" => a.terms = true,
             "--term-size" => {
                 let v = it.next().context("--term-size 需要 COLSxROWS，例：140x40")?;
                 a.term_size = Some(parse_size(&v)?);
@@ -428,11 +433,12 @@ fn parse_args() -> Result<Args> {
     let non_video_mode = a.inject.is_some()
         || a.fs_op.is_some()
         || a.term
+        || a.terms
         || !a.forward.is_empty()
         || a.status.is_some();
     if has_video_flag && non_video_mode {
         bail!(
-            "--quality/--bitrate/--fps/--scale 只对看画面的会话有效：--inject、文件操作、--term、--forward、--status 都不开视频通道"
+            "--quality/--bitrate/--fps/--scale 只对看画面的会话有效：--inject、文件操作、--term、--terms、--forward、--status 都不开视频通道"
         );
     }
     // 现场注入必须**跟着一条有画面的会话**。它和 --inject 是两种东西：含糊地两个都给，
@@ -444,8 +450,8 @@ fn parse_args() -> Result<Args> {
         if a.no_input {
             bail!("--inject-live 与 --no-input 矛盾：只读模式一条键鼠都不发，脚本一步也出不去");
         }
-        if a.fs_op.is_some() || a.term || !a.forward.is_empty() || a.status.is_some() {
-            bail!("--inject-live 只在有画面的会话里有效：文件操作、--term、--forward、--status 都不开视频通道，没有「当时的画幅」可换算");
+        if a.fs_op.is_some() || a.term || a.terms || !a.forward.is_empty() || a.status.is_some() {
+            bail!("--inject-live 只在有画面的会话里有效：文件操作、--term、--terms、--forward、--status 都不开视频通道，没有「当时的画幅」可换算");
         }
     }
     let env_pw = std::env::var("UULAN_PASSWORD").ok();
@@ -842,6 +848,22 @@ async fn main() -> Result<()> {
         let follow = args.term_size.is_none();
         let code = uulan_client::termx::run(c.control, opts, follow).await?;
         std::process::exit(code);
+    }
+
+    // `--terms`：列远端的 PTY 会话清单（id / 名称）。与 `--term`/`--ls` 一样是**独立会话**：
+    // 不开窗口、不收画面，干完就退出。这一格又是「协议先行、两端未接」：被控端的
+    // `TermOp::List`（与 `TermSessions` 上报）早写好了，控制端却从没发过 `List`、
+    // 也从没接住 `TermSessions` —— 这条消息两端都没人用过。现在把控制端这半接上。
+    if args.terms {
+        drop(c.video);
+        if !c.host.caps.contains(&Cap::Terminal) {
+            eprintln!("被控端不支持终端（对面版本太旧，或没实现这项能力）");
+            std::process::exit(2);
+        }
+        uulan_client::terms::run(c.control, args.json)
+            .await
+            .context("列远端终端会话失败")?;
+        return Ok(());
     }
 
     // 被控端状态：只读，不注入、不收画面。跑 N 秒、每秒一行，收尾打汇总。

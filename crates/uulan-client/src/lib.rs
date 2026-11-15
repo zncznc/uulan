@@ -21,6 +21,7 @@ pub mod tree;
 pub mod inject;
 pub mod session;
 pub mod termx;
+pub mod terms;
 pub mod input;
 pub mod watch;
 
