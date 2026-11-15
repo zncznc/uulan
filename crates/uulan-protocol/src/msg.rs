@@ -103,8 +103,11 @@ pub enum C2H {
 
     // ── 剪贴板 ──
     Clip { text: String },
-    /// 只声明"我这里有新的剪贴板内容"，不携带正文（大内容时省一次往返）。
-    ClipOffer { len: u32 },
+    // `ClipOffer`（先声明、再按需拉正文）2026-11-16 **删除**，H2C 侧同步删除：
+    // 两端从来没人收发它，而且「拉取」消息压根没定义过 —— 声明了也无法取正文。
+    // 真正工作的机制是直接带正文：`uulan-clip` 有 `MAX_TEXT_BYTES = 192 KiB` 上限，
+    // 超限内容直接跳过并计入 `skipped_oversize`（两端同一状态机）。
+    // 裁决记录见 docs/milestones/死消息裁决-2026-11-16.txt。
 
     // ── 文件 ──
     Fs(FsOp),
@@ -117,8 +120,12 @@ pub enum C2H {
 
     // ── 系统 ──
     Power { action: PowerAction },
-    /// 调整画面里某块区域的质量（AE 风格：控制端只关心"看到"的区域）。
-    VideoFocus { x: f32, y: f32, w: f32, h: f32 },
+    // `VideoFocus`（区域画质）2026-11-16 **删除**：它假设的机理不存在 ——
+    // x264 的 `zones` 是**按帧号的时间区间**，不是空间区域；连同 x264 文档自己的
+    // 示例写法在内，六种空间写法全部被 ffmpeg 9.0 的 libx264 实测拒绝。
+    // 真要做「某块区域更清楚」，路是双流合成（整帧低码率 + ROI 裁剪高码率，
+    // 控制端合成）或 x265 的空间 zones，那是另一项里程碑，不该留死消息骗未来的自己。
+    // 裁决证据见 docs/milestones/死消息裁决-2026-11-16.txt。
     /// 会话保持 / RTT 探测。`seq` 原样带回。
     Ping { seq: u32, sent_ms: u64 },
 
@@ -337,7 +344,7 @@ pub enum H2C {
 
     /// 被控端剪贴板变化。
     Clip { text: String },
-    ClipOffer { len: u32 },
+    // `ClipOffer` 已删除（拉取消息从未定义，见 C2H::Clip 处的记录）。
 
     /// 锁屏状态变化。锁屏后控制端应停止发送输入并提示用户。
     SystemState { locked: bool, has_desktop: bool },
@@ -624,12 +631,32 @@ mod tests {
         for m in [
             C2H::VideoSet(VideoSet::default()),
             C2H::Clip { text: "x".into() },
-            C2H::ClipOffer { len: 1 },
             C2H::Ping { seq: 1, sent_ms: 0 },
             C2H::Bye { reason: "bye".into() },
             C2H::Power { action: PowerAction::Lock },
         ] {
             assert!(!m.is_input(), "{m:?} 不该算输入");
+        }
+    }
+
+    /// 2026-11-16 死消息裁决的反例钉（docs/milestones/死消息裁决-2026-11-16.txt）：
+    /// `VideoFocus`（x264 没有空间 zones，机理不存在）与 `ClipOffer`（拉取消息从未定义）
+    /// 已从协议删除。这两句 json **解不出来**是裁决的一部分 —— 哪天有人把它们加回去
+    /// 或凭空再造同类「只有声明、没有机制」的消息，这条测试就该变红逼人重读归档。
+    #[test]
+    fn adjudicated_dead_messages_do_not_parse() {
+        for s in [
+            r#"{"type":"video_focus","x":0.1,"y":0.2,"w":0.3,"h":0.4}"#,
+            r#"{"type":"clip_offer","len":1}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<C2H>(s).is_err(),
+                "已裁决删除的死消息又能在 C2H 解出来了: {s}"
+            );
+            assert!(
+                serde_json::from_str::<H2C>(s).is_err(),
+                "已裁决删除的死消息又能在 H2C 解出来了: {s}"
+            );
         }
     }
 
@@ -650,14 +677,12 @@ mod tests {
         rt_c2h(C2H::KeyChar(KeyInput { target: KeyTarget::plain(0x61), down: false }));
         rt_c2h(C2H::VideoSet(VideoSet { fps: 60, max_bitrate_kbps: 8000, quality: Quality::Hd, scale: 0.5, ..Default::default() }));
         rt_c2h(C2H::Clip { text: "中文 clipboard\n".into() });
-        rt_c2h(C2H::ClipOffer { len: 1234 });
         rt_c2h(C2H::Fs(FsOp::List { id: 1, path: ":/".into() }));
         rt_c2h(C2H::Fs(FsOp::Put { id: 2, path: "~/a.bin".into(), size: 1 << 40 }));
         rt_c2h(C2H::Term(TermOp::Open { id: 1, cols: 120, rows: 30, shell: None }));
         rt_c2h(C2H::Term(TermOp::List));
         rt_c2h(C2H::PortMap(PortMapOp::Open { id: 1, target_host: "127.0.0.1".into(), target_port: 22 }));
         rt_c2h(C2H::Power { action: PowerAction::Reboot });
-        rt_c2h(C2H::VideoFocus { x: 0.1, y: 0.2, w: 0.3, h: 0.4 });
         rt_c2h(C2H::Ping { seq: 9, sent_ms: 1_700_000_000_000 });
         rt_c2h(C2H::Bye { reason: "user closed window".into() });
     }
@@ -692,7 +717,6 @@ mod tests {
         });
         rt_h2c(H2C::Metrics(Metrics { cpu: 12.5, mem_used: 1 << 30, mem_total: 1 << 32, net_rx: 1, net_tx: 2, rtt_ms: 8 }));
         rt_h2c(H2C::Clip { text: "x".into() });
-        rt_h2c(H2C::ClipOffer { len: 99 });
         rt_h2c(H2C::SystemState { locked: false, has_desktop: true });
         rt_h2c(H2C::InputError { message: "XTest 被拒绝".into() });
         rt_h2c(H2C::FsResult {

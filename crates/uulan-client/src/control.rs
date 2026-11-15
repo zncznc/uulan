@@ -424,9 +424,7 @@ impl ControlLink {
                                         },
                                     }
                                 }
-                                Ok(H2C::ClipOffer { len }) => {
-                                    debug!(len, "被控端声明有新剪贴板内容（第一版只支持直接内容）");
-                                }
+                                // H2C::ClipOffer 已于 2026-11-16 从协议删除（见 uulan-protocol 的 msg.rs）。
                                 Ok(H2C::Metrics(m)) => {
                                     status.apply_metrics(&m);
                                     debug!(cpu = m.cpu, mem_total = m.mem_total, "收到被控端指标");

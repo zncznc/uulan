@@ -38,7 +38,6 @@ impl Shape for H2C {
             Self::VideoError { .. } => "VideoError",
             Self::Metrics(..) => "Metrics",
             Self::Clip { .. } => "Clip",
-            Self::ClipOffer { .. } => "ClipOffer",
             Self::SystemState { .. } => "SystemState",
             Self::InputError { .. } => "InputError",
             Self::FsResult { .. } => "FsResult",

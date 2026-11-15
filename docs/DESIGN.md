@@ -222,6 +222,16 @@ H→C  {"type":"metrics","cpu":12.3,"mem_used":...,"mem_total":...,"net_rx":...,
 C→H  {"type":"power","action":"lock"|"reboot"|"shutdown"|"logout"}
 ```
 
+**死消息裁决（2026-11-16 夜批）**：协议点名发现两条「只有声明、没有机制」的消息，已删除并留反例测试：
+
+- `video_focus`（区域画质）—— x264 的 `zones` 是**按帧号的时间区间**，空间区域不存在这个机理
+  （六种写法含 x264 文档示例全部实测被 libx264 拒绝）。真要「某块区域更清楚」得走双流合成或 x265 空间 zones，独立里程碑项。
+- `clip_offer`（先声明再拉正文）—— 拉取消息从未定义；现行完整机制是 `uulan-clip` 的
+  `MAX_TEXT_BYTES = 192 KiB` 上限 + `skipped_oversize` 如实计数（已有测试钉住）。
+
+反例钉在 `uulan-protocol::tests::adjudicated_dead_messages_do_not_parse`：这两句 json 两个方向都必须解不出来。
+证据与判读全部在 `docs/milestones/死消息裁决-2026-11-16.txt`。
+
 ### 5.3 安全模型
 
 **Server 是「看不懂内容的盲中继」**，不持有任何设备凭据。访问控制由被控端自己把关。
