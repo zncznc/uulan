@@ -52,6 +52,10 @@ pub enum Step {
     MovePx { x: i32, y: i32 },
     /// 绝对移动，归一化 0..1。
     MoveNorm { x: f32, y: f32 },
+    /// 相对移动，像素。唯一**不依赖画幅**的移动：不需要知道屏幕尺寸，
+    /// 分辨率换代对落点没有影响（落点 = 当时指针位置 + 增量）。
+    /// `0,0` 照发，被控端 mapper 视为 no-op。
+    MoveRel { dx: i32, dy: i32 },
     /// 单边：按下或松开。
     Button { button: MouseButton, down: bool },
     /// 按下再松开（一次完整点击）。
@@ -107,6 +111,10 @@ fn parse_step(s: &str) -> Result<Step> {
         "movn" => {
             let (x, y) = two_floats(arg)?;
             Ok(Step::MoveNorm { x, y })
+        }
+        "moverel" => {
+            let (dx, dy) = two_ints(arg)?;
+            Ok(Step::MoveRel { dx, dy })
         }
         "click" => Ok(Step::Click { button: button(arg)? }),
         "down" => Ok(Step::Button { button: button(arg)?, down: true }),
@@ -215,6 +223,11 @@ pub fn plan_one(st: &Step, screen_w: u32, screen_h: u32) -> Vec<Action> {
                 x: x.clamp(0.0, 1.0),
                 y: y.clamp(0.0, 1.0),
             })),
+            // 相对移动**原样上线**：被控端 XTestFakeRelativeMotionEvent 吃的就是增量。
+            // 不许在这里掺画幅换算 —— 不换算正是这条消息存在的理由（尺寸无关）。
+            Step::MoveRel { dx, dy } => {
+                out.push(Action::Send(C2H::MouseMoveRel { dx: *dx, dy: *dy }))
+            }
             Step::Button { button, down } => {
                 out.push(Action::Send(C2H::MouseButton { button: *button, down: *down }))
             }
@@ -423,9 +436,9 @@ mod tests {
 
     #[test]
     fn parse_full_script() {
-        let s = "move:960,540; click:left; wheel:down:3; type:hello; wait:250; tap:0x41";
+        let s = "move:960,540; click:left; wheel:down:3; type:hello; wait:250; tap:0x41; moverel:120,-80";
         let steps = parse(s).unwrap();
-        assert_eq!(steps.len(), 6);
+        assert_eq!(steps.len(), 7);
         assert_eq!(steps[0], Step::MovePx { x: 960, y: 540 });
         assert_eq!(steps[1], Step::Click { button: MouseButton::Left });
         assert_eq!(steps[2], Step::Wheel { dx: 0, dy: -360 });
@@ -450,6 +463,8 @@ mod tests {
         assert!(parse("type:").is_err());
         assert!(parse("wait:soon").is_err());
         assert!(parse("tap:0").is_err());
+        assert!(parse("moverel:5").is_err());
+        assert!(parse("moverel:x,y").is_err());
     }
 
     #[test]
@@ -461,6 +476,25 @@ mod tests {
         let (x, y) = px_to_norm(960, 540, 1920, 1080);
         assert!((x - 0.5003).abs() < 0.001, "x = {x}");
         assert!((y - 0.5005).abs() < 0.001, "y = {y}");
+    }
+
+    #[test]
+    fn moverel_goes_on_the_wire_as_raw_delta() {
+        let steps = parse("moverel:120,-80").unwrap();
+        assert_eq!(steps, vec![Step::MoveRel { dx: 120, dy: -80 }]);
+        // 线上形状：type=mouse_move_rel + 原样增量。
+        let m = msgs(&plan(&steps, 1920, 1080));
+        assert_eq!(m.len(), 1);
+        let a = val(&m[0]);
+        assert_eq!(a["type"], "mouse_move_rel");
+        assert_eq!(a["dx"], 120);
+        assert_eq!(a["dy"], -80);
+        // **尺寸无关**是这条消息的立身之本：换三个屏幕尺寸，规划出的字节必须一字不差
+        //（绝对移动做不到 —— 归一化前要先乘画幅）。
+        for (w, h) in [(1920u32, 1080u32), (1024, 768), (800, 600)] {
+            let v = val(&msgs(&plan(&steps, w, h))[0]);
+            assert_eq!(v, a, "画幅 {w}x{h} 下形状变了");
+        }
     }
 
     #[test]

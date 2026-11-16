@@ -156,7 +156,7 @@ uulan-client —— uulan 内网远控的控制端
                       不需要 --device 和口令；加 --json 输出机器可读格式
   --status <秒>       只读被控端状态（CPU/内存/锁屏），每秒一行，跑完退出
   --inject \"<脚本>\"           沿真实链路把键鼠打进被控端，用来机器验证「真的打进去了」
-                             步骤用 ; 分隔：move:X,Y（屏幕像素）/ movn:X,Y（0..1）
+                             步骤用 ; 分隔：move:X,Y（屏幕像素）/ movn:X,Y（0..1）/ moverel:DX,DY（相对增量，唯一不依赖画幅的移动）
                              click:left|right|middle / down:left / up:left
                              wheel:up|down|left|right[:N] / tap:VK / keydown:VK / keyup:VK
                              type:文本 / wait:毫秒

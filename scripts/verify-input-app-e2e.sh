@@ -10,7 +10,9 @@
 #
 # 判据（xev 与 uulan 无关，它只打印收到的事件）：
 #   点一下 → ButtonPress(1)；type:hello → 5 个 KeyPress，keysym 依次 h e l l o；
-#   按住左键拖 90,60 → ButtonPress → MotionNotify(state 0x100) → ButtonRelease。
+#   按住左键拖 90,60 → ButtonPress → MotionNotify(state 0x100) → ButtonRelease；
+#   moverel:DX,DY → xdotool getmouselocation 前后差 = (DX,DY)（相对移动**不经画幅换算**，
+#     独立判据只能是指针增量本身 —— 这也是 `C2H::MouseMoveRel` 的发送半边接线的那条）。
 #
 # 用法：bash scripts/verify-input-app-e2e.sh
 # 环境变量：UULAN_CLIENT（本地控制端 exe）/ UULAN_SSH / UULAN_HOST_BIN（远端前缀）/ UULAN_APP_PORT
@@ -81,6 +83,25 @@ echo "== 3b) 真实链路注入（中文，走动态 Unicode keycode）：$INJEC
 RC2=${PIPESTATUS[0]}
 echo "  控制端退出码 = $RC2"
 
+# 第三阶段：相对移动。`C2H::MouseMoveRel` 的接收半边（mapper.mouse_rel →
+# XTestFakeRelativeMotionEvent）早就写好了，缺的从来是发送半边 —— 2026-11-17
+# 夜批接线（--inject 的 moverel 动词）。它是唯一**不依赖画幅**的移动：控制端不做
+# 归一化，被控端拿原增量喂 XTest。独立判据 = xdotool 指针前后差，不是 xev。
+RX=80; RY=-50
+echo "== 3c) 真实链路注入（相对移动 $RX,$RY；判据 = xdotool 指针增量）=="
+P0=$($SSH 'DISPLAY=:99 xdotool getmouselocation' 2>/dev/null | tr -d '\r' | tail -1)
+X0=$(printf '%s' "$P0" | grep -oE 'x:[0-9]+' | tr -dc '0-9')
+Y0=$(printf '%s' "$P0" | grep -oE 'y:[0-9]+' | tr -dc '0-9')
+"$CLIENT" --server "$SERVER:$PORT" --device "$DEV" --password-file "$PW" \
+  --inject "moverel:$RX,$RY" 2>&1 | grep -vE '^\s*$' | tail -3 | sed 's/^/  /'
+RC3=${PIPESTATUS[0]}
+echo "  控制端退出码 = $RC3"
+sleep 1
+P1=$($SSH 'DISPLAY=:99 xdotool getmouselocation' 2>/dev/null | tr -d '\r' | tail -1)
+X1=$(printf '%s' "$P1" | grep -oE 'x:[0-9]+' | tr -dc '0-9')
+Y1=$(printf '%s' "$P1" | grep -oE 'y:[0-9]+' | tr -dc '0-9')
+echo "  指针独立判据：$P0 → $P1"
+
 echo "== 4) 独立判据（真机 xev 收到的事件）=="
 EV=$($SSH "bash /tmp/remote-xvfb-testbed.sh events" 2>&1)
 echo "$EV" | sed 's/^/  /'
@@ -99,6 +120,13 @@ HST=$(printf '%s\n' "$EV"     | sed -n 's/^HOSTSTAT //p')
 echo "== 5) 断言 =="
 [ "${RC:-1}" = "0" ] && ok "控制端退出码 0（ASCII 阶段）" || bad "控制端退出码 ${RC:-?}（ASCII 阶段）"
 [ "${RC2:-1}" = "0" ] && ok "控制端退出码 0（中文阶段）" || bad "控制端退出码 ${RC2:-?}（中文阶段）"
+[ "${RC3:-1}" = "0" ] && ok "控制端退出码 0（相对移动阶段）" || bad "控制端退出码 ${RC3:-?}（相对移动阶段）"
+if [ -n "${X0:-}" ] && [ -n "${X1:-}" ] && \
+   [ "$((X1 - X0))" = "$RX" ] && [ "$((Y1 - Y0))" = "$RY" ]; then
+  ok "相对移动原样到 X：指针 ($X0,$Y0)→($X1,$Y1)，增量 ($((X1-X0)),$((Y1-Y0))) = 注入的 ($RX,$RY)"
+else
+  bad "相对移动落点不对：指针从 (${X0:-?},${Y0:-?}) 到 (${X1:-?},${Y1:-?})，期望增量 ($RX,$RY)"
+fi
 [ "${KEYS:-0}" -ge 5 ] && ok "键盘进了应用：KeyPress $KEYS 次" || bad "KeyPress 不足（${KEYS:-0}）"
 [ "${KREL:-0}" -ge 5 ] && ok "按键收尾成对：KeyRelease $KREL 次" || bad "KeyRelease 不足（${KREL:-0}）"
 case "${SYMS:-}" in
