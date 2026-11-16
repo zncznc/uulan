@@ -1,0 +1,39 @@
+开机自启复验（root 系统装之后）—— 2026-11-16 通过
+
+之前 M5 记的「整机重启后开机自启已验」是在**用户态装**的形态下验的；后来装了
+root 形态（中继变成**系统单元**），这一条没再复验过。本次真机重新开机，补上。
+
+## 开机时序（机器 10:35 起来，我 10:38 查的）
+
+    10:35:14  uulan-server（系统单元）就绪，台账 devices=1 从 /opt/uulan/state 载入
+    10:35:15  uulan-host（用户单元）进程起来，PID 8557，属主 mis
+    10:35:19  中继记录「被控端上线 device_id=805747189」—— 开机后 5 秒可被连
+
+    中继  active / enabled（系统单元）
+    被控端 active / enabled（用户单元，Linger=yes）
+    21116  监听 1，没有用户单元中继残留（root 装时已 disable --now，之后没再起来）
+
+## 画面验收
+
+    Windows 控制端 --frames 40 --headless
+    收到 AU 42，首帧 221 ms
+    与同一时刻真机 `import -window root` 截图逐像素比（缩到 480x270）：
+        MAE 1.02 / 255，相关系数 1.0000
+
+## 输入验收（趁屏幕处于解锁态）
+
+    scripts/verify-input-e2e.sh —— 4 通过 / 0 失败，退出码 0
+    独立判据是同机 `xev`：KeyPress=5（hello 五个键）、ButtonPress=2、
+    ButtonRelease=2、按住左键拖拽期间 MotionNotify=3
+    打的是用户看得见的物理 :0，不是 Xvfb
+
+## 过程中我自己读错了一次，记下来免得再犯
+
+查 `journalctl --user -u uulan-host` 时最后一条停在 11-13，一度像是「用户单元开机
+没起来、日志不新鲜」。实际是**我没有导出 `XDG_RUNTIME_DIR`**，读到了另一个 runtime
+的 journal。补上 `export XDG_RUNTIME_DIR=/run/user/$(id -u)` 之后立刻看到今天的日志，
+`is-active` 也是 active。
+
+教训：**非交互 SSH 里 `systemctl --user` / `journalctl --user` 必须带
+`XDG_RUNTIME_DIR`（有时还要 `DBUS_SESSION_BUS_ADDRESS`）**，否则会读到空/陈旧的结果，
+把「我查错了」误判成「服务没跑」。这类误判比真故障更费时间，因为它给出的证据看起来很硬。
