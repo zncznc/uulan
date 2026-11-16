@@ -40,6 +40,9 @@ struct Args {
     save_frame: Option<PathBuf>,
     /// 不开窗口，走原来的命令行模式。
     headless: bool,
+    /// 捕获模式（仅窗口模式）：本地光标锁进窗口并隐藏，移动改发相对增量
+    /// （`C2H::MouseMoveRel`，不做画幅换算）。会话中途 F8 开/关。
+    capture: bool,
     /// 只读模式：不上报键鼠（排障、旁观时用）。
     no_input: bool,
     /// 不参与剪贴板同步（排障 / 不希望本机剪贴板被对面改写时用）。
@@ -116,6 +119,9 @@ uulan-client —— uulan 内网远控的控制端
   --ffmpeg <path>     ffmpeg 可执行文件（默认走 PATH）
   --save-frame <path> 退出时把最后一帧存成 PPM（排查「对面到底画的是什么」用）
   --headless          不开窗口，只打印统计（自测 / 无显示环境用）
+  --capture           窗口模式的捕获模式：本地光标锁进窗口并隐藏，移动按原样
+                      发相对增量（不掺画幅换算）；F8 随时开/关。与 --headless
+                      及各不开窗口的动作互斥
   --audio             接收被控端的声音（PulseAudio monitor → Opus）
   --audio-save <path> 把声音存成 WAV（同时隐含 --audio；无人值守验收用）
   --no-input          只读模式：不上报键鼠（排障、旁观时用）
@@ -200,6 +206,7 @@ fn parse_args() -> Result<Args> {
         json: false,
         save_frame: None,
         headless: false,
+        capture: false,
         no_input: false,
         no_clipboard: false,
         fs_op: None,
@@ -250,6 +257,7 @@ fn parse_args() -> Result<Args> {
             "--save-frame" => a.save_frame = Some(PathBuf::from(it.next().unwrap_or_default())),
             "--json" => a.json = true,
             "--headless" => a.headless = true,
+            "--capture" => a.capture = true,
             "--audio" => a.audio = true,
             "--audio-save" => {
                 a.audio_save = Some(PathBuf::from(it.next().context("--audio-save 需要一个路径")?));
@@ -394,6 +402,11 @@ fn parse_args() -> Result<Args> {
     if a.server.is_empty() {
         bail!("--server 不能为空");
     }
+    // `--capture` 在这几条「提前返回」的分支里永远到不了窗口 —— 在门口就拒，
+    // 别让人以为列完设备/清完记录之后自己进过捕获模式（与下面的全量闸门同一个理由）。
+    if a.capture && (a.devices || a.forget) {
+        bail!("--capture 与 --devices/--forget 无意义：这两种动作不开窗口，也不进会话");
+    }
     // `--forget` 只删本机的一个小文件：不连中继、不需要设备 ID、也不需要口令。
     if a.forget {
         return Ok(a);
@@ -454,6 +467,16 @@ fn parse_args() -> Result<Args> {
         bail!(
             "--quality/--bitrate/--fps/--scale 只对看画面的会话有效：--inject、文件操作、--term、--terms、--power、--forward、--status 都不开视频通道"
         );
+    }
+    // 捕获模式的三样东西（锁指针、藏光标、设备级增量）全部长在 winit 事件循环上 ——
+    // 「不开窗口的模式」带 --capture 只会让用户以为自己在捕获。当场报错，别静默降级。
+    if a.capture && (a.headless || a.devices || non_video_mode) {
+        bail!(
+            "--capture 只在窗口模式下有效：--headless、--devices、--inject、文件操作、--term、--terms、--power、--forward、--status 都不开窗口"
+        );
+    }
+    if a.capture && a.no_input {
+        bail!("--capture 与 --no-input 矛盾：只读模式一条键鼠都不发，捕获模式只会把本地光标钉死在窗口里");
     }
     if a.power.is_some()
         && (a.terms
@@ -1062,7 +1085,7 @@ async fn main() -> Result<()> {
             None => None,
         };
         let sup = tokio::spawn(session::drive(live.clone(), plan.clone(), c));
-        let r = uulan_client::window::run(live.clone(), overlay, args.seconds);
+        let r = uulan_client::window::run(live.clone(), overlay, args.seconds, args.capture);
         // 窗口关了（用户点的 / 到了 --seconds / 不再重连）：会话循环连同解码器一起收掉。
         sup.abort();
         // 现场注入的收尾必须在这：它和下面的「输入上报」共用同一份 InputStats，

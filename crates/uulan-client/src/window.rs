@@ -37,10 +37,10 @@ use crate::session::{Live, Phase};
 use crate::watch::{Frame, WatchStats, WatchStatsSnapshot};
 use uulan_protocol::msg::{C2H, MouseButton as ProtoButton};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::PhysicalKey;
-use winit::window::{Window, WindowId};
+use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, DeviceEvents, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::{CursorGrabMode, Window, WindowId};
 
 /// 窗口标题里显示的统计，约每秒刷新一次。
 #[derive(Debug, Clone, Default)]
@@ -138,12 +138,21 @@ struct App {
     frame_sz: Option<(u32, u32)>,
     /// 触摸板的像素滚动要攒够一行才发。
     wheel: WheelAccum,
+    /// 捕获模式状态机（纯逻辑在 `capture.rs`，这里只做接线）。
+    capture: crate::capture::CaptureCtl,
+    /// 启动参数 `--capture`：窗口建好即尝试进入捕获模式。
+    capture_start: bool,
     /// 上报了多少条键鼠消息（收工时的证据数字）。
     input_sent: u64,
 }
 
 impl App {
-    fn new(live: Arc<Live>, overlay: Overlay, deadline: Option<std::time::Instant>) -> Self {
+    fn new(
+        live: Arc<Live>,
+        overlay: Overlay,
+        deadline: Option<std::time::Instant>,
+        capture_start: bool,
+    ) -> Self {
         let rx = live.frames();
         Self {
             live,
@@ -162,6 +171,8 @@ impl App {
             mods: Mods::default(),
             frame_sz: None,
             wheel: WheelAccum::default(),
+            capture: crate::capture::CaptureCtl::new(),
+            capture_start,
             input_sent: 0,
         }
     }
@@ -180,6 +191,46 @@ impl App {
                 self.input_sent += 1;
             }
         }
+    }
+
+    /// 进/出捕获模式：状态机与系统动作（抓指针、藏光标）必须一起变，且以**系统动作
+    /// 的成败**为准 —— 抓握失败还宣称在捕获，用户得到的是「光标能跑、对面不跟着动」
+    /// 的最坏组合；解除失败还切回绝对上报，则两套移动同时生效。
+    fn set_capture_on(&mut self, want: bool, trigger: &str) {
+        let Some(window) = self.window.clone() else { return };
+        if want {
+            match window.set_cursor_grab(CursorGrabMode::Locked) {
+                Ok(()) => {
+                    window.set_cursor_visible(false);
+                    self.capture.set_enabled(true);
+                    info!(trigger, "捕获模式已开启：移动发相对增量（不做画幅换算），F8 退出");
+                }
+                Err(e) => {
+                    warn!(error = %e, "指针锁定失败，捕获模式不启用（继续按绝对坐标上报）");
+                    self.capture.set_enabled(false);
+                    return;
+                }
+            }
+        } else {
+            if let Err(e) = window.set_cursor_grab(CursorGrabMode::None) {
+                warn!(error = %e, "解除指针锁定失败：保持捕获模式（切回绝对上报会两套移动并存）");
+                return;
+            }
+            window.set_cursor_visible(true);
+            self.capture.set_enabled(false);
+            info!(trigger, "捕获模式已关闭：光标回到本地");
+        }
+        let s = window.inner_size();
+        window.set_title(&self.shown_title(s.width, s.height));
+    }
+
+    /// 标题 = 既有内容 + 捕获模式标注（一眼能看出现在走的是哪条移动路径）。
+    fn shown_title(&self, ww: u32, wh: u32) -> String {
+        let mut s = self.overlay.title(ww, wh);
+        if self.capture.enabled() {
+            s.push_str(" · 捕获模式（F8 退出）");
+        }
+        s
     }
 
     /// 窗口尺寸变了就重建绘制面。
@@ -342,7 +393,7 @@ impl App {
         }
         self.prev = s;
         self.overlay_since = std::time::Instant::now();
-        window.set_title(&self.overlay.title(ww, wh));
+        window.set_title(&self.shown_title(ww, wh));
     }
 }
 
@@ -377,6 +428,9 @@ impl ApplicationHandler for App {
             event_loop.exit();
         }
         info!("窗口已就绪");
+        if self.capture_start {
+            self.set_capture_on(true, "启动参数");
+        }
     }
 
     fn window_event(
@@ -402,6 +456,11 @@ impl ApplicationHandler for App {
                 self.mods = Mods::from_state(m.state());
             }
             WindowEvent::CursorMoved { position, .. } => {
+                // 捕获模式下本地指针被钉死在窗口里，绝对坐标失去意义 ——
+                // 移动一律走 DeviceEvent 的原始增量（见 device_event）。
+                if self.capture.enabled() {
+                    return;
+                }
                 let Some(r) = self.image_rect() else { return };
                 if let Some((x, y)) = norm_point(position.x, position.y, r) {
                     self.send_input(C2H::MouseMoveAbs { x, y });
@@ -429,6 +488,16 @@ impl ApplicationHandler for App {
                 if is_synthetic {
                     return;
                 }
+                // F8 = 捕获模式开关。这条键是**本地**动作，绝不转发到对面
+                // （否则「退出捕获」顺手就在被控桌面上按了一次 F8）。
+                if event.state == ElementState::Pressed
+                    && !event.repeat
+                    && matches!(event.physical_key, PhysicalKey::Code(KeyCode::F8))
+                {
+                    let want = !self.capture.enabled();
+                    self.set_capture_on(want, "F8");
+                    return;
+                }
                 let vk = match event.physical_key {
                     PhysicalKey::Code(c) => vk_from_key(c),
                     PhysicalKey::Unidentified(_) => None,
@@ -451,6 +520,22 @@ impl ApplicationHandler for App {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device: winit::event::DeviceId,
+        event: DeviceEvent,
+    ) {
+        // 捕获模式的移动走这里：winit 的原始设备增量（Windows 后端经
+        // RIDEV_INPUTSINK 注册，窗口不在前台也收得到 —— 夜批里没人点窗口）。
+        // 关闭状态下 CaptureCtl::motion 恒返回空，这条回调在非捕获时是免费的。
+        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+            for (ix, iy) in self.capture.motion(dx, dy) {
+                self.send_input(C2H::MouseMoveRel { dx: ix, dy: iy });
+            }
         }
     }
 
@@ -480,12 +565,21 @@ impl ApplicationHandler for App {
 ///
 /// **必须在主线程调用**（winit 的硬性要求）。tokio 运行时应该已经跑在别的线程上，
 /// 这里的 `rx` 就是从那边 `VideoWatcher::subscribe()` 拿到的；`input` 为 `None` 就是只读模式。
-pub fn run(live: Arc<Live>, overlay: Overlay, seconds: Option<f64>) -> Result<()> {
+pub fn run(
+    live: Arc<Live>,
+    overlay: Overlay,
+    seconds: Option<f64>,
+    capture_start: bool,
+) -> Result<()> {
     let event_loop = EventLoop::new().context("创建事件循环失败（没有可用的显示环境？）")?;
     // Poll：不睡等事件，保证有帧时能立刻画出来
     event_loop.set_control_flow(ControlFlow::Poll);
+    // 捕获模式靠 DeviceEvent::MouseMotion；Windows 后端把它映射到
+    // RIDEV_INPUTSINK（winit 源码写死：WhenFocused 不挂 INPUTSINK）。无人值守的
+    // 夜批没有「前台窗口」可言，必须 Always，否则指针增量一条都进不来。
+    event_loop.listen_device_events(DeviceEvents::Always);
     let deadline = seconds.map(|s| std::time::Instant::now() + std::time::Duration::from_secs_f64(s));
-    let mut app = App::new(live, overlay, deadline);
+    let mut app = App::new(live, overlay, deadline, capture_start);
     event_loop.run_app(&mut app).context("窗口事件循环异常退出")?;
     info!(painted = app.painted, input_sent = app.input_sent, "窗口已关闭");
     Ok(())
@@ -545,7 +639,17 @@ mod tests {
         let live = Arc::new(Live::new());
         // 会话槽的帧通道是 `Live` 自己建的：喂一帧进去，窗口那边就能读到。
         let _ = live.frames_tx().send(frame);
-        App::new(live, Overlay::default(), None)
+        App::new(live, Overlay::default(), None, false)
+    }
+
+    /// 捕获模式必须写进标题：移动路径从「绝对坐标」换成「相对增量」是有感知的
+    /// 行为变化，用户低头看标题就该知道现在按 F8 能退出。
+    #[test]
+    fn capture_mode_is_written_into_the_title() {
+        let mut app = app_with(None);
+        assert!(!app.shown_title(8, 8).contains("捕获模式"), "没开启不许标注");
+        app.capture.set_enabled(true);
+        assert!(app.shown_title(8, 8).contains("捕获模式（F8 退出）"));
     }
 
     #[test]
