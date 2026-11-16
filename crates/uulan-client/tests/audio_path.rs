@@ -472,17 +472,19 @@ async fn missing_audio_capability_is_recorded_not_only_logged() {
     .await
     .expect("连接超时")
     .expect("连接失败");
-    assert!(
-        !c.host.caps.contains(&Cap::Audio),
-        "这台机器上没有 PulseAudio，被控端不该声明 Cap::Audio，实际 {:?}",
-        c.host.caps
-    );
-    // 换台有声卡的机器跑这套测试（比如真麒麟），上面那条断言就不成立了 ——
     // 这里要验的是「没声明能力时原因要落到状态里」，不是「这台机器一定没声卡」。
+    // 换台有声卡的机器跑这套测试（比如真麒麟），「无能力」这条前提就不成立 ——
+    // 必须**先跳过再断言**：2026-11-16 真机首跑就是把硬断言排在跳过分支前面，
+    // 在有 PulseAudio 的麒麟上必红（SKIP 写在断言之后等于没写）。
     if c.host.caps.contains(&Cap::Audio) {
         eprintln!("跳过：这台机器的被控端声明了 Cap::Audio，测不到「无能力」这条分支");
         return;
     }
+    assert!(
+        !c.host.caps.contains(&Cap::Audio),
+        "走到这里 caps 不该含 Cap::Audio，实际 {:?}",
+        c.host.caps
+    );
 
     let Some(dir) = writable_dir() else {
         eprintln!("跳过：这台机器上从工作区里跑出来的 exe 写不了盘（见 DESIGN 的构建陷阱 2）");

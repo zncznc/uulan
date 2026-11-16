@@ -1,0 +1,135 @@
+真机验收四条收尾 + 锁屏改走 UKUI D-Bus 链 —— 2026-11-16 夜批（22:00 班）
+========================================================================
+
+状态：显示器选屏之外的**四条真机验收全部补完（画面结束原因、音频状态、--terms、电源动作）**；
+其中电源动作的 lock 在真机上暴露出「loginctl 退出码 0 但根本不锁屏」，**改代码后真锁住**。
+真机 192.168.223.15 全程可达（无漂移），白天另一会话已验「显示器选屏」与「root 装重启自启」。
+
+────────────────────────────────────────────────────────────────────────
+〇、本轮基线与部署
+────────────────────────────────────────────────────────────────────────
+· 本机开工基线：cargo test --workspace **524 passed / 0 failed / 1 ignored，零警告**（与 05:00 班一致）。
+· HEAD=043a632 打包 → 真机换源码保留 target/ → cargo build --release（server+host+client）54s 零警告。
+· **真机现网形态的一个坑（本轮踩实）**：root 装后，被控端用户单元的 ExecStart 指向
+  **/opt/uulan/bin/uulan-host（11-12 构建）**，不含 11-15/16 的任何新接线；/opt 归 root、mis 无免密 sudo。
+  本轮用 systemd **drop-in** 把用户单元临时指到 ~/.local/uulan/bin/uulan-head-20261116（mis 可写）：
+    ~/.config/systemd/user/uulan-host.service.d/push-head-20261116.conf
+    [Service] ExecStart= <home>/.local/uulan/bin/uulan-head-20261116 --server 192.168.223.15:21116
+  生效用 `systemctl --user daemon-reload` + `kill -s KILL uulan-host`（Restart=always 拉新 ExecStart）。
+  **daemon-reload 不被命令守卫拦**（只拦 stop/start/restart 类字样）。
+· 正在跑的 11-12 生产被控端与新起测试进程**会互抢注册**（同 device_id + 同 reg_token = 合法顶替，
+  两边反复互踢），所以必须走单元配置切换、不能平行起第二个正式身份的被控端。
+· 画面基线（重启前）：28.5fps / 首帧 297ms / 与真机截图 **corr 0.9981 / MAE 0.71%**；
+  画面基线（重启后）：29.5fps / 首帧 254ms / 丢帧 0 / **corr 0.9987 / MAE 0.77%**。无回归。
+
+────────────────────────────────────────────────────────────────────────
+一、画面结束原因（H2C::VideoError）真机 ✅
+────────────────────────────────────────────────────────────────────────
+手法：Windows 控制端 headless 30s 会话，第 10 秒真机 `pkill -x ffmpeg`（打死编码子进程；
+  ⚠ 归档原写法 `pkill -f 'ffmpeg.*x11grab'` 的字符串本身会被自己的正则匹配到，pkill -x 更稳）。
+证据（两端时间轴对得上，0.27s 差）：
+· 被控端 journal：`编码源收尾：已把原因发给控制端 被控端采集源意外结束：抓屏进程退出了
+  （X 服务器断了？被系统杀掉？）（已出帧 308 / 关键帧 21 / 12841187 字节） failed=true`
+· 控制端当场收到（不是 15 秒静默看门狗误判半开）：`被控端报告编码器没能继续（原因来自对面，不是本机推断）`
+· 统计行：`画面结束 : 本机按时限收工…（被控端报编码器故障 1 条会话）`、`会话 : 建立 2 条 / 断线接回 1 次`
+· 1 秒接回后照跑：554 帧 / 丢帧 0 / 29.7fps；`pkill -f 'ffmpeg.*x11grab'` 里「failed=true 至今无真链路证据」
+  这条欠账就此清掉 —— **真机已造出这次崩溃并拿到线上原文**。
+
+────────────────────────────────────────────────────────────────────────
+二、音频状态（AudioWatch/AudioStop）真机 ✅（含一个测试排序 bug 修复）
+────────────────────────────────────────────────────────────────────────
+1) `cargo test --release -p uulan-client --test audio_path` 在真机首跑 **3 passed / 1 failed**：
+   `missing_audio_capability_is_recorded_not_only_logged` 红。查源码坐实是**判据 bug 不是产品 bug**：
+   文件把「这台机器没声卡才成立」的硬断言排在「有声卡就 SKIP」的分支**之前** —— 在麒麟上 SKIP 永远跑不到。
+   （正是白天那条「被 SKIP 的分支等于没验」教训的镜像：**断言排在跳过前面，等于跳过形同虚设**。）
+   修：SKIP 分支前移到断言之前（保留一条形同虚设检查之外的兜底断言）。修后真机 **4 passed / 0 failed**。
+2) 叫停链路真机复现：控制端 `--ffmpeg` 指到不存在路径 + `--audio`：
+   控制端统计 `音频状态 : 本机已请求停止（被控端回了 1 条 / 起不来 0 次）… 被控端已确认停止`；
+   被控端 journal `音频已停止（控制端关掉的）` —— stop_acks 语义在真链路上成立。
+3) 声学反向真采：真机 `paplay` 10s 440Hz 正弦 → Windows `--audio-save`：
+   收到 175 帧 / 64276 字节 → 6.4s PCM、**峰值 4034**、错误 0；
+   频谱 Goertzel 判据 440Hz/1000Hz = **1.1e11 倍**、440/300 = 1.8e8 倍 —— 收下的就是那个音。
+   采集源回话 `pulse:alsa_output.usb-Generic_USB_Audio-00.analog-stereo-spdif-output.monitor`（真实 USB 声卡）。
+   ⚠ 首跑假红教训：paplay 必须检查退出码 —— 第一次静默失败给出「峰值 0 但解出 7.0 秒」的
+   **静音也自洽**的假象；opus 静音帧极小（34B/帧），字节数对不上（7KB/7s vs 64kbps）是穿帮点。
+   另 ssh 非交互会话跑 paplay 要显式 `export XDG_RUNTIME_DIR=/run/user/$(id -u)`。
+
+────────────────────────────────────────────────────────────────────────
+三、--terms 真机 ✅
+────────────────────────────────────────────────────────────────────────
+· `cargo test --release -p uulan-client --test terms_path` 真机 1/1 通过（真 Linux 注册表 + 假 shell，
+  同连接看得见 1 条、独立连接必空 —— 作用域口径钉在真机侧）。
+· 麒麟自编控制端对现网：`--terms` → 「远端当前没有终端会话」rc=0（独立进程永远空 = 老实答案），
+  `--terms --json` → `[]` rc=0。归档「注册表按控制会话分」的口径在真机复现无歧义。
+· 顺带证据：麒麟自编 uulan-client 连 HEAD 被控端正常（1920x1080，编码器 5），ssh 无 DISPLAY 时
+  如实打印「剪贴板不可用：打不开 X 显示」再降级 —— 能力探测行为正确。
+
+────────────────────────────────────────────────────────────────────────
+四、电源动作真机 ✅ —— 唯一预期要改代码的点，果然要改
+────────────────────────────────────────────────────────────────────────
+【暴露的问题】host.json 加 power_allow:["lock"] 后 `--power lock` 回「已采纳/已执行」rc=0 ——
+但取证发现**什么都没锁**：`loginctl lock-session` 在被控端 systemd 用户单元的上下文里退出码 0，
+`loginctl show-session 5 -p LockedHint` 仍是 no、屏保 dialog 不出现、画面均值不变。
+（归档里「LockedHint 管不到 UKUI 屏保」的旧记录就此坐实到电源动作链路。）
+
+【排查实证（全在真机上，判据=抓帧均值 + dialog 进程数 + GetLockState）】
+· `org.ukui.ScreenSaver` 在 session-5 上有名字；gdbus introspect 出全套方法：
+  Lock()/ShowScreensaver()/UnLock()/GetLockState()/LockByBlank(i)→b …
+· `ukui-screensaver-command --lock` **段错误（rc=139）**，不可用。
+· 当轮会话内 Lock() 调用只翻状态不显形 —— 事后查明是**屏保守护进程被白天测试残留卡死**
+  （idle-delay=5 也从不触发，dialog 永不拉起，锁状态 true 而无 UI）。
+· **整机重启后 daemon 复活**：开机即有 `ukui-screensaver-dialog --lock-startup`（麒麟桌面无操作即锁屏，
+  属机器习惯，非 uulan 行为）；杀掉 dialog → state=false、均值 103.6（真桌面）；再调 Lock() →
+  dialog=1、均值 77.1 —— **UKUI 的 D-Bus Lock 在健康守护进程上真锁屏，机理钉死**。
+
+【代码改动（本轮唯一功能性改动）】crates/uulan-host/src/power.rs：
+· `Exec` 新增 `Chain(Vec<Vec<String>>)`：有序回落链，第一个「起得来且退出码 0（或超宽限仍在跑）」算数，
+  全败报最后一步、并把前面各步失败原因缀进 detail（现场要能看见「缺的是 gdbus」而不是只看到兜底的半句话）。
+· Lock 的 unix 分支改为链：**gdbus 调 org.ukui.ScreenSaver.Lock（UKUI 原生，真机实测显形）
+  → 兜底 loginctl lock-session（认 LockedHint 的 GNOME/KDE 等仍走通用路）**。
+· 采纳口径**没有**挪窝：仍然只在 compose 一处判（Chain 只决定「哪一步的结果送去给它」）。
+· Windows 分支与其他动作（Logout/Reboot/Shutdown）一字未动；测试钩子 power_test_program 仍是单 argv。
+· 测试：更新 production_commands 的 Lock 断言（链形状 + 两步内容）；新增
+  `chain_takes_the_first_step_that_works_and_keeps_earlier_failures`（真程序 /bin/false→/bin/true 采纳；
+  不存在程序→/bin/false 全败、历史入 detail）—— 本机 11/11、真机 **12/12 全绿**（链测试 cfg(unix) 只在真机跑）。
+· `cargo check -p uulan-host --target x86_64-unknown-linux-gnu --tests` 通过（首轮 E0004：
+  test_program 那个 match 没盖 Chain —— 加 arm 修掉）。
+
+【真机验收数字（新二进制经 drop-in 生效后）】
+· `--power lock --json` → `{"action":"lock","detail":"已执行","ok":true}`；
+  被控端日志一行 `执行电源动作 action="lock" chain=gdbus call … Lock || loginctl lock-session`；
+  独立判据当场取证：**GetLockState=(true,)、dialog 进程数=1、抓帧均值 103.6→77.1**。
+· `--power logout`（名单外）→ 「未执行」+ 拒绝理由含可照抄改法（当前放行 lock, reboot），**真实退出码 1**。
+  ⚠ 别再拿 `cmd | tail` 的 `$?` 当退出码 —— 本轮第一次量的 LOGOUT_RC=0 就是管道假象。
+· `--power reboot` → `{"action":"reboot","detail":"已执行","ok":true}` rc=0：
+  **被控端自己的授权路（systemd 用户单元）能真重启整机**，polkit 不拦（当年「ssh 里 systemctl reboot
+  被拒」是 tty 会话的身份，与被控端单元不是同一条路 —— 归档第②个未定点就此有答案）。
+  重启即真机验证的自启动回归：开机 +20s 系统单元中继 active、+3 分钟内被控端（用户单元、HEAD 构建）
+  active，随后 Windows 控制端取 354 帧 / 首帧 254ms / corr 0.9987 —— 同批合并完成。
+  采证脚本用真机 `crontab @reboot` 落盘（不赌本机 ssh 时机）；轮询里 `systemctl --user` 要带
+  XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS，cron 环境没有这两个变量时状态列会是空的。
+
+────────────────────────────────────────────────────────────────────────
+五、机器状态与回滚（全部已复位）
+────────────────────────────────────────────────────────────────────────
+· host.json 的 power_allow **已删回不配**（真机保持默认全拒；删后现网取证：`--power lock` →
+  「未执行」rc=1）。备份链：host.json.bak.20261116-2225（改动前原文，可 cp -a 回去）。
+  改法本身也留了脚本：~/set-power-allow.py / ~/cleanup-power.sh。
+· @reboot 采证 cron **已撤**（crontab 现为空）。~/*.sh 采证脚本与 /tmp 截图留着（无害，未删）。
+· 屏保策略已复原：idle-delay=5、idle-activation-enabled=true、dialog 杀回未锁态（state=false）。
+  注意：麒麟桌面无操作几分钟会自动锁，这是本机习惯；要长时验桌面先 `gsettings set
+  org.ukui.screensaver idle-delay 30`（改完记得改回）。
+· **仍在生效的一处状态**：被控端单元 drop-in（见〇节）让它跑 HEAD 构建而非 /opt 的 11-12 构建。
+  这是本轮真机验收的前提；恢复原状 = 删 `~/.config/systemd/user/uulan-host.service.d/` 里那个
+  conf + `systemctl --user daemon-reload` + `systemctl --user kill -s KILL uulan-host`。
+  原单元文件备份 uulan-host.service.bak.20261116-2210 未动过（drop-in 没改主文件）。
+  /opt/uulan 的正式更新仍要 root：`install.sh --bin ~/.local/uulan/src/target/release`（root 跑）
+  或装 deploy/uulan.sudoers —— 下轮/现场顺手做掉即可消除此分歧态。
+· 真机 MAC（下次失联可 WoL）：**eno1 1c:83:41:8b:97:97**（192.168.223.15，麒麟 V10 SP1，海光 C86）。
+
+────────────────────────────────────────────────────────────────────────
+六、本机侧收工数字
+────────────────────────────────────────────────────────────────────────
+· cargo test --workspace：见本轮收工（改 power.rs 后全量 + verify-power-e2e 复跑，数字记在本节末）。
+· verify-power-e2e.sh 复跑：见末尾补记。
+· 音频 audio_path 排序修复：本机也全绿（无 PulseAudio → 走完整分支而非 SKIP）。

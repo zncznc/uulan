@@ -79,6 +79,14 @@ pub fn describe(allow: &[PowerAction]) -> String {
 /// 这一拍到底执行什么（纯函数，跨平台分支在这里收口）。
 pub enum Exec {
     Spawn(Vec<String>),
+    /// **有序回落链**：挨个执行，第一个「起得来且退出码 0（或超宽限仍在跑）」的算数；
+    /// 全都不成，回最后一步的结果，并把前面各步的失败原因**缀在 detail 里**。
+    ///
+    /// 由来（2026-11-16 真机麒麟 V10 SP1 实测）：`loginctl lock-session` 退出码 0
+    /// 却什么都不锁（LockedHint 翻不动 UKUI 屏保，早就有记录，这次坐实）；
+    /// `org.ukui.ScreenSaver.Lock` 才是真把锁屏 dialog 拉起来的那条 ——
+    /// 但它是 UKUI 自家接口，GNOME/KDE 机器上没有这个名字，必须留给 loginctl 兜底。
+    Chain(Vec<Vec<String>>),
     /// 这台机器上没有安全执行这条路（例如拿不到当前用户名）。拒绝并把原因说清。
     Impossible(String),
 }
@@ -102,7 +110,22 @@ pub fn plan(action: PowerAction, test_program: Option<&str>, user: Option<&str>)
                 ])
             }
             #[cfg(not(windows))]
-            Exec::Spawn(vec!["loginctl".into(), "lock-session".into()])
+            // 先 UKUI 自家 D-Bus（真机实测会真锁屏），机器上没这个名字/没 gdbus
+            // 再退回 loginctl 通用路（认 LockedHint 的桌面环境里它是管用的）。
+            Exec::Chain(vec![
+                vec![
+                    "gdbus".into(),
+                    "call".into(),
+                    "--session".into(),
+                    "--dest".into(),
+                    "org.ukui.ScreenSaver".into(),
+                    "--object-path".into(),
+                    "/".into(),
+                    "--method".into(),
+                    "org.ukui.ScreenSaver.Lock".into(),
+                ],
+                vec!["loginctl".into(), "lock-session".into()],
+            ])
         }
         PowerAction::Logout => {
             #[cfg(windows)]
@@ -270,15 +293,27 @@ pub(crate) async fn handle(
         return;
     }
 
-    let argv = match plan(action, test_program.as_deref(), user.as_deref()) {
-        Exec::Spawn(v) => v,
+    match plan(action, test_program.as_deref(), user.as_deref()) {
         Exec::Impossible(why) => {
             report(Outcome::Impossible(why));
-            return;
         }
-    };
-    info!(action = action.wire_name(), cmd = %argv.join(" "), "执行电源动作");
+        Exec::Spawn(argv) => {
+            info!(action = action.wire_name(), cmd = %argv.join(" "), "执行电源动作");
+            report(run_argv(&argv).await);
+        }
+        Exec::Chain(steps) => {
+            info!(
+                action = action.wire_name(),
+                chain = %steps.iter().map(|s| s.join(" ")).collect::<Vec<_>>().join(" || "),
+                "执行电源动作"
+            );
+            report(run_chain(&steps).await);
+        }
+    }
+}
 
+/// 单条 argv：不经 shell、stdin 关死、stdout/stderr 都收着（stderr 是现场答案）。
+async fn run_argv(argv: &[String]) -> Outcome {
     let mut cmd = tokio::process::Command::new(&argv[0]);
     cmd.args(&argv[1..])
         .stdin(Stdio::null())
@@ -286,20 +321,67 @@ pub(crate) async fn handle(
         .stderr(Stdio::piped());
     let child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => {
-            report(Outcome::SpawnFail(e.to_string()));
-            return;
-        }
+        Err(e) => return Outcome::SpawnFail(e.to_string()),
     };
     // kill_on_drop 默认 false：宽限期到点就**放手**，让关机命令把机器关掉。
     match tokio::time::timeout(EXEC_GRACE, child.wait_with_output()).await {
-        Err(_) => report(Outcome::Pending),
-        Ok(Err(e)) => report(Outcome::SpawnFail(format!("等结果失败：{e}"))),
+        Err(_) => Outcome::Pending,
+        Ok(Err(e)) => Outcome::SpawnFail(format!("等结果失败：{e}")),
         Ok(Ok(outs)) => {
             let code = outs.status.code();
             let err = String::from_utf8_lossy(&outs.stderr).to_string();
-            report(Outcome::Exited(code, err));
+            Outcome::Exited(code, err)
         }
+    }
+}
+
+/// 有序链：第一个成功的算数；全败报**最后一步**，前面的失败原因缀进 stderr 摘要。
+/// 「采纳与否」的口径仍然只在 compose 一处 —— 这里只决定「哪一步的结果送去给它」。
+async fn run_chain(steps: &[Vec<String>]) -> Outcome {
+    if steps.is_empty() {
+        return Outcome::SpawnFail("空执行链（这是 bug，请报告）".into());
+    }
+    let mut history: Vec<String> = Vec::new();
+    let total = steps.len();
+    for (i, argv) in steps.iter().enumerate() {
+        let out = run_argv(argv).await;
+        let worked = matches!(&out, Outcome::Exited(Some(0), _) | Outcome::Pending);
+        if worked {
+            return out;
+        }
+        if i + 1 == total {
+            let h = history.join(" ; ");
+            return if h.is_empty() { out } else { merge_history(out, &h) };
+        }
+        history.push(format!("第{}步[{}]: {}", i + 1, argv.join(" "), outcome_brief(&out)));
+        warn!(step = i + 1, cmd = %argv.join(" "), "这条执行路没成，试下一条");
+    }
+    unreachable!("上面 total==i+1 时必已 return");
+}
+
+/// 给「链上失败步骤」用的一行摘要（不进线上 detail 的正文，正文只保最后一步 + 前情）。
+fn outcome_brief(o: &Outcome) -> String {
+    match o {
+        Outcome::SpawnFail(e) => format!("命令起不来：{e}"),
+        Outcome::Exited(Some(c), err) => {
+            let t = stderr_tail(err, 80);
+            if t.is_empty() { format!("退出码 {c}") } else { format!("退出码 {c}: {t}") }
+        }
+        Outcome::Exited(None, err) => format!("被信号终止: {}", stderr_tail(err, 80)),
+        Outcome::Pending => "仍在运行".into(),
+        Outcome::Denied(w) | Outcome::Impossible(w) => w.clone(),
+    }
+}
+
+/// 把前情提要并进最后一步的结果里（detail 的「算不算采纳」仍由 compose 单点决定）。
+fn merge_history(o: Outcome, history: &str) -> Outcome {
+    match o {
+        Outcome::Exited(code, err) => {
+            let sep = if err.trim().is_empty() { "" } else { "\n" };
+            Outcome::Exited(code, format!("{err}{sep}此前的尝试: {history}"))
+        }
+        Outcome::SpawnFail(e) => Outcome::SpawnFail(format!("{e}；此前的尝试: {history}")),
+        other => other,
     }
 }
 
@@ -401,6 +483,26 @@ mod tests {
                 assert_eq!(v[1], "reboot");
             }
             Exec::Impossible(_) => panic!("测试钩子不该有 Impossible 路"),
+            Exec::Chain(_) => panic!("测试钩子钉死了 argv，不该输出链"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn chain_takes_the_first_step_that_works_and_keeps_earlier_failures() {
+        // 第一步注定失败（/bin/false），第二步成功 —— 链要回「成功那步」，采纳口径不变。
+        let ok = run_chain(&[vec!["/bin/false".into()], vec!["/bin/true".into()]]).await;
+        assert!(matches!(ok, Outcome::Exited(Some(0), _)), "第二步成 = 退出码 0：{:?}", outcome_brief(&ok));
+        // 全败：报最后一步的退出码，但**前一步为什么没成必须跟着上线路**，
+        // 否则现场只看见兜底步的半句话，查不到真正缺的是 gdbus。
+        let bad = run_chain(&[
+            vec!["/nonexistent-program-uulan-chain-test".into()],
+            vec!["/bin/false".into()],
+        ])
+        .await;
+        match bad {
+            Outcome::Exited(_, err) => assert!(err.contains("此前的尝试"), "前情要缀进 stderr：{err}"),
+            other => panic!("最后一步的退出码要原样报，拿到 {:?}", outcome_brief(&other)),
         }
     }
 
@@ -409,8 +511,14 @@ mod tests {
     fn production_commands_follow_the_service_manager_conventions() {
         // 麒麟/通用 Linux：loginctl / systemctl，不经 shell、没有拼接面。
         match plan(Lock, None, None) {
-            Exec::Spawn(v) => assert_eq!(v, vec!["loginctl", "lock-session"]),
-            _ => panic!(),
+            Exec::Chain(steps) => {
+                assert_eq!(steps.len(), 2, "锁屏必须是两步链（UKUI 优先、loginctl 兜底）");
+                assert_eq!(steps[0][0], "gdbus");
+                assert!(steps[0].iter().any(|a| a == "org.ukui.ScreenSaver.Lock"),
+                    "第一步要调 UKUI 自家锁屏：{:?}", steps[0]);
+                assert_eq!(steps[1], vec!["loginctl", "lock-session"]);
+            }
+            _ => panic!("锁屏应走 Chain，拿到别的变体"),
         }
         match plan(Reboot, None, None) {
             Exec::Spawn(v) => assert_eq!(v, vec!["systemctl", "reboot"]),
