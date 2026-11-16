@@ -46,7 +46,10 @@ RDIR="/tmp/uulan-monitor.$TS"          # 真机侧独立测试台目录（带时
 XD=2048; YD=768; MW=1024               # Xvfb :97 帧缓冲与「每块屏」尺寸
 RIGHT_X=$((XD - MW))                   # 右半块原点 = +1024
 TOL=${UULAN_TOL:-3}
-BIN=${UULAN_BIN:-~/.local/uulan/src/target/release}
+# BIN 是要**拼进远端命令串**的，所以默认值里的家目录必须留给远端 shell 展开。
+# 写成 ~ 会被本地 bash 先展开成 MSYS 家目录（/c/Users/xxx），远端路径当场作废 ——
+# 表现为「真机上没有当前二进制」的假 FAIL，只有手动传 UULAN_BIN 时才跑得动。
+BIN=${UULAN_BIN:-\$HOME/.local/uulan/src/target/release}
 
 # 原生程序只认 C:/ D:/，MSYS 工具只认 /d/ —— 两套路径都备着。
 WORKN=$(cygpath -m "$WORK" 2>/dev/null || echo "$WORK")
@@ -97,6 +100,19 @@ done
 rlast "test -x $BIN/uulan-host && test -x $BIN/uulan-server && echo HAVE" | grep -q HAVE || {
   echo "FAIL 真机上没有 $BIN 下的当前二进制（先从 HEAD 部署并 cargo build --release -p uulan-server -p uulan-host）"; exit 2; }
 
+# 测试台的进程特征（供开跑前清扫与收尾判据共用）。
+# 方括号写法 [X]vfb 让模式**不匹配执行这条命令的 shell 自己** —— 否则 pgrep/grep 会
+# 把自己数进去，收尾永远报「残留 1~3 条」的假失败（2026-11-16 撞过）。
+BENCH="pgrep -f '[/]tmp/uulan-monitor\.'; pgrep -f '[X]vfb :97'; pgrep -f '[x]ev -geometry 300x200'"
+
+# 开跑前扫陈旧测试台：上一轮若中途死掉（脚本 bug / 超时 / Ctrl-C），Xvfb :97 和两个 xev
+# 会留在真机上，新一轮 Xvfb 因显示号被占起不来，故障会被误报成「被控端 A 没起来」。
+STALE=$(rlast "{ $BENCH; } | sort -u | wc -l")
+if [ "${STALE:-0}" != "0" ]; then
+  echo "  提示：真机有 ${STALE} 个上一轮的测试台残留，先清掉（只按测试台特征匹配，不碰生产服务）"
+  rlast "{ $BENCH; } | sort -u | xargs -r kill 2>/dev/null; sleep 2; { $BENCH; } | sort -u | xargs -r kill -9 2>/dev/null; echo SWEPT" >/dev/null
+fi
+
 rssh "mkdir -p $RDIR/bin $RDIR/cfg" >/dev/null
 # 布局 shim：真 Xvfb 的 xrandr 不列已连接输出，这里造「两块屏并排」（仅此一步是合成数据）。
 $SSH "cat > $RDIR/bin/xrandr && chmod +x $RDIR/bin/xrandr" <<SHIM
@@ -144,7 +160,10 @@ start_host() {
 
 # 测试台自己的口令 → 本地 0600 文件（标记过滤，绝不上屏；拿不到打印空串）
 grab_pw() {
-  local nm=$1 f="$WORK/ms-$nm.pw" pw=""
+  # 必须分两条：bash 先把整条 `local` 的词表展开完再赋值，所以
+  # `local nm=$1 f="…$nm…"` 里的 $nm 取的是**外层**同名变量（这里没定义，set -u 直接炸）。
+  local nm=$1 pw=""
+  local f="$WORK/ms-$nm.pw"
   for i in $(seq 1 10); do
     pw=$($SSH "python3 -c \"import json;print('PW='+json.load(open('$RDIR/cfg/$nm.json'))['password'])\"" 2>/dev/null | tr -d '\r' | grep -a 'PW=' | head -1 | sed 's/.*PW=//')
     [ -n "$pw" ] && break; sleep 0.5
@@ -233,15 +252,24 @@ FB0=$(rlast "DISPLAY=:0 xdpyinfo 2>/dev/null | awk '/dimensions:/{print \$2}'")
 CONN0=$(rlast "DISPLAY=:0 xrandr --query 2>/dev/null | grep -c ' connected '")
 if [ -z "$FB0" ]; then
   bad "读不到真 :0 的帧缓冲（xdpyinfo 失败）—— C 段没法钉"
-elif [ "${CONN0:-0}" != "0" ]; then
-  skp "真 :0 上有 ${CONN0} 块已连接输出（不是现网裸帧缓冲形态），C 段按现口径没法钉"
+elif [ "${CONN0:-0}" = "0" ]; then
+  # 裸帧缓冲（机器上没挂显示器）：空表 → 按整帧缓冲抓
+  WANT='按整帧缓冲抓'
 else
+  # 挂了真显示器：@1 越界 → 退回第一块。这条同样要钉住。
+  # 2026-11-16 实测（VGA-0 1920x1080 已连接）：`[WARN] 显示器1 不存在（已连接只有 1 块）—— 退回第一块`。
+  WANT='显示器1 不存在'
+fi
+if [ -n "$FB0" ]; then
   rssh "DISPLAY=:0 NO_COLOR=1 $BIN/uulan-host --diagnose --config $RDIR/cfg/C.json --capture 'x11::0@1' > $RDIR/diagC.txt 2>&1; echo RC=\$?" | grep -q 'RC=0' \
     && ok "C --diagnose 退出码 0（WARN 不算 FAIL）" || bad "C --diagnose 退出码非 0"
-  WLINE=$(rssh "grep -a '^\[WARN\] 显示器' $RDIR/diagC.txt" | head -1)
-  chk "C --diagnose 显示器项 = [WARN] 按整帧缓冲抓" "$(printf '%s' "$WLINE" | grep -q '按整帧缓冲抓' && echo 1)" "[$WLINE]"
-  FAILN=$(rlast "grep -ac '\[FAIL\]' $RDIR/diagC.txt || echo 9")
-  chk "C --diagnose 没有任何 [FAIL] 项" "$([ "${FAILN:-9}" = "0" ] && echo 1)" "FAIL×${FAILN:-?}"
+  WLINE=$(rssh "grep -a '^\\[WARN\\] 显示器' $RDIR/diagC.txt" | head -1)
+  chk "C --diagnose 显示器件降级为「$WANT」（已连接 ${CONN0:-?} 块）" "$(printf '%s' "$WLINE" | grep -q "$WANT" && echo 1)" "[$WLINE]"
+  # 判据坑：`grep -c` 数到 0 个匹配时退出码是 1，`|| echo 9` 会把**健康的 0 个 FAIL**
+  # 变成哨兵 9 —— 于是「一切正常」被报成失败（2026-11-16 撞过）。这里显式区分
+  # 「文件在不在」和「数到几个」，不再用兜底哨兵冒充数据。
+  FAILN=$(rlast "if test -f $RDIR/diagC.txt; then grep -ac '\[FAIL\]' $RDIR/diagC.txt; else echo ERR; fi")
+  chk "C --diagnose 没有任何 [FAIL] 项" "$([ "${FAILN:-ERR}" = "0" ] && echo 1)" "FAIL×${FAILN:-?}"
   DEV_C=$(start_host C "x11::0@1" 0); PWC=$(grab_pw C)
   if [ -n "$DEV_C" ] && [ -n "$PWC" ]; then
     run_session "$DEV_C" "$PWC" C "-" 8
@@ -265,8 +293,8 @@ echo "== 收尾：停测试台（kill 各 pid，目录留底不删）；正式�
 kill_pid A; kill_pid B
 for f in xvfb xev-l xev-r server; do kill_pid $f; done
 sleep 1
-LEFT=$(rlast "ps -u mis -o args 2>/dev/null | grep -c '$RDIR' || echo 9")
-chk "测试台进程清干净（$RDIR 无残留）" "$([ "${LEFT:-9}" = "0" ] && echo 1)" "残留 ${LEFT:-?} 条"
+LEFT=$(rlast "{ $BENCH; } | sort -u | wc -l")
+chk "测试台进程清干净（真机无 monitor / Xvfb:97 / xev 残留，生产服务不在判据里）" "$([ "${LEFT:-9}" = "0" ] && echo 1)" "残留 ${LEFT:-?} 条"
 
 echo
 echo "结果：$pass 通过 / $fail 失败 / $skip 跳过"
