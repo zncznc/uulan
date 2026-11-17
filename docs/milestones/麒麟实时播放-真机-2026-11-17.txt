@@ -1,0 +1,116 @@
+麒麟控制端的实时播放（M7 的最后一格）—— 2026-11-17 夜批 22:00 班，真机验收通过
+
+本轮改的只有一件事：`audioin.rs` 里 `Sink::Speaker` 在非 Windows 平台以前永远返回 Err
+（「这个平台还没有实时播放后端」），所以**麒麟控制端收到音频却哪儿都不去**，只能
+`--audio-save` 落成 WAV。现在把 PCM 交给本机的播放命令，并在真麒麟上用「把声音再录回来」
+这种独立判据验通。
+
+本机基线（开工时实测）：`cargo test --workspace` **531 passed / 0 failed / 1 ignored**（42 个
+测试二进制），零警告。收工：**533 passed / 0 failed / 1 ignored**，零警告（涨的 2 条是本轮新加的
+两条纯函数单测）；`cargo build --release` RC=0（1m06s）。
+
+提交：3284f71（代码 + 验收脚本）。
+
+## 一、挑命令是实测挑出来的，不是想当然
+
+| 路 | 真机实测 | 结论 |
+|---|---|---|
+| `paplay --format=s16le --channels=2 --rate=48000 <raw 文件>` | 「打开声音文件失败」rc=1 | **不通**：这台麒麟（PulseAudio 13.99）的 paplay 只吃 libsndfile 认得的文件 |
+| `cat raw \| paplay --format=... -` | 「open()：没有那个文件或目录」rc=1 | **不通**：这个版本根本没有 raw/stdin 这条路 |
+| `cat raw \| aplay -q -t raw -f S16_LE -c 2 -r 48000 -` | rc=0，且信宿 monitor 录得到 | **采用**（ALSA default 经 `/usr/share/alsa/pulse-alsa.conf` 落到 pulse 的默认信宿） |
+| `pw-play` | 这台机器没有（`which pw-play` 空） | 没验过的东西**不写进候选表**，免得它去抢播放顺序 |
+| 另起 null sink + `PULSE_SINK=uulan_verify aplay ...` | monitor 录回 451700 字节**全是零**（峰值 0） | **别打这个主意**：ALSA→pulse 插件按默认信宿落，`PULSE_SINK` 对它不起作用；要做「不出声的验收台」得先 `set-default-sink`，而那是改机器状态的事 |
+
+候选表 `player_candidates()` 与 PATH 查找 `find_in_path_with(name, dirs, is_exe)` 都是纯函数，
+所以**两个平台的单测都能钉住它们**（Windows 上看不到 cfg(not(windows)) 的任何代码，这条是
+本仓库唯一能给这段逻辑本机证据的路）。新增 2 条：
+
+- `player_args_are_exactly_the_decoders_format` —— `-t raw` / `-f S16_LE` / `-c 2` / `-r 48000` /
+  末位必须是 `-`（stdin），且这两个数字必须来自 `CHANNELS` / `SAMPLE_RATE` 本身。参数与解码器
+  输出一字不差是这条链路的立身之本：差一个字符的现场表现是「ALSA 当场退出」或
+  「一声不响但统计在涨」，后者最难查。
+- `find_in_path_follows_path_order_and_executability` —— 按 PATH 顺序、只认真正能执行的那项
+  （同名不可执行文件不算），找不到时是老实的 `None`（不赌第一个目录）。
+
+## 二、真机部署（HEAD，不碰工作区）
+
+- `git archive HEAD` → 2,744,320 字节 tar → scp → 真机换源码保留 `target/` 缓存，
+  旧底 `~/.local/uulan/src.old.20261117_224458`。
+- `cargo build --release -p uulan-server -p uulan-host -p uulan-client` **41.30s，RC=0，零警告**。
+  ⚠ 顺带纠正一处长期口径：**麒麟上编得出控制端**（`x11-dlopen` + 两个 `build.rs` 软链，2026-10-24 打通），
+  本轮 41 秒实测再次成立 —— 任务提示里「客户端在真机上编不了」那句是旧的。
+  控制端 sha256 前 12 位 `ee9437fa91ae`。
+- **正式服务一个字没动**：`uulan-host` 用户单元 ExecStart 仍指向
+  `~/.local/uulan/bin/uulan-head-20261116`（11-16 那个 drop-in），`uulan-server` 系统单元照旧。
+  本轮改动全在控制端，协议与 wire 零变化 → 不需要换现网二进制。
+
+## 三、真机验收：`scripts/verify-audio-playback-e2e.sh`（在麒麟上跑）12/0/0，跑两轮
+
+测试台与被控端都用独立配置与独立中继（127.0.0.1:21998，台账在 /tmp 的工作目录里），
+设备 ID 是测试台自己生成的（302986016 / 322663151），**不碰正式服务的身份与口令**。
+被控端 `--audio-source lavfi:sine=frequency=440:sample_rate=48000`、
+`--capture lavfi:testsrc2=size=640x480:rate=15`、`--once`。
+
+第一轮（真机 22:45:51–22:46:01，同会话）：
+
+- 控制端退出码 **0**；`已请求被控端发送音频 sink=Speaker`
+- **`实时播放已接上 program=aplay rate=48000 channels=2`** ← 本机真的起了播放进程的证据
+- `被控端正在推流 codec=opus/ogg 64k 48000Hz 2ch detail=lavfi:sine=frequency=440:sample_rate=48000`
+- 音频统计：收到 **494 帧 / 113744 字节** → 解出 **9.9 秒** PCM（峰值 2945）→
+  **播放 1892640 字节**，错误 **0**
+- **`实时播放已收尾 program=aplay`** ← 播放进程自己退出，没走到 1500 ms 宽限 kill，尾巴没被切
+- 独立判据：`parecord` 从 `alsa_output.usb-Generic_USB_Audio-00...monitor` 录回
+  **1926140 字节 / 10.03 秒 / 峰值 2841 / 5 个 2 秒窗 / 440Hz:1000Hz = 27 倍**
+- 对照组（**没人播时**录 3 秒）：44 字节 / 0.00 秒 / 峰值 0 —— Pulse 把挂起的信宿一个样本都不写。
+  这条是判据不自证的凭据：录到的那段 440 Hz 只可能来自本轮这条链路。
+- 同会话画面：解出 2560 帧 / 丢帧 0 / 首帧 122 ms（合成源不限速，帧数只作活性证据）
+- 第二轮 22:47：同样 12/0/0，**440Hz:1000Hz = 33 倍**、解出 9.9 秒 / 播放 1892640 字节 /
+  错误 0、画面 2516 帧 / 丢帧 0 / 首帧 144 ms
+
+为什么判据必须是「录回来」而不是「播放字节数」：`played_bytes` 只证明字节写进了子进程的
+stdin，而管道能一声不响地吞掉一整晚。数字要落在 PulseAudio 上才算数。
+
+顺带补的一个观测口：`play_loop` 里播放写入失败以前只加计数就 `break`，原因（含子进程退出码）
+不落日志——现在 `warn!` 出来。这与剪贴板那条教训同族：「统计里少了 N 个」必须能说清是谁拒的。
+
+## 四、本机音频链路复跑（改动没弄坏 Windows 那半条）
+
+`bash scripts/verify-audio-e2e.sh` → **RC=0**：8.20 s / 峰值 2981 / 440Hz 是 1000Hz 的
+**1047 倍**（与归档数字一致）、音频状态行「被控端正在推流（被控端回了 1 条 / 起不来 0 次）」；
+同会话视频 6468 帧 / **解码丢帧 2**（本机 lavfi 测试台的量级噪声，换代边界本来就允许几帧；
+真机两轮都是 0）。
+
+## 五、现网回归（Windows 控制端 = 本轮 HEAD 构建 → 正式被控端）
+
+- 355 帧解出 / 357 AU / **丢帧 0** / 首帧 **216 ms** / 实测 29.5 fps / 被控端自报 30.40 fps /
+  平均码率 9017 kbps
+- 存帧 vs 真机 `ffmpeg -f x11grab` 截图：**相关系数 1.0000 / MAE 0.96–255 = 0.37%**
+  （基线要求 0.9982，无回归）
+
+## 六、上一班留下的那条时序脆弱，本轮收尾
+
+白天那班核全量时是 530/1，唯一红的 `term::tests::backpressure_waits_instead_of_dropping_bytes`
+单跑 3 次全过 —— 断言写成「固定睡 150 ms 后一次性断言」，42 个测试二进制抢 CPU 时那条重试
+可能一次都没被调度到。本轮改成**轮询到条件成立为止（3 秒上限）**，判据本身一字未动
+（拒绝期间一条不许塞进队列、必须一直在重试而不是悄悄放弃）。本轮全量两轮都没再红。
+
+## 七、机器状态与撤法
+
+- `~/.local/uulan/src` = HEAD（本轮）；旧底 `src.old.20261117_224458`。撤：
+  `cd ~/.local/uulan && mv src src.bad && mv src.old.20261117_224458 src`（`target/` 已随新源码搬过去，
+  回滚后缓存还在）。
+- **正式服务未被替换**（`~/.local/uulan/bin/uulan-head-20261116` 与两个单元照旧）。
+- 探针加载过的 null sink 已 `pactl unload-module` 撤掉（`sinks-after=1`，实测回到只有那块 USB 声卡）。
+- 验收期间把 `org.ukui.screensaver idle-activation-enabled` 设为 false，**收工已改回 true**；
+  锁屏对话框进程（`ukui-screensaver-dialog --session-idle`）按既有纪律 kill 掉过（不需要 root）。
+- 家目录留下 `deploy-head-2302.sh`、`probe-*.sh`、`check440.py`、源码 tar 这些台架文件（惰性问题，不删）。
+
+## 八、仍未验（别写成已验）
+
+- **音量/流被别的程序争用时的行为**：本轮没测 Pulse 被别人独占或 sink 忙时的表现
+  （代码路径是「起不来就 warn + 只解码不播放」，但没有真机反例）。
+- **播放延迟**没量过（只验了「有声音且是那条正弦」）。
+- 多信宿机器上「播到哪块」只做了默认信宿的保守选择（`pactl info` 里认名字），没有第二块声卡可测。
+- 开发机（Windows）这一侧的实时播放本轮只复跑了 `--audio-save` 那条 WAV 路，
+  `waveOut` 那半条没重测（未改，且 M7 首验时已在真机听过来）。
+- 麦克风（控制端 → 被控端）方向仍未做，这是 M7 剩下的唯一一格。
