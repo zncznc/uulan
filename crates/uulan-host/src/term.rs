@@ -953,9 +953,15 @@ mod tests {
 ") }).await.unwrap();
 
         // 拒绝期间：一条消息都不该被「吞掉」，也不该到对端。
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(out_rx.try_recv().is_err(), "队列满的时候不该硬塞进去");
+        // 「先睡 150 ms 再一次性断言」在满载时是假红：42 个测试二进制抢 CPU 时，那条重试
+        // 可能一次都没被调度到（2026-11-17 白天跑全量就红过这一次，单跑 3 次全过）。
+        // 判据本身没动，改的是等法 —— 轮询到条件成立为止，超时才输。
+        let retry_deadline = Instant::now() + Duration::from_secs(3);
+        while attempts.load(Ordering::SeqCst) == 0 && Instant::now() < retry_deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(attempts.load(Ordering::SeqCst) > 0, "应当一直在重试，而不是悄悄放弃");
+        assert!(out_rx.try_recv().is_err(), "队列满的时候不该硬塞进去");
 
         // 放开之后：退出事件必须还在（这就是「等」和「丢」的区别）。
         blocked.store(false, Ordering::SeqCst);

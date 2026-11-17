@@ -122,7 +122,8 @@ uulan-client —— uulan 内网远控的控制端
   --capture           窗口模式的捕获模式：本地光标锁进窗口并隐藏，移动按原样
                       发相对增量（不掺画幅换算）；F8 随时开/关。与 --headless
                       及各不开窗口的动作互斥
-  --audio             接收被控端的声音（PulseAudio monitor → Opus）
+  --audio             接收被控端的声音（PulseAudio monitor → Opus），本机实时播放
+                      （Windows 用 waveOut；其它平台把 PCM 交给 aplay；都不行时 --audio-save 仍可取证）
   --audio-save <path> 把声音存成 WAV（同时隐含 --audio；无人值守验收用）
   --no-input          只读模式：不上报键鼠（排障、旁观时用）
   --no-clipboard      不同步剪贴板（不希望本机剪贴板被对面改写时用）

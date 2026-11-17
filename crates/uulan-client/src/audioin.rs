@@ -12,8 +12,12 @@
 //! ## 平台
 //!
 //! - Windows：`waveOut`（winmm，手写 FFI —— 与 `termx::wincon` 同样的理由，不引 windows-sys 特性）。
-//! - 其它平台：实时播放**未实现**（`--audio-save` 照常可用）。麒麟控制端要出声得等下一步，
-//!   这一点必须写在帮助与文档里，别让人以为「开了 --audio 就有声音」。
+//! - 其它平台：把裸 PCM 原样灌进一个播放命令的 stdin（候选见 [`player_candidates`]）。
+//!   2026-11-17 在真麒麟上验通：控制端播出来的声音被 `parecord` 从信宿的 monitor 录回来，
+//!   440 Hz 仍然是主角。
+//! - **挑的是 `aplay` 而不是 `paplay`，这是实测出来的**：这台麒麟的 paplay（PulseAudio 13.99）
+//!   只吃 libsndfile 认得的文件，喂 raw 一律「打开声音文件失败」（退出码 1）；而 ALSA 的 default
+//!   本来就经 pulse 插件落到同一个信宿 —— 录回来的波形证明了这条路由，不是想当然。
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -29,6 +33,10 @@ use uulan_protocol::frame::{read_frame, FrameKind};
 /// 采样率/声道：解码器与播放器都按这套参数，改一处就要两处一起改。
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u16 = 2;
+
+/// 收尾时给播放命令的宽限：先把缓冲里的尾巴放完，超时才 kill。
+#[cfg(not(windows))]
+const PIPE_FINISH_MS: u64 = 1500;
 
 /// 音频统计。窗口模式与 headless 都在收工时打这一行 —— 「有没有声音」唯一可 grep 的证据。
 #[derive(Debug, Default)]
@@ -357,7 +365,156 @@ fn speaker() -> Result<Box<dyn Out>, String> {
 
 #[cfg(not(windows))]
 fn speaker() -> Result<Box<dyn Out>, String> {
-    Err("这个平台还没有实时播放后端（用 --audio-save 落成 WAV 即可验收）".into())
+    let dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    let mut tried = Vec::new();
+    for cand in player_candidates() {
+        let Some(found) = find_in_path(cand.program, &dirs) else {
+            tried.push(format!("{}（不在 PATH）", cand.program));
+            continue;
+        };
+        match PipeOut::open(&cand, &found) {
+            Ok(o) => {
+                // 这行是「本机到底有没有出声」唯一可 grep 的证据：统计里那个播放字节数只说明
+                // 字节写进了管道，而管道能一声不响地吞掉一整晚。
+                info!(program = %cand.program, rate = SAMPLE_RATE, channels = CHANNELS,
+                      "实时播放已接上");
+                return Ok(Box::new(o));
+            }
+            Err(e) => tried.push(format!("{}：{}", cand.program, e)),
+        }
+    }
+    Err(format!(
+        "这台机器上没能起任何一个播放命令（{}）—— 用 --audio-save 落成 WAV 仍可验收",
+        tried.join(" / ")
+    ))
+}
+
+/// 一个实时播放候选：命令名 + 完整参数（参数里已经钉死采样格式）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerCandidate {
+    pub program: &'static str,
+    pub args: Vec<String>,
+}
+
+/// 候选表。**只列实测过能吃 raw stdin 的命令**：`paplay` 在这台麒麟上明确不行（见模块头），
+/// `pw-play` 手边没有 PipeWire 机器可验 —— 写进来就是拿没验证过的东西去抢播放顺序。
+///
+/// 为什么它是纯函数：参数错一个字符，现场的表现是「流在动、统计在涨、一声不响」，
+/// 那是最难查的一类故障，所以两个平台的单测都得能钉住这张表。
+pub fn player_candidates() -> Vec<PlayerCandidate> {
+    vec![PlayerCandidate {
+        program: "aplay",
+        // raw 模式必须把格式说全：少了任何一项，ALSA 要么当场报错退出，要么按错的规格播。
+        args: vec![
+            "-q".into(),
+            "-t".into(),
+            "raw".into(),
+            "-f".into(),
+            "S16_LE".into(),
+            "-c".into(),
+            CHANNELS.to_string(),
+            "-r".into(),
+            SAMPLE_RATE.to_string(),
+            "-".into(),
+        ],
+    }]
+}
+
+/// 按 PATH 的顺序找可执行文件；「算不算可执行」由调用方给，单测因此不碰磁盘。
+pub fn find_in_path_with(
+    name: &str,
+    dirs: &[PathBuf],
+    is_exe: impl Fn(&std::path::Path) -> bool,
+) -> Option<PathBuf> {
+    dirs.iter().find_map(|d| {
+        let p = d.join(name);
+        if is_exe(&p) {
+            Some(p)
+        } else {
+            None
+        }
+    })
+}
+
+/// 生产入口：拿真实文件系统的答案。
+pub fn find_in_path(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    find_in_path_with(name, dirs, |p| is_executable(p))
+}
+
+#[cfg(unix)]
+fn is_executable(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(p: &std::path::Path) -> bool {
+    std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)
+}
+
+/// unix 实时播放：PCM 原样进子进程的 stdin。
+///
+/// 反压靠子进程本身 —— `write_all` 阻塞在它没读完的时候，正是「能等就别丢字节」
+/// （与 Windows 那条 `waveOutWrite` 等缓冲放完同理，也和被控端 PTY 那侧一致）。
+#[cfg(not(windows))]
+struct PipeOut {
+    program: String,
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+}
+
+#[cfg(not(windows))]
+impl PipeOut {
+    fn open(cand: &PlayerCandidate, program_path: &std::path::Path) -> Result<Self, String> {
+        let mut child = std::process::Command::new(program_path)
+            .args(&cand.args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("{}", e))?;
+        let stdin = child.stdin.take().ok_or_else(|| "拿不到 stdin".to_string())?;
+        Ok(PipeOut { program: cand.program.into(), child, stdin: Some(stdin) })
+    }
+}
+
+#[cfg(not(windows))]
+impl Out for PipeOut {
+    fn write(&mut self, pcm: &[u8]) -> std::io::Result<()> {
+        match self.stdin.as_mut() {
+            Some(s) => s.write_all(pcm),
+            None => Err(std::io::Error::other("播放后端已经关掉了")),
+        }
+    }
+
+    fn finish(&mut self) {
+        // 先关 stdin，让播放器把缓冲里的尾巴放完自己退出；直接 kill 会切掉最后一句。
+        self.stdin = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(PIPE_FINISH_MS);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = self.child.kill();
+                        let _ = self.child.wait();
+                        warn!(program = %self.program, "播放命令没自己退出，宽限到点后终止（尾巴可能被切）");
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => {
+                    warn!(error = %e, program = %self.program, "问不到播放命令的状态");
+                    break;
+                }
+            }
+        }
+        info!(program = %self.program, "实时播放已收尾");
+    }
 }
 
 #[cfg(windows)]
@@ -816,6 +973,34 @@ mod tests {
 
     /// 假时钟起点。状态机的时间一律由调用方给，所以这些测试不真等 5 秒。
     const T0: u64 = 1_000;
+
+    /// 解码器吐的是什么，播放命令就得要什么 —— 一字不差。对不上的表现是「ALSA 当场退出」
+    /// 或「一声不响但统计在涨」，两种都极难在现场定位，所以这条必须被单测钉住。
+    #[test]
+    fn player_args_are_exactly_the_decoders_format() {
+        let c = player_candidates();
+        assert_eq!(c.len(), 1, "候选表里只该有实测过的那一个");
+        let a = &c[0].args;
+        let val = |flag: &str| a.iter().position(|s| s == flag).map(|i| a[i + 1].clone());
+        assert_eq!(val("-t").as_deref(), Some("raw"), "必须走 raw 模式");
+        assert_eq!(val("-f").as_deref(), Some("S16_LE"));
+        assert_eq!(val("-c").as_deref(), Some(CHANNELS.to_string()).as_deref());
+        assert_eq!(val("-r").as_deref(), Some(SAMPLE_RATE.to_string()).as_deref());
+        assert_eq!(a.last().map(|s| s.as_str()), Some("-"), "数据必须从 stdin 进");
+    }
+
+    /// PATH 的顺序说了算，而且只认真正能执行的那一项；谁都没有时是老实的 None。
+    #[test]
+    fn find_in_path_follows_path_order_and_executability() {
+        // 两边的路径一律用同一个 join 造出来：Windows 上分隔符是 \，写成字面量会假红。
+        let first = PathBuf::from("/first").join("aplay");
+        let second = PathBuf::from("/second").join("aplay");
+        let dirs = vec![PathBuf::from("/first"), PathBuf::from("/second")];
+        let table = std::collections::HashMap::from([(first, false), (second.clone(), true)]);
+        let hit = find_in_path_with("aplay", &dirs, |p| *table.get(p).unwrap_or(&false));
+        assert_eq!(hit, Some(second), "第一个目录里那个不可执行的同名文件不该被选中");
+        assert_eq!(find_in_path_with("nope", &dirs, |_| false), None, "找不到不能赌第一个目录");
+    }
 
     #[test]
     fn idle_until_something_is_asked() {
