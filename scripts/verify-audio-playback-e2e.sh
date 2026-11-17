@@ -82,6 +82,13 @@ rate = struct.unpack_from("<I", b, 24)[0]
 bits = struct.unpack_from("<H", b, 34)[0]
 n = len(data) // (bits // 8)
 samples = struct.unpack_from("<%dh" % n, data, 0)
+# 交织立体声先混成单声道帧：Goertzel 的 rate 是按「每秒帧数」定义的，
+# 直接喂 short 流等于把时间基错成 96k —— 440 Hz 会被量成 220 Hz，
+# 440:1000 的比值就沦为旁瓣抽签（2026-11-18 麦克风复跑第二轮就是这么红的，
+# 混帧后同一段字节 440:1000 = 3.4e7 倍，声音一直都在）。
+if ch == 2:
+    samples = [(samples[i] + samples[i + 1]) // 2 for i in range(0, n - (n % 2), 2)]
+    n = len(samples)
 peak = max(abs(s) for s in samples) if samples else 0
 
 def goertzel(seg, freq):
@@ -92,7 +99,7 @@ def goertzel(seg, freq):
         s2, s1 = s1, s0
     return s1 * s1 + s2 * s2 - coeff * s1 * s2
 
-w = max(1, int(rate * ch * 2))
+w = max(1, rate * 2)   # 混帧之后一帧就是一个采样时刻：2 秒 = 2*rate 帧
 p440 = p1000 = 0.0
 wins = 0
 for i in range(0, len(samples), w):
@@ -102,7 +109,7 @@ for i in range(0, len(samples), w):
     p440 += goertzel(seg, 440.0); p1000 += goertzel(seg, 1000.0); wins += 1
 ratio = p440 / max(p1000, 1e-9)
 print("  WAV %d 字节 / %.2f 秒 / 峰值 %d / %d 个 2 秒窗 / 440Hz:1000Hz = %.0f 倍"
-      % (len(b), n / rate / ch, peak, wins, ratio))
+      % (len(b), n / rate, peak, wins, ratio))
 live = peak > 100 and ratio >= 10
 if want:
     sys.exit(0 if live else 1)
