@@ -144,7 +144,7 @@ pub fn start(
                 }
             },
         };
-        match playback::pump(&ffmpeg, rx, out, &st_out, Box::new(|| {})) {
+        match playback::pump(&ffmpeg, rx, out, &st_out, Box::new(|| {}), Box::new(|_, _| {})) {
             playback::PumpEnd::DecoderGone(why) => {
                 // 本机连解码器都起不来 → 记一笔，由会话那边的看门狗发 `C2H::AudioStop`：
                 // 再让被控端一路编码下去只是白吃 CPU 与带宽，而这边永远不会有声音。

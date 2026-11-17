@@ -290,7 +290,7 @@ pub fn pipe_speaker() -> Result<Box<dyn PcmSink>, String> {
 }
 
 /// `pump` 的结局。每一端把它接成自己那句「为什么结束了」。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum PumpEnd {
     /// 上游字节流结束（对端停了 / 写半端关了），解码器把尾巴冲刷完了。
     Ended,
@@ -306,14 +306,17 @@ pub enum PumpEnd {
 /// `on_ready` 在「解码器起来了」的那一刻被调用一次 —— 被控端用它回
 /// `MicState{running:true}`，让对面知道播放在本机真的落地了。
 ///
-/// **为什么返回而不是回调收尾**：调用方还要 abort/await 读任务、写自己的统计日志，
-/// 各端措辞不同；「怎么坏的」在这里如实交出去就够了。
+/// `on_end` 在**每一条返回路径上、真正 return 之前**被调用（含 DecoderGone 的早退）。
+/// 为什么必须有它：调用方那个 async 任务可能已经被 `abort`（控制端整个进程先退出是
+/// 常态），而 `spawn_blocking` 的这里**杀不到** —— 收尾的回话与账目只有落在这个
+/// 线程里才保证说得出口。2026-11-18 真机 night 批就是「玩家释放了、账却没落」暴露的。
 pub fn pump(
     ffmpeg: &Path,
     rx: Receiver<Vec<u8>>,
     mut sink: Box<dyn PcmSink>,
     stats: &Arc<Counters>,
     on_ready: Box<dyn FnOnce() + Send>,
+    on_end: Box<dyn FnOnce(&PumpEnd, &Arc<Counters>) + Send>,
 ) -> PumpEnd {
     let mut child = match std::process::Command::new(ffmpeg)
         .args(decode_args())
@@ -327,14 +330,20 @@ pub fn pump(
             let why = format!("{e}");
             warn!(error = %why, "音频解码器启动失败");
             stats.bump_errors();
-            return PumpEnd::DecoderGone(why);
+            let end = PumpEnd::DecoderGone(why);
+            on_end(&end, stats);
+            return end;
         }
     };
     let Some(mut din) = child.stdin.take() else {
-        return PumpEnd::DecoderGone("拿不到 ffmpeg 的 stdin".into());
+        let end = PumpEnd::DecoderGone("拿不到 ffmpeg 的 stdin".into());
+        on_end(&end, stats);
+        return end;
     };
     let Some(mut dout) = child.stdout.take() else {
-        return PumpEnd::DecoderGone("拿不到 ffmpeg 的 stdout".into());
+        let end = PumpEnd::DecoderGone("拿不到 ffmpeg 的 stdout".into());
+        on_end(&end, stats);
+        return end;
     };
     on_ready();
 
@@ -399,10 +408,12 @@ pub fn pump(
     sink.finish();
     let _ = child.wait();
     info!(pcm = stats.pcm_bytes.load(Ordering::Relaxed), "音频解码结束");
-    match early_err {
+    let end = match early_err {
         Some(why) => PumpEnd::SinkGone(why),
         None => PumpEnd::Ended,
-    }
+    };
+    on_end(&end, stats);
+    end
 }
 
 #[cfg(test)]

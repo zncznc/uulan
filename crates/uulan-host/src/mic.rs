@@ -124,8 +124,35 @@ pub async fn run(
     // notify 是异步侧的闭包，跨界只能走 channel —— 这正是
     // 「口径 = 解码器 + 播放后端都起来了」的实现（不是「收到 MicStart 了」）。
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    // 收尾的**回话与账目都放进 on_end**（在阻塞线程里执行到最后）：
+    // 控制端整个进程先退出是常态 —— 那时会话收尾会 abort 本任务，留在异步侧的
+    // 「麦克风转接收尾」一行永远落不了盘（2026-11-18 真机测试台暴露：播放器释放了、
+    // 账没落）。spawn_blocking 杀不到，这段就 guaranteed 说得出口。
+    let notify = std::sync::Arc::new(notify);
+    let notify_end = notify.clone();
+    let on_end: Box<dyn FnOnce(&playback::PumpEnd, &Arc<Counters>) + Send> = Box::new(move |end, st| {
+        use std::sync::atomic::Ordering::Relaxed;
+        let bytes = st.ogg_bytes.load(Relaxed);
+        let detail = match end {
+            playback::PumpEnd::Ended => format!("麦克风流结束（本机收到 {bytes} 字节）"),
+            playback::PumpEnd::DecoderGone(w) => format!("本机解码器起不来：{w}"),
+            playback::PumpEnd::SinkGone(w) => format!("本机播放中断：{w}"),
+        };
+        if !matches!(end, playback::PumpEnd::Ended) {
+            warn!(detail = %detail, "麦克风转接非正常结束");
+        }
+        notify_end(H2C::MicState { running: false, codec: String::new(), detail });
+        info!(
+            bytes = bytes,
+            frames = st.frames.load(Relaxed),
+            pcm = st.pcm_bytes.load(Relaxed),
+            played = st.played_bytes.load(Relaxed),
+            peak = st.peak.load(Relaxed),
+            "麦克风转接收尾"
+        );
+    });
     let pump = tokio::task::spawn_blocking(move || {
-        let end = playback::pump(
+        playback::pump(
             &ffmpeg,
             rx,
             player,
@@ -133,8 +160,8 @@ pub async fn run(
             Box::new(move || {
                 let _ = ready_tx.send(());
             }),
-        );
-        (end, st_pump)
+            on_end,
+        )
     });
 
     // 解码器真的起来了才算 running:true（pump 在 spawn 成功后发这一格）。
@@ -158,63 +185,28 @@ pub async fn run(
         });
     }
 
+    // 正常路径下这里能 await 到；被 abort 也无妨 —— 回话与账目已由 on_end
+    // 在阻塞线程里落完（那才是这套收尾的真正责任人）。
     let t0 = std::time::Instant::now();
-    let (end, stats) = match pump.await {
-        Ok(v) => v,
+    let end = match pump.await {
+        Ok(e) => e,
         Err(e) => {
             warn!(error = %e, "麦克风转接的播放任务崩了");
             reader.abort();
-            notify(H2C::MicState {
-                running: false,
-                codec: String::new(),
-                detail: format!("播放任务崩溃：{e}"),
-            });
             return MicReport::default();
         }
     };
     let _ = reader.await;
-
+    use std::sync::atomic::Ordering::Relaxed;
     let report = MicReport {
-        bytes: stats.ogg_bytes.load(std::sync::atomic::Ordering::Relaxed),
-        frames: stats.frames.load(std::sync::atomic::Ordering::Relaxed),
+        bytes: stats.ogg_bytes.load(Relaxed),
+        frames: stats.frames.load(Relaxed),
         seconds: t0.elapsed().as_secs_f64().round() as u64,
-        pcm: stats.pcm_bytes.load(std::sync::atomic::Ordering::Relaxed),
-        played: stats.played_bytes.load(std::sync::atomic::Ordering::Relaxed),
-        peak: stats.peak.load(std::sync::atomic::Ordering::Relaxed),
+        pcm: stats.pcm_bytes.load(Relaxed),
+        played: stats.played_bytes.load(Relaxed),
+        peak: stats.peak.load(Relaxed),
     };
-    match &end {
-        playback::PumpEnd::Ended => {
-            notify(H2C::MicState {
-                running: false,
-                codec: String::new(),
-                detail: format!("麦克风流结束（本机收到 {} 字节）", report.bytes),
-            });
-        }
-        playback::PumpEnd::DecoderGone(why) => {
-            warn!(error = %why, "麦克风转接的解码器起不来");
-            notify(H2C::MicState {
-                running: false,
-                codec: String::new(),
-                detail: format!("本机解码器起不来：{why}"),
-            });
-        }
-        playback::PumpEnd::SinkGone(why) => {
-            warn!(error = %why, "麦克风转接的播放后端中断");
-            notify(H2C::MicState {
-                running: false,
-                codec: String::new(),
-                detail: format!("本机播放中断：{why}"),
-            });
-        }
-    }
-    info!(
-        bytes = report.bytes,
-        frames = report.frames,
-        pcm = report.pcm,
-        played = report.played,
-        peak = report.peak,
-        "麦克风转接收尾"
-    );
+    debug!(?end, "麦克风转接 run 收尾");
     report
 }
 
