@@ -109,10 +109,11 @@ if want:
 sys.exit(1 if live else 0)
 PY
 
-SERVER_PID=""; HOST_PID=""
+SERVER_PID=""; HOST_PID=""; HOST2_PID=""
 cleanup() {
   [ -n "$HOST_PID" ] && kill "$HOST_PID" 2>/dev/null
   [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
+  [ -n "$HOST2_PID" ] && kill "$HOST2_PID" 2>/dev/null
   return 0
 }
 trap cleanup EXIT
@@ -197,6 +198,46 @@ VFIRST=$(grep -o "首帧延迟   : [0-9]*" "$WORK/client.plain" | tail -1 | tr -
 echo "  画面：解出 ${VFRAME:-?} 帧 / 丢帧 ${VDROP:-?} / 首帧 ${VFIRST:-?} ms"
 [ "${VFRAME:-0}" -gt 20 ] && ok "开音频的同会话画面照出（${VFRAME} 帧）" || bad "画面只有 ${VFRAME:-0} 帧"
 [ "${VDROP:-1}" -eq 0 ] && ok "解码丢帧 0" || bad "解码丢帧 $VDROP"
+
+echo "== 6. 反例：播放进程当场死掉时，会话不许跟着挂死 =="
+# 把 ALSA 的配置指到一个不存在的文件：aplay 一启动就退出（真机实测第一笔写入就 broken pipe）。
+# 这条反例在 2026-11-17 夜批抓到一个真 bug —— play_loop 原来直接 break，于是 ffmpeg 卡在写
+# stdout（没人读了）、喂字节的线程卡在写它的 stdin，`feeder.join()` 永远不返回；
+# spawn_blocking 的任务不结束，tokio 运行时收尾一直等它 → 整个控制端挂住不退出、统计一个字没打。
+# 被控端是 --once（一轮会话就退），所以这里另起一台测试台被控端。
+RUST_LOG=info "$HOST" --server "127.0.0.1:$PORT" --config "$WORK/host2.json" \
+  --capture "lavfi:testsrc2=size=640x480:rate=15" \
+  --audio-source "lavfi:sine=frequency=440:sample_rate=48000" \
+  --name neg-host --once >"$WORK/host2.log" 2>&1 &
+HOST2_PID=$!
+DEV2=""
+for _ in $(seq 1 200); do
+  DEV2=$(grep -oE "设备 ID : [0-9]{6,}" "$WORK/host2.log" 2>/dev/null | tail -1 | sed 's/.*: *//' | tr -d '[:space:]')
+  [ -n "$DEV2" ] && break
+  sleep 0.1
+done
+sed -n 's/.*"password": *"\([^"]*\)".*/\1/p' "$WORK/host2.json" | head -1 > "$WORK/pw2.txt"
+[ -n "$DEV2" ] && [ -s "$WORK/pw2.txt" ] || env_out "反例用的第二台被控端没起来"
+ALSA_CONFIG_PATH=/nonexistent/alsa.conf RUST_LOG=info NO_COLOR=1 \
+  timeout 45 "$CLI" --server "127.0.0.1:$PORT" --device "$DEV2" \
+  --password-file "$WORK/pw2.txt" --headless --seconds "$RUN_SECS" \
+  --no-input --no-clipboard --audio >"$WORK/neg.log" 2>&1
+NRC=$?
+sed -E 's/\x1b\[[0-9;]*m//g' "$WORK/neg.log" > "$WORK/neg.plain"
+echo "  反例退出码：$NRC（124 = 被 timeout 砍掉 = 挂死）"
+if grep -qE "播放后端写入失败|打不开音频输出设备" "$WORK/neg.plain"; then
+  ok "反例确实把播放侧弄坏了：$(grep -oE '播放后端写入失败.*|打不开音频输出设备.*' "$WORK/neg.plain" | head -1 | cut -c1-110)"
+  if [ "$NRC" -eq 124 ]; then
+    bad "控制端挂死：播放进程一死，整条会话退不出来"
+  else
+    ok "会话照常规收尾（退出码 $NRC，不是 124）"
+  fi
+  grep -q "统计" "$WORK/neg.plain" \
+    && ok "收工统计打得出来（真挂死时这里一个字都没有）" \
+    || bad "没有收工统计 = 收尾根本没走到"
+else
+  skip "这台机器没能把播放侧弄坏（ALSA_CONFIG_PATH 不生效），反例没构造成功 —— 不作为通过证据"
+fi
 
 echo
 echo "结论：$PASS 通过 / $FAIL 失败 / $SKIP 跳过（工作目录 $WORK）"

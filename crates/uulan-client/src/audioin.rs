@@ -252,12 +252,18 @@ fn play_loop(
     });
 
     // 主线程读 PCM 并播放。
+    // died_early：播放后端坏了或读 PCM 出错 —— 与「解码器把这一路放完了」是两回事，
+    // 收尾动作不同（见下面 kill 那段）。
+    let mut died_early = false;
     let mut pcm = vec![0u8; 8192];
     loop {
         let n = match dout.read(&mut pcm) {
             Ok(0) => break,
             Ok(n) => n,
-            Err(_) => break,
+            Err(_) => {
+                died_early = true;
+                break;
+            }
         };
         stats.pcm_bytes.fetch_add(n as u64, Ordering::Relaxed);
         // 峰值：s16le 小端，两字节一个样本。
@@ -272,13 +278,24 @@ fn play_loop(
         if peak as u64 > cur {
             stats.peak.store(peak as u64, Ordering::Relaxed);
         }
-        if out.write(&pcm[..n]).is_err() {
+        if let Err(e) = out.write(&pcm[..n]) {
             stats.errors.fetch_add(1, Ordering::Relaxed);
+            // 原因必须落日志：只加计数就 break，现场分不清是播放器退了、管道被抢、还是声卡没了
+            // （与剪贴板那条教训同族：「少了 N 个」要能说清是谁拒的）。
+            warn!(error = %e, "播放后端写入失败，本机出声到此中断（解码与统计照常收尾）");
+            died_early = true;
             break;
         }
         stats.played_bytes.fetch_add(n as u64, Ordering::Relaxed);
     }
 
+    // 播放侧提前死了必须先杀解码器，否则这里会**永久挂住**：ffmpeg 卡在写 stdout（没人读了），
+    // 喂字节的线程卡在写它的 stdin，`feeder.join()` 就永远不返回；而 spawn_blocking 的任务不结束，
+    // tokio 运行时的收尾会一直等它 —— 表现是整个控制端不退出、统计一个字都没打出来。
+    // 2026-11-17 夜批用「ALSA 配置指坏 → aplay 当场退出」这个反例在真麒麟上抓到过这条。
+    if died_early {
+        let _ = child.kill();
+    }
     let _ = feeder.join();
     out.finish();
     let _ = child.wait();
@@ -485,9 +502,20 @@ impl PipeOut {
 #[cfg(not(windows))]
 impl Out for PipeOut {
     fn write(&mut self, pcm: &[u8]) -> std::io::Result<()> {
-        match self.stdin.as_mut() {
-            Some(s) => s.write_all(pcm),
-            None => Err(std::io::Error::other("播放后端已经关掉了")),
+        let Some(s) = self.stdin.as_mut() else {
+            return Err(std::io::Error::other("播放后端已经关掉了"));
+        };
+        match s.write_all(pcm) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // io 错误本身只会说 broken pipe —— 现场要看的是子进程到底是死了还是还活着。
+                let why = match self.child.try_wait() {
+                    Ok(Some(st)) => format!("播放进程已退出（{st}）"),
+                    Ok(None) => "播放进程仍在跑".to_string(),
+                    Err(q) => format!("问不到播放进程的状态（{q}）"),
+                };
+                Err(std::io::Error::other(format!("{e}；{why}")))
+            }
         }
     }
 
