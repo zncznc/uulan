@@ -10,6 +10,7 @@
 //! 两侧都只跟管道打交道，不依赖 X11、也不依赖窗口系统，所以能在任何平台上端到端测。
 
 pub mod annexb;
+pub mod playback;
 pub mod decode;
 pub mod ffmpeg;
 pub mod source;

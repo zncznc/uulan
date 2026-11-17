@@ -101,6 +101,12 @@ struct Args {
     audio: bool,
     /// 把收到的声音落成 WAV 文件（`--audio-save`）。无人值守验收靠它给证据。
     audio_save: Option<PathBuf>,
+    /// 麦克风转接（`--mic`）：把本机的声音送到对面、从**被控端**的音箱放出来。
+    mic: bool,
+    /// 显式钉死采集源（`--mic-source`：`pulse:` / `dshow:` / `lavfi:`）。隐含 `--mic`。
+    mic_source: Option<String>,
+    /// 上行 Opus 码率 kbps（`--mic-bitrate`；0 = 默认 64）。隐含 `--mic`。
+    mic_bitrate: u32,
 }
 
 const HELP: &str = "\
@@ -125,6 +131,10 @@ uulan-client —— uulan 内网远控的控制端
   --audio             接收被控端的声音（PulseAudio monitor → Opus），本机实时播放
                       （Windows 用 waveOut；其它平台把 PCM 交给 aplay；都不行时 --audio-save 仍可取证）
   --audio-save <path> 把声音存成 WAV（同时隐含 --audio；无人值守验收用）
+  --mic               麦克风转接：本机的声音送到对面、从被控端的音箱放出来
+                      （Windows 默认取 DirectShow 第一个录音设备；麒麟等 unix 用 pulse:default）
+  --mic-source <源>   显式钉死采集源（pulse:<设备> / dshow:<设备> / lavfi:<表达式>；隐含 --mic）
+  --mic-bitrate <k>   上行 Opus 码率 kbps，16..256（隐含 --mic）
   --no-input          只读模式：不上报键鼠（排障、旁观时用）
   --no-clipboard      不同步剪贴板（不希望本机剪贴板被对面改写时用）
   --json              以 JSON 输出（--headless 的统计 / --devices 的设备目录 / --terms 的会话清单）
@@ -232,6 +242,9 @@ fn parse_args() -> Result<Args> {
         scale: None,
         audio: false,
         audio_save: None,
+        mic: false,
+        mic_source: None,
+        mic_bitrate: 0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -260,6 +273,16 @@ fn parse_args() -> Result<Args> {
             "--headless" => a.headless = true,
             "--capture" => a.capture = true,
             "--audio" => a.audio = true,
+            "--mic" => a.mic = true,
+            "--mic-source" => {
+                a.mic_source = Some(it.next().context("--mic-source 需要一个源（pulse:/dshow:/lavfi:）")?);
+                // 给了源就是要转接 —— 别让「忘了 --mic」变成「安静地什么都没做」。
+                a.mic = true;
+            }
+            "--mic-bitrate" => {
+                a.mic_bitrate = it.next().unwrap_or_default().parse().context("--mic-bitrate 要数字（kbps）")?;
+                a.mic = true;
+            }
             "--audio-save" => {
                 a.audio_save = Some(PathBuf::from(it.next().context("--audio-save 需要一个路径")?));
                 // 只要落盘就是「要声音」，否则用户以为给了路径就会有文件。
@@ -1054,6 +1077,10 @@ async fn main() -> Result<()> {
         },
         audio_stats: std::sync::Arc::new(uulan_client::audioin::AudioStats::default()),
         audio_watch: std::sync::Arc::new(uulan_client::audioin::AudioWatch::default()),
+        mic: if args.mic { Some(args.mic_bitrate) } else { None },
+        mic_source: args.mic_source.clone(),
+        mic_stats: std::sync::Arc::new(uulan_client::audioin::AudioStats::default()),
+        mic_watch: std::sync::Arc::new(uulan_client::audioin::AudioWatch::default()),
     };
 
     // ── 窗口模式 ──────────────────────────────────────────────────────────
@@ -1621,6 +1648,21 @@ async fn run_headless(
             println!(
                 "  {}",
                 plan.audio_watch.summary(plan.audio_stats.got_bytes())
+            );
+        }
+        // 麦克风转接（上行）。got_bytes 传的是**本机送出**的口径 —— 但 summary 里那句
+        // 「本机一个字节都没收到」是下行措辞，上行不适用（对面结束时的字节数在它回话的
+        // detail 里原样带着），所以这里固定传 true，由下面自己的「上行」行给字节数。
+        if plan.mic.is_some() {
+            use std::sync::atomic::Ordering::Relaxed;
+            println!(
+                "  麦克风     : 上行 {} 帧 / {} 字节",
+                plan.mic_stats.frames.load(Relaxed),
+                plan.mic_stats.ogg_bytes.load(Relaxed)
+            );
+            println!(
+                "  {}",
+                plan.mic_watch.summary_labeled("麦克风状态", true)
             );
         }
         // 画面为什么停：优先搬被控端**自己说的那句**，它没说才退到本机推断，并明说是推断。

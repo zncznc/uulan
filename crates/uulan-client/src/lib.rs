@@ -13,6 +13,7 @@
 
 pub mod audioin;
 pub mod capture;
+pub mod micin;
 pub mod connect;
 pub mod control;
 pub mod forward;

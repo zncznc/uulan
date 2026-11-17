@@ -107,6 +107,14 @@ pub struct HostConfig {
     #[serde(default)]
     pub audio_source: Option<String>,
 
+    /// 麦克风转接（M7 上行，`C2H::MicStart`）：本机把收到的声音送到哪儿。
+    ///
+    /// 有效值只有 `speaker`（默认：`aplay` → 系统声卡）与 `null`（解码后丢弃，**验收台
+    /// 专用**）。拼错词直接让服务起不来 —— 与 `power_allow` 同一条纪律：「配了 null
+    /// 却被当成 speaker」或反过来，现场都查不出来。
+    #[serde(default = "default_mic_sink")]
+    pub mic_sink: String,
+
     /// 电源动作放行名单（`C2H::Power`，M4 补格 2026-11-16）。空 = **全部拒绝**（默认）。
     ///
     /// 有效值 `lock` / `logout` / `reboot` / `shutdown`，或 `*` 全放行；拼错词直接
@@ -121,6 +129,12 @@ pub struct HostConfig {
     /// （与 `audio_source` 的 `lavfi:` 合成源同一思路）。**生产配置不要写它。**
     #[serde(default)]
     pub power_test_program: Option<String>,
+}
+
+/// 麦克风转接的落点默认值。生产语义（`speaker`）写在这里，
+/// 合法词表只有一份 —— 在 `crate::mic::parse_sink`。
+fn default_mic_sink() -> String {
+    "speaker".into()
 }
 
 fn default_true() -> bool {
@@ -173,6 +187,7 @@ impl Default for HostConfig {
             portmap_allow: Vec::new(),
             term_shell: None,
             audio_source: None,
+            mic_sink: default_mic_sink(),
             power_allow: Vec::new(),
             power_test_program: None,
         }
@@ -228,6 +243,9 @@ impl HostConfig {
         }
         if !(1..=144).contains(&self.fps) {
             return Err(ConfigError::Empty(format!("fps={} 超出 1..=144", self.fps)));
+        }
+        if let Err(e) = crate::mic::parse_sink(&self.mic_sink) {
+            return Err(ConfigError::MicSink(e));
         }
         if let Err(e) = crate::power::parse_allow(&self.power_allow) {
             return Err(ConfigError::Power(e));
@@ -455,6 +473,8 @@ pub enum ConfigError {
     Empty(String),
     #[error("power_allow 有误: {0}")]
     Power(String),
+    #[error("mic_sink 有误: {0}")]
+    MicSink(String),
 }
 
 #[cfg(test)]

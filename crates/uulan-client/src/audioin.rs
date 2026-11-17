@@ -3,7 +3,12 @@
 //! ## 分工
 //!
 //! - 异步侧：从 `SecReadHalf` 读 `Blob` 帧，塞进一条 std 通道（有界，反压到 socket）；
-//! - 阻塞侧（`spawn_blocking`）：喂解码器、取 PCM、写播放后端。
+//! - 阻塞侧（`spawn_blocking`）：交给 `uulan_media::playback::pump` ——
+//!   喂解码器、取 PCM、写播放后端。
+//!
+//! 2026-11-18 起「解码 + 播放」这一半**与被控端的麦克风转接共用**
+//! （`crates/uulan-media/src/playback.rs`）：两端做的是同一件事，真麒麟上实测出来的
+//! 纪律（paplay 不吃 raw、尾巴收尾、播放侧先死必须先杀解码器）只留一份副本。
 //!
 //! 为什么解码放在阻塞线程里：播放本身就是阻塞的（`waveOutWrite` 要等缓冲放完），
 //! 把它塞进 tokio worker 会占住调度器；而 tokio 的进程 API 与 std 的混用又会多出
@@ -12,73 +17,29 @@
 //! ## 平台
 //!
 //! - Windows：`waveOut`（winmm，手写 FFI —— 与 `termx::wincon` 同样的理由，不引 windows-sys 特性）。
-//! - 其它平台：把裸 PCM 原样灌进一个播放命令的 stdin（候选见 [`player_candidates`]）。
-//!   2026-11-17 在真麒麟上验通：控制端播出来的声音被 `parecord` 从信宿的 monitor 录回来，
-//!   440 Hz 仍然是主角。
+//! - 其它平台：把裸 PCM 原样灌进一个播放命令的 stdin（候选见
+//!   `uulan_media::playback::player_candidates`）。2026-11-17 在真麒麟上验通：控制端播出来的
+//!   声音被 `parecord` 从信宿的 monitor 再录回来，440 Hz 仍然是主角。
 //! - **挑的是 `aplay` 而不是 `paplay`，这是实测出来的**：这台麒麟的 paplay（PulseAudio 13.99）
 //!   只吃 libsndfile 认得的文件，喂 raw 一律「打开声音文件失败」（退出码 1）；而 ALSA 的 default
 //!   本来就经 pulse 插件落到同一个信宿 —— 录回来的波形证明了这条路由，不是想当然。
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::Mutex;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
+use uulan_media::playback::{self, Counters, PcmSink};
 use uulan_protocol::crypto::SecReadHalf;
 use uulan_protocol::frame::{read_frame, FrameKind};
 
-/// 采样率/声道：解码器与播放器都按这套参数，改一处就要两处一起改。
-pub const SAMPLE_RATE: u32 = 48_000;
-pub const CHANNELS: u16 = 2;
+/// 采样率/声道：与被控端上行、共享播放层同一组常量（只在一处定义）。
+pub use uulan_media::playback::{CHANNELS, SAMPLE_RATE};
 
-/// 收尾时给播放命令的宽限：先把缓冲里的尾巴放完，超时才 kill。
-#[cfg(not(windows))]
-const PIPE_FINISH_MS: u64 = 1500;
-
-/// 音频统计。窗口模式与 headless 都在收工时打这一行 —— 「有没有声音」唯一可 grep 的证据。
-#[derive(Debug, Default)]
-pub struct AudioStats {
-    /// 从 audio 通道收到的 Ogg 字节数。
-    pub ogg_bytes: AtomicU64,
-    /// 收到的帧数。
-    pub frames: AtomicU64,
-    /// 解码出来的 PCM 字节数（s16le 立体声 48 kHz，192000 B/s）。
-    pub pcm_bytes: AtomicU64,
-    /// 播放后端写出去的字节数。`--audio-save` 时与 `pcm_bytes` 相等。
-    pub played_bytes: AtomicU64,
-    /// 解码/播放出错次数。
-    pub errors: AtomicU64,
-    /// 峰值电平（0..=32767 的绝对值最大值），用来区分「有流但全是静音」。
-    pub peak: AtomicU64,
-}
-
-impl AudioStats {
-    pub fn pcm_seconds(&self) -> f64 {
-        self.pcm_bytes.load(Ordering::Relaxed) as f64 / (SAMPLE_RATE as f64 * CHANNELS as f64 * 2.0)
-    }
-
-    /// 本机到底收到过音频字节没有。用来把「对面推完了/结束了」与
-    /// 「对面说在推、其实一个字节都没到」分开 —— 两者在统计行上不能长一个样。
-    pub fn got_bytes(&self) -> bool {
-        self.ogg_bytes.load(Ordering::Relaxed) > 0
-    }
-
-    /// 一行给人看的总结。
-    pub fn summary(&self) -> String {
-        format!(
-            "音频：收到 {} 帧 / {} 字节 → 解出 {:.1} 秒 PCM（峰值 {}，播放 {} 字节，错误 {}）",
-            self.frames.load(Ordering::Relaxed),
-            self.ogg_bytes.load(Ordering::Relaxed),
-            self.pcm_seconds(),
-            self.peak.load(Ordering::Relaxed),
-            self.played_bytes.load(Ordering::Relaxed),
-            self.errors.load(Ordering::Relaxed),
-        )
-    }
-}
+/// 共享层的计数就是本端的 `AudioStats`（字段名与统计措辞自 2026-11-15 起不变，
+/// 脚本 grep 的就是 `Counters::summary` 那句话）。
+pub type AudioStats = Counters;
 
 /// 从哪儿出声。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,7 +53,7 @@ pub enum Sink {
 /// 一条音频接收任务。
 ///
 /// `Drop` 会 abort 异步侧；阻塞侧由 `spawn_blocking` 的句柄 abort（它会在下一个
-/// 检查点退出，解码器进程 `kill_on_drop`）。
+/// 检查点退出，解码器进程随线程收尾一并收掉）。
 pub struct AudioIn {
     stats: Arc<AudioStats>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -152,8 +113,7 @@ pub fn start(
                     if n == 0 {
                         continue;
                     }
-                    st_in.frames.fetch_add(1, Ordering::Relaxed);
-                    st_in.ogg_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    st_in.add_frame(n);
                     if tx.send(f.payload.to_vec()).is_err() {
                         break;
                     }
@@ -167,153 +127,49 @@ pub fn start(
 
     let st_out = stats.clone();
     let player = tokio::task::spawn_blocking(move || {
-        play_loop(&ffmpeg, sink, rx, st_out, watch);
+        let out: Box<dyn PcmSink> = match &sink {
+            Sink::Wav(p) => match WavOut::create(p) {
+                Ok(w) => Box::new(w),
+                Err(e) => {
+                    warn!(error = %e, path = %p.display(), "打不开录音文件，改为丢弃");
+                    Box::new(playback::NullSink)
+                }
+            },
+            Sink::Speaker => match speaker() {
+                Ok(s) => s,
+                Err(e) => {
+                    // 没有声卡/被占用时不要整条链路跟着死：继续解码，只是不出声。
+                    warn!(error = %e, "打不开音频输出设备（只解码，不播放）");
+                    Box::new(playback::NullSink)
+                }
+            },
+        };
+        match playback::pump(&ffmpeg, rx, out, &st_out, Box::new(|| {})) {
+            playback::PumpEnd::DecoderGone(why) => {
+                // 本机连解码器都起不来 → 记一笔，由会话那边的看门狗发 `C2H::AudioStop`：
+                // 再让被控端一路编码下去只是白吃 CPU 与带宽，而这边永远不会有声音。
+                watch.note_local_failure(&format!("本机音频解码器起不来：{why}"));
+            }
+            playback::PumpEnd::SinkGone(why) => {
+                // 原因由 pump 里 warn 过；这里只把它带进状态机，收工统计看得见。
+                watch.note_local_failure(&format!("本机播放中断：{why}"));
+            }
+            playback::PumpEnd::Ended => {}
+        }
     });
 
     AudioIn { stats, tasks: vec![reader, player] }
 }
 
-/// ffmpeg 解码参数：Ogg → s16le 裸 PCM。
-fn decode_args() -> Vec<String> {
-    vec![
-        "-hide_banner".into(),
-        "-loglevel".into(),
-        "error".into(),
-        "-nostdin".into(),
-        "-f".into(),
-        "ogg".into(),
-        "-i".into(),
-        "pipe:0".into(),
-        "-f".into(),
-        "s16le".into(),
-        "-ar".into(),
-        SAMPLE_RATE.to_string(),
-        "-ac".into(),
-        CHANNELS.to_string(),
-        "pipe:1".into(),
-    ]
+/// 按平台挑实时播放后端。
+#[cfg(windows)]
+fn speaker() -> Result<Box<dyn PcmSink>, String> {
+    Ok(Box::new(winmm::WaveOut::open()?))
 }
 
-/// 阻塞侧：喂字节 → 取 PCM → 写后端。
-fn play_loop(
-    ffmpeg: &std::path::Path,
-    sink: Sink,
-    rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    stats: Arc<AudioStats>,
-    watch: Arc<AudioWatch>,
-) {
-    let mut child = match std::process::Command::new(ffmpeg)
-        .args(decode_args())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, "音频解码器启动失败");
-            stats.errors.fetch_add(1, Ordering::Relaxed);
-            // 本机连解码器都起不来 → 记一笔，由会话那边的看门狗发 `C2H::AudioStop`：
-            // 再让被控端一路编码下去只是白吃 CPU 与带宽，而这边永远不会有声音。
-            watch.note_local_failure(&format!("本机音频解码器起不来：{e}"));
-            return;
-        }
-    };
-    let mut din = child.stdin.take().expect("piped stdin");
-    let mut dout = child.stdout.take().expect("piped stdout");
-
-    let mut out: Box<dyn Out> = match &sink {
-        Sink::Wav(p) => match WavOut::create(p) {
-            Ok(w) => Box::new(w),
-            Err(e) => {
-                warn!(error = %e, path = %p.display(), "打不开录音文件，改为丢弃");
-                Box::new(NullOut)
-            }
-        },
-        Sink::Speaker => match speaker() {
-            Ok(s) => s,
-            Err(e) => {
-                // 没有声卡/被占用时不要整条链路跟着死：继续解码，只是不出声。
-                warn!(error = %e, "打不开音频输出设备（只解码，不播放）");
-                Box::new(NullOut)
-            }
-        },
-    };
-
-    // 喂字节的线程：`din.write_all` 阻塞，正好由它承担反压。
-    let feeder = std::thread::spawn(move || {
-        while let Ok(chunk) = rx.recv() {
-            if din.write_all(&chunk).is_err() {
-                break;
-            }
-        }
-        // 关掉 stdin 让 ffmpeg 把缓冲区里剩下的解码完 —— 不关的话最后几十毫秒会丢。
-        let _ = din.flush();
-    });
-
-    // 主线程读 PCM 并播放。
-    // died_early：播放后端坏了或读 PCM 出错 —— 与「解码器把这一路放完了」是两回事，
-    // 收尾动作不同（见下面 kill 那段）。
-    let mut died_early = false;
-    let mut pcm = vec![0u8; 8192];
-    loop {
-        let n = match dout.read(&mut pcm) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(_) => {
-                died_early = true;
-                break;
-            }
-        };
-        stats.pcm_bytes.fetch_add(n as u64, Ordering::Relaxed);
-        // 峰值：s16le 小端，两字节一个样本。
-        let mut peak = 0u32;
-        for pair in pcm[..n].chunks_exact(2) {
-            let v = i16::from_le_bytes([pair[0], pair[1]]).unsigned_abs() as u32;
-            if v > peak {
-                peak = v;
-            }
-        }
-        let cur = stats.peak.load(Ordering::Relaxed);
-        if peak as u64 > cur {
-            stats.peak.store(peak as u64, Ordering::Relaxed);
-        }
-        if let Err(e) = out.write(&pcm[..n]) {
-            stats.errors.fetch_add(1, Ordering::Relaxed);
-            // 原因必须落日志：只加计数就 break，现场分不清是播放器退了、管道被抢、还是声卡没了
-            // （与剪贴板那条教训同族：「少了 N 个」要能说清是谁拒的）。
-            warn!(error = %e, "播放后端写入失败，本机出声到此中断（解码与统计照常收尾）");
-            died_early = true;
-            break;
-        }
-        stats.played_bytes.fetch_add(n as u64, Ordering::Relaxed);
-    }
-
-    // 播放侧提前死了必须先杀解码器，否则这里会**永久挂住**：ffmpeg 卡在写 stdout（没人读了），
-    // 喂字节的线程卡在写它的 stdin，`feeder.join()` 就永远不返回；而 spawn_blocking 的任务不结束，
-    // tokio 运行时的收尾会一直等它 —— 表现是整个控制端不退出、统计一个字都没打出来。
-    // 2026-11-17 夜批用「ALSA 配置指坏 → aplay 当场退出」这个反例在真麒麟上抓到过这条。
-    if died_early {
-        let _ = child.kill();
-    }
-    let _ = feeder.join();
-    out.finish();
-    let _ = child.wait();
-    info!(pcm = stats.pcm_bytes.load(Ordering::Relaxed), "音频解码结束");
-}
-
-trait Out: Send {
-    fn write(&mut self, pcm: &[u8]) -> std::io::Result<()>;
-    fn finish(&mut self) {}
-}
-
-/// 不出声的后端：没有声卡 / 没实现实时播放时用它，解码链路照跑（统计仍然有意义）。
-struct NullOut;
-
-impl Out for NullOut {
-    fn write(&mut self, _pcm: &[u8]) -> std::io::Result<()> {
-        Ok(())
-    }
+#[cfg(not(windows))]
+fn speaker() -> Result<Box<dyn PcmSink>, String> {
+    playback::pipe_speaker()
 }
 
 /// WAV 落盘。头里的长度先写占位，`finish` 时按实际字节数回填。
@@ -337,7 +193,7 @@ impl WavOut {
     }
 }
 
-impl Out for WavOut {
+impl PcmSink for WavOut {
     fn write(&mut self, pcm: &[u8]) -> std::io::Result<()> {
         self.f.write_all(pcm)?;
         self.data += pcm.len() as u64;
@@ -351,7 +207,7 @@ impl Out for WavOut {
             let _ = self.f.write_all(&wav_header(self.data));
             let _ = self.f.flush();
         }
-        info!(bytes = self.data, "音频已写入 WAV");
+        tracing::info!(bytes = self.data, "音频已写入 WAV");
     }
 }
 
@@ -372,177 +228,6 @@ fn wav_header(data_len: u64) -> Vec<u8> {
     h.extend_from_slice(b"data");
     h.extend_from_slice(&data_len.to_le_bytes());
     h
-}
-
-/// 按平台挑实时播放后端。
-#[cfg(windows)]
-fn speaker() -> Result<Box<dyn Out>, String> {
-    Ok(Box::new(winmm::WaveOut::open()?))
-}
-
-#[cfg(not(windows))]
-fn speaker() -> Result<Box<dyn Out>, String> {
-    let dirs: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect())
-        .unwrap_or_default();
-    let mut tried = Vec::new();
-    for cand in player_candidates() {
-        let Some(found) = find_in_path(cand.program, &dirs) else {
-            tried.push(format!("{}（不在 PATH）", cand.program));
-            continue;
-        };
-        match PipeOut::open(&cand, &found) {
-            Ok(o) => {
-                // 这行是「本机到底有没有出声」唯一可 grep 的证据：统计里那个播放字节数只说明
-                // 字节写进了管道，而管道能一声不响地吞掉一整晚。
-                info!(program = %cand.program, rate = SAMPLE_RATE, channels = CHANNELS,
-                      "实时播放已接上");
-                return Ok(Box::new(o));
-            }
-            Err(e) => tried.push(format!("{}：{}", cand.program, e)),
-        }
-    }
-    Err(format!(
-        "这台机器上没能起任何一个播放命令（{}）—— 用 --audio-save 落成 WAV 仍可验收",
-        tried.join(" / ")
-    ))
-}
-
-/// 一个实时播放候选：命令名 + 完整参数（参数里已经钉死采样格式）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlayerCandidate {
-    pub program: &'static str,
-    pub args: Vec<String>,
-}
-
-/// 候选表。**只列实测过能吃 raw stdin 的命令**：`paplay` 在这台麒麟上明确不行（见模块头），
-/// `pw-play` 手边没有 PipeWire 机器可验 —— 写进来就是拿没验证过的东西去抢播放顺序。
-///
-/// 为什么它是纯函数：参数错一个字符，现场的表现是「流在动、统计在涨、一声不响」，
-/// 那是最难查的一类故障，所以两个平台的单测都得能钉住这张表。
-pub fn player_candidates() -> Vec<PlayerCandidate> {
-    vec![PlayerCandidate {
-        program: "aplay",
-        // raw 模式必须把格式说全：少了任何一项，ALSA 要么当场报错退出，要么按错的规格播。
-        args: vec![
-            "-q".into(),
-            "-t".into(),
-            "raw".into(),
-            "-f".into(),
-            "S16_LE".into(),
-            "-c".into(),
-            CHANNELS.to_string(),
-            "-r".into(),
-            SAMPLE_RATE.to_string(),
-            "-".into(),
-        ],
-    }]
-}
-
-/// 按 PATH 的顺序找可执行文件；「算不算可执行」由调用方给，单测因此不碰磁盘。
-pub fn find_in_path_with(
-    name: &str,
-    dirs: &[PathBuf],
-    is_exe: impl Fn(&std::path::Path) -> bool,
-) -> Option<PathBuf> {
-    dirs.iter().find_map(|d| {
-        let p = d.join(name);
-        if is_exe(&p) {
-            Some(p)
-        } else {
-            None
-        }
-    })
-}
-
-/// 生产入口：拿真实文件系统的答案。
-pub fn find_in_path(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
-    find_in_path_with(name, dirs, |p| is_executable(p))
-}
-
-#[cfg(unix)]
-fn is_executable(p: &std::path::Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_executable(p: &std::path::Path) -> bool {
-    std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)
-}
-
-/// unix 实时播放：PCM 原样进子进程的 stdin。
-///
-/// 反压靠子进程本身 —— `write_all` 阻塞在它没读完的时候，正是「能等就别丢字节」
-/// （与 Windows 那条 `waveOutWrite` 等缓冲放完同理，也和被控端 PTY 那侧一致）。
-#[cfg(not(windows))]
-struct PipeOut {
-    program: String,
-    child: std::process::Child,
-    stdin: Option<std::process::ChildStdin>,
-}
-
-#[cfg(not(windows))]
-impl PipeOut {
-    fn open(cand: &PlayerCandidate, program_path: &std::path::Path) -> Result<Self, String> {
-        let mut child = std::process::Command::new(program_path)
-            .args(&cand.args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| format!("{}", e))?;
-        let stdin = child.stdin.take().ok_or_else(|| "拿不到 stdin".to_string())?;
-        Ok(PipeOut { program: cand.program.into(), child, stdin: Some(stdin) })
-    }
-}
-
-#[cfg(not(windows))]
-impl Out for PipeOut {
-    fn write(&mut self, pcm: &[u8]) -> std::io::Result<()> {
-        let Some(s) = self.stdin.as_mut() else {
-            return Err(std::io::Error::other("播放后端已经关掉了"));
-        };
-        match s.write_all(pcm) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // io 错误本身只会说 broken pipe —— 现场要看的是子进程到底是死了还是还活着。
-                let why = match self.child.try_wait() {
-                    Ok(Some(st)) => format!("播放进程已退出（{st}）"),
-                    Ok(None) => "播放进程仍在跑".to_string(),
-                    Err(q) => format!("问不到播放进程的状态（{q}）"),
-                };
-                Err(std::io::Error::other(format!("{e}；{why}")))
-            }
-        }
-    }
-
-    fn finish(&mut self) {
-        // 先关 stdin，让播放器把缓冲里的尾巴放完自己退出；直接 kill 会切掉最后一句。
-        self.stdin = None;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(PIPE_FINISH_MS);
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
-                        let _ = self.child.kill();
-                        let _ = self.child.wait();
-                        warn!(program = %self.program, "播放命令没自己退出，宽限到点后终止（尾巴可能被切）");
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-                Err(e) => {
-                    warn!(error = %e, program = %self.program, "问不到播放命令的状态");
-                    break;
-                }
-            }
-        }
-        info!(program = %self.program, "实时播放已收尾");
-    }
 }
 
 #[cfg(windows)]
@@ -610,7 +295,7 @@ mod winmm {
     }
 
     // SAFETY: 句柄只在持有它的线程里用（播放循环是单线程），
-    // 且 `Out` 要求 Send 只是为了让 Box<dyn Out> 能在线程间移动 ——
+    // 且 `PcmSink` 要求 Send 只是为了让 Box<dyn PcmSink> 能在线程间移动 ——
     // 实际上它从创建到 drop 都在同一个阻塞线程里。
     unsafe impl Send for WaveOut {}
 
@@ -690,7 +375,7 @@ mod winmm {
         }
     }
 
-    impl super::Out for WaveOut {
+    impl super::PcmSink for WaveOut {
         fn write(&mut self, pcm: &[u8]) -> std::io::Result<()> {
             self.write_block(pcm)
         }
@@ -718,7 +403,7 @@ mod winmm {
     }
 }
 
-// ─────────────────── 被控端音频状态（`H2C::AudioState`）的观察器 ───────────────────
+// ─────────────────── 被控端音频状态（`H2C::AudioState` / `H2C::MicState`）的观察器 ───────────────────
 
 /// `C2H::AudioStart` 发出去之后，允许被控端多久一句 `AudioState` 都不回。
 ///
@@ -752,15 +437,19 @@ fn clip_detail(s: &str) -> String {
 /// ffmpeg 起不来…），而控制端以前**一条都没接** —— `control.rs` 的兜底分支把它丢了。
 /// 于是现场只看得见「没声音」，看不见「为什么没声音」：与 2026-10-31 那个
 /// 「剪贴板恒报发送 0 却查不出原因」是同一类问题（协议先行、两端未接）。
+///
+/// 2026-11-18 起同一台状态机被**麦克风转接**复用（`MicStart`/`MicState` 那一对）：
+/// 消息形状一样（running/codec/detail）、相位迁移一样，没必要再造一台。
+/// 一台观察器只管一条流：控制端为下行与上行各持有一份。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioPhase {
     /// 没要声音（没给 `--audio`）。
     Idle,
     /// 要了声音，但被控端没声明 `Cap::Audio` —— 连 `AudioStart` 都没发出去。
     Unsupported,
-    /// 已发 `AudioStart`，还没等到被控端任何一句 `AudioState`。
+    /// 已发 `AudioStart`/`MicStart`，还没等到被控端任何一句状态。
     Requested,
-    /// 被控端确认在推流。
+    /// 被控端确认在推流（下行）/ 确认在播（上行）—— 口径都是「对面的流活着」。
     Running,
     /// 从来没推起来过，被控端就明说不行（原因在 `detail`）。
     Failed,
@@ -771,6 +460,8 @@ pub enum AudioPhase {
     Stopped,
     /// `AudioStart` 发出去了，被控端**一句都没回**（版本比这条状态消息更旧）。
     Stalled,
+    /// 本机这一侧的采集没起来（麦克风转接专用）：请求根本没发出去。
+    LocalDead,
 }
 
 impl AudioPhase {
@@ -785,6 +476,7 @@ impl AudioPhase {
             Self::Ended => "被控端不再推流",
             Self::Stopped => "本机已请求停止",
             Self::Stalled => "被控端没回过音频状态（版本比这条消息更旧？）",
+            Self::LocalDead => "本机采集没起来（没发请求）",
         }
     }
 }
@@ -792,7 +484,7 @@ impl AudioPhase {
 #[derive(Debug)]
 struct Inner {
     phase: AudioPhase,
-    /// 收到过几条 `AudioState`（含内容重复的）。
+    /// 收到过几条状态消息（含内容重复的）。
     states: u64,
     /// 其中「一次都没推起来过就说不行」的条数。
     failures: u64,
@@ -827,7 +519,7 @@ impl Default for Inner {
 /// 都能在 `cargo test` 里钉住 —— 不需要真链路，更不需要真声卡。
 #[derive(Debug, Default)]
 pub struct AudioWatch {
-    inner: Mutex<Inner>,
+    inner: std::sync::Mutex<Inner>,
 }
 
 impl AudioWatch {
@@ -844,7 +536,7 @@ impl AudioWatch {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// 记一次「`AudioStart` 已经发出去了」。返回相位是否真的变了。
+    /// 记一次「`AudioStart`（或 `MicStart`）已经发出去了」。返回相位是否真的变了。
     pub fn note_requested(&self, now_ms: u64) -> bool {
         let mut w = self.lock();
         if w.phase == AudioPhase::Running {
@@ -871,7 +563,15 @@ impl AudioWatch {
         w.detail = clip_detail(why);
     }
 
-    /// 记一条被控端来的 `AudioState`。返回 `Some((从, 到))` = 相位变了，
+    /// 本机一侧的采集连启动都没启动（麦克风转接：ffmpeg 拉不起来 / 找不到设备）。
+    /// 请求**没有**发出去，所以这不是「对面起不来」，措辞必须分得开。
+    pub fn note_local_dead(&self, why: &str) {
+        let mut w = self.lock();
+        w.phase = AudioPhase::LocalDead;
+        w.detail = clip_detail(why);
+    }
+
+    /// 记一条被控端来的状态消息。返回 `Some((从, 到))` = 相位变了，
     /// 调用方只在变化时打日志（同一状态每 2 秒重复报一次会把终端刷满）。
     ///
     /// 计数口径是这一轮定下来的，写清楚免得以后被「顺手改回去」：
@@ -962,14 +662,17 @@ impl AudioWatch {
         self.lock().stop_acks
     }
 
-    /// 一行可 grep 的总结（收工统计用）。
-    ///
-    /// `got_bytes` = 本机到底收到过音频字节没有。「被控端说结束了却一字节没到」
-    /// 与「放完了」在统计行上必须分得开 —— 这正是现场最容易混的两件事。
+    /// 一行可 grep 的总结（收工统计用；下行音频的措辞自 2026-11-15 起不变）。
     pub fn summary(&self, got_bytes: bool) -> String {
+        self.summary_labeled("音频状态", got_bytes)
+    }
+
+    /// 同上，但换前缀 —— 麦克风转接那行要说「麦克风状态」，
+    /// 不能和下行音频的统计混成同一条 grep 目标。
+    pub fn summary_labeled(&self, label: &str, got_bytes: bool) -> String {
         let w = self.lock();
         let mut s = format!(
-            "音频状态 : {}（被控端回了 {} 条 / 起不来 {} 次）",
+            "{label} : {}（被控端回了 {} 条 / 起不来 {} 次）",
             w.phase.label(),
             w.states,
             w.failures
@@ -1001,34 +704,6 @@ mod tests {
 
     /// 假时钟起点。状态机的时间一律由调用方给，所以这些测试不真等 5 秒。
     const T0: u64 = 1_000;
-
-    /// 解码器吐的是什么，播放命令就得要什么 —— 一字不差。对不上的表现是「ALSA 当场退出」
-    /// 或「一声不响但统计在涨」，两种都极难在现场定位，所以这条必须被单测钉住。
-    #[test]
-    fn player_args_are_exactly_the_decoders_format() {
-        let c = player_candidates();
-        assert_eq!(c.len(), 1, "候选表里只该有实测过的那一个");
-        let a = &c[0].args;
-        let val = |flag: &str| a.iter().position(|s| s == flag).map(|i| a[i + 1].clone());
-        assert_eq!(val("-t").as_deref(), Some("raw"), "必须走 raw 模式");
-        assert_eq!(val("-f").as_deref(), Some("S16_LE"));
-        assert_eq!(val("-c").as_deref(), Some(CHANNELS.to_string()).as_deref());
-        assert_eq!(val("-r").as_deref(), Some(SAMPLE_RATE.to_string()).as_deref());
-        assert_eq!(a.last().map(|s| s.as_str()), Some("-"), "数据必须从 stdin 进");
-    }
-
-    /// PATH 的顺序说了算，而且只认真正能执行的那一项；谁都没有时是老实的 None。
-    #[test]
-    fn find_in_path_follows_path_order_and_executability() {
-        // 两边的路径一律用同一个 join 造出来：Windows 上分隔符是 \，写成字面量会假红。
-        let first = PathBuf::from("/first").join("aplay");
-        let second = PathBuf::from("/second").join("aplay");
-        let dirs = vec![PathBuf::from("/first"), PathBuf::from("/second")];
-        let table = std::collections::HashMap::from([(first, false), (second.clone(), true)]);
-        let hit = find_in_path_with("aplay", &dirs, |p| *table.get(p).unwrap_or(&false));
-        assert_eq!(hit, Some(second), "第一个目录里那个不可执行的同名文件不该被选中");
-        assert_eq!(find_in_path_with("nope", &dirs, |_| false), None, "找不到不能赌第一个目录");
-    }
 
     #[test]
     fn idle_until_something_is_asked() {
@@ -1189,5 +864,20 @@ mod tests {
         w.note_local_failure("第二句不该盖掉第一句");
         assert_eq!(w.take_local_failure().as_deref(), Some("解码器启动失败：os error 2"));
         assert!(w.take_local_failure().is_none(), "同一件事只通知一次");
+    }
+
+    /// 麦克风转接专用：本机采集没起来时**请求根本没发出去**，
+    /// 不能与「被控端起不来」（Failed）混成同一种红。
+    #[test]
+    fn local_dead_is_a_distinct_phase() {
+        let w = AudioWatch::default();
+        w.note_local_dead("DirectShow 上没有可用的音频输入设备");
+        assert_eq!(w.phase(), AudioPhase::LocalDead);
+        let s = w.summary_labeled("麦克风状态", false);
+        assert!(s.starts_with("麦克风状态 : "), "前缀必须能换：{s}");
+        assert!(s.contains("本机采集没起来"), "{s}");
+        assert!(s.contains("DirectShow"), "原因要原样带进统计行：{s}");
+        assert_eq!(w.failures(), 0, "自己没起来不是对面的失败");
+        assert_eq!(w.states(), 0, "一句回话都没收到过");
     }
 }

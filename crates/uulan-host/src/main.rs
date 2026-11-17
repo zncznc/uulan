@@ -38,6 +38,8 @@ struct Args {
     server: Option<String>,
     capture: Option<String>,
     audio_source: Option<String>,
+    /// 麦克风转接的落点覆盖（`speaker` / `null`）。不写 = 配置里的值（默认 speaker）。
+    mic_sink: Option<String>,
     ffmpeg: Option<PathBuf>,
     encoder: Option<Encoder>,
     name: Option<String>,
@@ -60,6 +62,8 @@ uulan-host —— uulan 内网远控的被控端
   --diagnose          自检：显示 / XTest / ffmpeg / 中继 / 配置可写性，给一行结论 + 建议
                       只读，不注册中继、不改配置；退出码 0 = 能跑，1 = 有失败项
   --audio-source <源> 音频采集源（M7）：`pulse:<设备>` / `lavfi:<表达式>`；
+  --mic-sink <落点> 麦克风转接（M7 上行）本机送到哪儿：`speaker`（默认）/
+                      `null`（解码后丢弃，验收台专用）；拼错词服务直接起不来
                       不写 = 自动探测 PulseAudio 默认输出的 monitor
   --new-temp-code     生成新的一次性临时验证码，落盘后退出
   --once              收到一次会话并结束后就退出（自测用）
@@ -75,6 +79,7 @@ fn parse_args() -> Result<Args> {
         server: None,
         capture: None,
         audio_source: None,
+        mic_sink: None,
         ffmpeg: None,
         encoder: None,
         name: None,
@@ -90,6 +95,7 @@ fn parse_args() -> Result<Args> {
             "--server" => a.server = Some(it.next().unwrap_or_default()),
             "--capture" => a.capture = Some(it.next().unwrap_or_default()),
             "--audio-source" => a.audio_source = Some(it.next().unwrap_or_default()),
+            "--mic-sink" => a.mic_sink = Some(it.next().unwrap_or_default()),
             "--ffmpeg" => a.ffmpeg = Some(PathBuf::from(it.next().unwrap_or_default())),
             "--name" => a.name = Some(it.next().unwrap_or_default()),
             "--encoder" => {
@@ -158,6 +164,18 @@ async fn main() -> Result<()> {
         let v = if s.trim().is_empty() { None } else { Some(s.clone()) };
         if cfg.audio_source != v {
             cfg.audio_source = v;
+            dirty = true;
+        }
+    }
+    if let Some(v) = &args.mic_sink {
+        // 拼错词当场死（与 power_allow 同纪律）——别把「没配」与「配错」混成一个。
+        let parsed = uulan_host::mic::parse_sink(v).map_err(|e| anyhow::anyhow!(e))?;
+        let as_str = match parsed {
+            uulan_host::mic::MicSink::Speaker => "speaker",
+            uulan_host::mic::MicSink::Null => "null",
+        };
+        if cfg.mic_sink != as_str {
+            cfg.mic_sink = as_str.to_string();
             dirty = true;
         }
     }
@@ -422,6 +440,9 @@ async fn serve_relay(
                 let snap = state.snapshot();
                 screen = session::refresh_region(&snap.capture, &snap, screen).await;
                 let params = SessionParams {
+                    // 启动时 check() 已验过词表；这里解析失败只可能是有人绕过启动直改
+                    // 内存快照 —— 那是 bug，就让它 panic 出声，不许静默退回 speaker。
+                    mic_sink: uulan_host::mic::parse_sink(&snap.mic_sink).expect("mic_sink 已在启动时校验"),
                     state: state.clone(),
                     ffmpeg: ffmpeg.clone(),
                     capture: snap.capture,

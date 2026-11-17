@@ -334,7 +334,13 @@ impl ControlLink {
         clipboard: Option<Box<dyn Clipboard>>,
         stats: Arc<InputStats>,
     ) -> Self {
-        Self::start_full(control, clipboard, stats, Arc::new(AudioWatch::default()))
+        Self::start_full(
+            control,
+            clipboard,
+            stats,
+            Arc::new(AudioWatch::default()),
+            Arc::new(AudioWatch::default()),
+        )
     }
 
     /// 同上，再加一份**调用方持有的**音频状态观察器（`H2C::AudioState` 记进那里）。
@@ -347,6 +353,7 @@ impl ControlLink {
         clipboard: Option<Box<dyn Clipboard>>,
         stats: Arc<InputStats>,
         audio: Arc<AudioWatch>,
+        mic: Arc<AudioWatch>,
     ) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<C2H>();
         let status = Arc::new(HostStatus::default());
@@ -460,6 +467,25 @@ impl ControlLink {
                                             }
                                         }
                                         None => debug!(running, "被控端重复上报同一个音频状态"),
+                                    }
+                                }
+                                Ok(H2C::MicState { running, codec, detail }) => {
+                                    // 麦克风转接的每一句都记进**上行那份**观察器（与下行
+                                    // 各一台：同一台会把「被控端在推」与「被控端在播」混成一个相位）。
+                                    match mic.on_state(running, &codec, &detail) {
+                                        Some((from, to)) => {
+                                            let msg = format!(
+                                                "被控端麦克风状态：{} → {}",
+                                                from.label(),
+                                                to.label()
+                                            );
+                                            if to == AudioPhase::Failed {
+                                                warn!(codec = %codec, detail = %detail, "{msg}");
+                                            } else {
+                                                info!(codec = %codec, detail = %detail, "{msg}");
+                                            }
+                                        }
+                                        None => debug!(running, "被控端重复上报同一个麦克风状态"),
                                     }
                                 }
                                 Ok(other) => {

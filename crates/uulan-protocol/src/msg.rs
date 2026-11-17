@@ -101,6 +101,20 @@ pub enum C2H {
     /// 停掉音频（关掉 ffmpeg，别让它一直占着声卡）。
     AudioStop,
 
+    /// 麦克风转接（M7 的最后一格）：控制端开始把自己的声音送上去。
+    ///
+    /// 方向与 `AudioStart` **相反**：那条是「被控端推声音下来」，这条是
+    /// 「控制端送声音上去」，复用同一条 `audio` 通道（两个方向的密钥与计数器
+    /// 本来就是分开派生的）。「停」= 控制端放下上行写半端（流 EOF），被控端据此收尾。
+    ///
+    /// **没有 `MicStop`**：再加一条消息的唯一构造点是「会话中途用户关麦克风」——
+    /// 这个 UI 还不存在；协议里躺一条没人发的消息，正是历轮点名一直在清的东西。
+    MicStart {
+        /// 上行 Opus 码率，kbps。0 = 默认 64（与下行同一套上限口径）。
+        #[serde(default)]
+        bitrate_kbps: u32,
+    },
+
     // ── 剪贴板 ──
     Clip { text: String },
     // `ClipOffer`（先声明、再按需拉正文）2026-11-16 **删除**，H2C 侧同步删除：
@@ -400,6 +414,21 @@ pub enum H2C {
         detail: String,
     },
 
+    /// 麦克风转接的回话（配 `C2H::MicStart`）。与 `AudioState` 同一套纪律：
+    /// 被控端**每一句都必须回** —— 起不来要带原因（这台机器没播放后端 / ffmpeg 起不来），
+    /// 否则控制端只能靠超时猜「没成功」还是「机器走了」。
+    ///
+    /// `running:true` 的口径是「本机解码器 + 播放后端都起来了」，不是「收到消息了」。
+    /// 老控制端永远收不到这条（它不会发 MicStart），两端不必同批升级；
+    /// 老被控端不认 `MicStart`（解帧失败掉会话）与 `Power` 同一条刻意口径，如实暴露。
+    MicState {
+        running: bool,
+        #[serde(default)]
+        codec: String,
+        #[serde(default)]
+        detail: String,
+    },
+
     /// 电源动作的结果（配 `C2H::Power`，M4 补格 2026-11-16）。
     ///
     /// 被控端对**每次请求必回一句** —— 采纳、拒绝、失败都回；不回的话
@@ -572,7 +601,10 @@ mod tests {
         let f = C2H::MouseButton { button: MouseButton::Right, down: false };
         assert_eq!(serde_json::to_string(&f).unwrap(), r#"{"type":"mouse_button","button":"right","down":false}"#);
 
-        let f = H2C::AuthFail { reason: AuthFailReason::BadPassword, retry_after_ms: 1000 };
+        let f = C2H::MicStart { bitrate_kbps: 64 };
+        assert_eq!(serde_json::to_string(&f).unwrap(), r#"{"type":"mic_start","bitrate_kbps":64}"#);
+
+let f = H2C::AuthFail { reason: AuthFailReason::BadPassword, retry_after_ms: 1000 };
         assert_eq!(
             serde_json::to_string(&f).unwrap(),
             r#"{"type":"auth_fail","reason":"bad_password","retry_after_ms":1000}"#
@@ -683,6 +715,7 @@ mod tests {
         rt_c2h(C2H::Term(TermOp::List));
         rt_c2h(C2H::PortMap(PortMapOp::Open { id: 1, target_host: "127.0.0.1".into(), target_port: 22 }));
         rt_c2h(C2H::Power { action: PowerAction::Reboot });
+        rt_c2h(C2H::MicStart { bitrate_kbps: 0 });
         rt_c2h(C2H::Ping { seq: 9, sent_ms: 1_700_000_000_000 });
         rt_c2h(C2H::Bye { reason: "user closed window".into() });
     }
@@ -742,6 +775,7 @@ mod tests {
         rt_h2c(H2C::PortMapOk { id: 1 });
         rt_h2c(H2C::PortMapErr { id: 1, error: "refused".into() });
         rt_h2c(H2C::Pong { seq: 1, sent_ms: 5, host_ms: 8 });
+        rt_h2c(H2C::MicState { running: true, codec: "opus/ogg".into(), detail: "aplay".into() });
         rt_h2c(H2C::Bye { reason: "host quit".into() });
     }
 

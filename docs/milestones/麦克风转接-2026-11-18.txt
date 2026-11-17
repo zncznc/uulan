@@ -1,0 +1,107 @@
+麦克风转接（M7 上行：控制端 → 被控端的音箱）· 2026-11-18 夜批（01:00 班）
+================================================================
+
+本轮把 DESIGN 里挂了两周的「M7 剩下的唯一一格」补上：控制端操作员对着自己机器的
+麦克风说话（或送任意采集源），声音从**被控端**的音箱放出来。「UU 远程」式的隔空喊话。
+
+一、这一格为什么现在才做、以及为什么长这样
+--------------------------------------------
+* 通道零新增：audio 通道（协议 v4 的第 4 条）两个方向的密钥与 nonce 计数器本来就
+  分开派生（crypto::ChannelKeys），**上行只是往同一条 TCP 的另一半写字节**。
+  PROTO_VERSION 保持 4，四条通道的集合没动。
+* **协议里没有 MicStop**（这是本轮刻意的设计，不是遗忘）：
+  「停」= 控制端结束采集 → 上行写半端 drop → TCP 写半边关闭 → 被控端 read_frame
+  拿到 EOF → 收尾。给「会话中途用户关麦克风」这种**还不存在的 UI** 预留一条消息，
+  就是历轮点名一直在清的「协议先行、两端未接」。等 UI 出现的那天，消息、构造点、
+  处理点必须同一批落地。
+* **running:true 的口径 = 对面「解码器 + 播放后端都起来了」**，不是「收到消息了」。
+  实现：pump 在 ffmpeg spawn 成功后经 channel 转达（`on_ready` 回调跨阻塞/异步边界）。
+  被控端在 Windows 上如实回 `running:false`（共享播放层在 Windows 没实现，
+  控制端自己的 waveOut 在客户端 crate 里）—— 不许装作播了。
+* MicState 观察器**复用** AudioWatch 状态机（消息形状 running/codec/detail 完全同构），
+  但**每台只管一条流**：控制端为下行/上行各持一份。新增一个相位 LocalDead：
+  「本机采集没起来（没发请求）」——自己没起来 ≠ 对面起不来（Failed），两种红
+  在统计行上必须分得开。
+* **播放层下沉到 `uulan-media::playback`**（本轮唯一的重构）：
+  控制端 audioin 的「Ogg → ffmpeg 解码 → 播放后端」与被控端 mic 收的是同一条流，
+  2026-11-17 真机实测出的全部纪律（paplay 不吃 raw、尾巴 1500ms 宽限、
+  **播放侧先死必须先杀解码器**否则三方互等挂死整个进程）从两份变一份。
+  两句可 grep 证据「实时播放已接上 / 已收尾」原样保留（老验收脚本不破坏）。
+  原 audioin 的两条纯函数单测随代码搬家（名字没改）。
+
+二、采集源口径（--mic / --mic-source / --mic-bitrate）
+------------------------------------------------------
+* Windows 默认：DirectShow **没有免枚举的默认设备**概念 —— 起一次
+  `ffmpeg -list_devices true -f dshow -i dummy` 从 stderr 取第一个音频设备名
+  （`parse_dshow_audio` 纯函数 + 真机格式样例测；注意这条命令**必定非零退出**，
+  判据只有 stderr 的设备表，拿退出码判成败会把所有枚举都判成失败）。
+  本机（ZNC-7G4D）实测**没有任何录音输入设备** —— 默认枚举路径走到就是
+  「这台机器没有可用的录音输入」这句实话。
+* unix 默认：`pulse:default` = PulseAudio 默认输入源（麦克风）。
+* `lavfi:` 合成源带 `-re`（不加会拼尽全力灌爆链路 —— 下行同款坑）。
+* **本机采集起来了才发 MicStart**（与下行「先起接收端再发 AudioStart」同一时序
+  纪律的两个方向）：对面不许为一条永远不来的流白起管道。源名不带前缀 = 直接报错
+  （猜设备名的表现是「采集到了别的东西」，比报错难查十倍）。
+* 上行编码钉死 48 kHz / 立体声 / libopus/ogg / lowdelay / frame_duration 20 /
+  page_duration 20000 + flush_packets 1 —— 对面解码器与 aplay 只认这一种格式，
+  单测钉住（mono 上行 = aplay 按立体声播 = 变速+串声道，同「缩放差 1 像素花屏」族）。
+
+三、配置闸门
+------------
+* 被控端 `mic_sink`：只认 `speaker`（默认）与 `null`（解码后丢弃，验收台专用 ——
+  没声卡的机器也能把「上行 → 解码 → 统计」整条钉住）。**拼错词让服务起不来**
+  （ConfigError::MicSink，power_allow 同纪律）。老 host.json 缺这个字段照常起
+  （serde default，真机测试台已按此跑）。
+* `--diagnose` 加第九项「麦克风转接」：只问 aplay 在不在 PATH（**只读**，
+  自检不许顺手出声），没有 = WARN 不是 FAIL。
+
+四、本机证据（2026-11-18）
+--------------------------
+* `cargo test --workspace`：（待补：基线/新数/警告数）
+* 新单测 19 条：media playback（4，其中 2 条搬家）+ client micin（5）+
+  host mic（3）+ audioin LocalDead/summary_labeled（1 + 既有 13 条不回归）+
+  protocol wire 形状/roundtrip（2 处并入既有测试）+ 集成 mic_path（2 条真链路）。
+* `crates/uulan-client/tests/mic_path.rs`（真 server + 真 host + 真 wire，
+  Null 落点）：
+  - `mic_uplink_flows_and_stops_by_eof`：有界源 `sine:duration=3` 放满 → 采集进程
+    自己退 → 写半端 drop → 对面 EOF 收尾 → 相位 Running→Ended 且 failures=0。
+    「没有 MicStop」的这条纪律**只靠时序就能测死**。上行字节落在 8 KB..120 KB
+    区间（防「只握手没传声」与「有界源没 bounded 灌爆」两头）。
+  - `unparsable_mic_source_never_leaves_the_machine`：`--mic-source default`
+    → LocalDead、states=0、通道 0 字节、报错文案含三种合法前缀（照抄就能改）。
+* （待补：release 构建、linux-target check、Windows 冒烟数字）
+
+五、真机（192.168.223.15 麒麟 V10 SP1）
+---------------------------------------
+* 部署：HEAD 打包 → `~/.local/uulan/src`（target/ 缓存保留，src.old.* 留底）→
+  真机 `cargo build --release -p uulan-server -p uulan-host -p uulan-client`
+  （待补：耗时/RC/警告）
+* `scripts/verify-mic-realkylin-e2e.sh`（测试台 = 独立中继 + 独立 host.json/台账，
+  mic_sink=speaker 生产形态）：（待补：通过/失败/跳过计数与全部实测数字）
+* Windows → 麒麟跨机一轮（UULAN_EXTERNAL_CLIENT=1）：（待补）
+* 现网回归（正式被控端 —— 仍走 drop-in 的 HEAD 构建）：（待补：帧数/丢帧/首帧/corr）
+* 判据纪律沿用 11-16/17 两条教训：声音必须从信宿 monitor **录回来**算数（统计的
+  「播放 N 字节」只是管道账）；对照组（没人送麦）必须测不出 tone。
+
+六、机器状态与撤法
+------------------
+* 测试台全部是 `/tmp/uulan-mic.<TS>` 里的独立配置 + 独立端口（默认 21999），
+  脚本退出时 trap 收尸；**不碰正式服务的身份与口令**。
+* 正式形态的 drop-in（push-head-20261116.conf 指向 ~/.local/uulan/bin/uulan-head-20261116）
+  本轮撤法：（待补：留 / 撤，以及执行了什么）
+* 协议与 wire 零版本变更；老控制端连新被控端：永远不会发 MicStart，零影响。
+  新控制端 `--mic` 连**老**被控端：解帧失败掉会话（与 Power 同一条刻意口径，
+  如实暴露，别加宽容）。
+
+七、仍未验（别当已验）
+----------------------
+* Windows **真麦克风硬件**采集：这台开发机没有任何录音输入设备（dshow 枚举为空，
+  实测）—— 默认枚举路径只验了「报错诚实」，没验「真能采到声」。
+* 麒麟真麦（alsa_input）采集：验收判据全部走合成源 —— 无人值守半夜没有说话的人，
+  真麦只做过「采到什么算什么」的峰值观察（如有，写进第五节）。
+* 双向同时（--audio 与 --mic 同会话）的相互延迟影响：mic_path 没测，
+  现网 e2e 分开跑。（下行 + 上行共用一条 TCP 的两个方向，密钥/计数器独立，
+  理论上无互踩；「理论上」不算证据。）
+* 播放延迟、信宿争用：与 11-17 遗留同格，仍未量。
+* F8/会话中途关麦：**没有这条 UI，也没有 MicStop**（见第一节）；做 UI 时消息与
+  两端处理必须同批补。

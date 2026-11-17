@@ -98,6 +98,7 @@ async fn spawn_host(
             };
             if let ToEndpoint::Incoming { session: sid, client_addr, .. } = msg {
                 let params = SessionParams {
+                    mic_sink: uulan_host::mic::MicSink::Speaker,
                     state: state.clone(),
                     ffmpeg: ff.clone(),
                     capture: cfg.capture.clone(),
@@ -234,6 +235,10 @@ async fn audio_flows_from_host_to_client_wav() {
         audio: Some(Sink::Wav(out.clone())),
         audio_stats: stats.clone(),
         audio_watch: watch.clone(),
+        mic: None,
+        mic_source: None,
+        mic_stats: Arc::new(uulan_client::audioin::AudioStats::default()),
+        mic_watch: Arc::new(uulan_client::audioin::AudioWatch::default()),
     };
 
     let open = timeout(T, session::open(None, &plan, c))
@@ -345,6 +350,10 @@ async fn client_surfaces_a_source_that_never_produced_bytes() {
         audio: Some(Sink::Wav(out.clone())),
         audio_stats: stats.clone(),
         audio_watch: watch.clone(),
+        mic: None,
+        mic_source: None,
+        mic_stats: Arc::new(uulan_client::audioin::AudioStats::default()),
+        mic_watch: Arc::new(uulan_client::audioin::AudioWatch::default()),
     };
 
     let open = timeout(T, session::open(None, &plan, c))
@@ -420,6 +429,10 @@ async fn client_stops_the_host_when_it_cannot_decode() {
         audio: Some(Sink::Wav(out.clone())),
         audio_stats: stats.clone(),
         audio_watch: watch.clone(),
+        mic: None,
+        mic_source: None,
+        mic_stats: Arc::new(uulan_client::audioin::AudioStats::default()),
+        mic_watch: Arc::new(uulan_client::audioin::AudioWatch::default()),
     };
 
     let open = timeout(T, session::open(None, &plan, c))
@@ -507,6 +520,10 @@ async fn missing_audio_capability_is_recorded_not_only_logged() {
         audio: Some(Sink::Wav(out.clone())),
         audio_stats: stats.clone(),
         audio_watch: watch.clone(),
+        mic: None,
+        mic_source: None,
+        mic_stats: Arc::new(uulan_client::audioin::AudioStats::default()),
+        mic_watch: Arc::new(uulan_client::audioin::AudioWatch::default()),
     };
 
     let open = timeout(T, session::open(None, &plan, c))

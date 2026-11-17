@@ -100,6 +100,7 @@ async fn spawn_locked_host(server: &str, cfg: HostConfig, out: Arc<Mutex<Vec<Inj
             let Ok(msg) = conn.recv().await else { break };
             if let ToEndpoint::Incoming { session: sid, client_addr, .. } = msg {
                 let params = SessionParams {
+                    mic_sink: uulan_host::mic::MicSink::Speaker,
                     state: state.clone(),
                     ffmpeg: ffmpeg.clone(),
                     capture: cfg.capture.clone(),

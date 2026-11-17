@@ -144,6 +144,7 @@ pub async fn run(
     check_xtest(&mut r, &cfg.capture, display.as_deref());
     check_ffmpeg(&mut r, ffmpeg_arg, encoder).await;
     check_audio(&mut r, cfg);
+    check_mic(&mut r, cfg);
     check_relay(&mut r, &cfg.server).await;
     check_host(&mut r);
     r
@@ -392,6 +393,23 @@ fn check_audio(r: &mut Report, cfg: &HostConfig) {
             "音频",
             format!("没有可用的音频采集源：{e}"),
             "要被控端的声音就得有 PulseAudio 的输出 monitor（桌面版麒麟自带）；不要声音可以忽略这一项。",
+        ),
+    }
+}
+
+/// 麦克风转接（M7 上行）：这台机器**能不能播**对面送来的声音。
+///
+/// **只读**：只问候选播放命令在不在 PATH（`mic::probe`），不拉 ffmpeg、不开 aplay ——
+/// 自检顺手播出声会吓到人，而「声卡被占」也不该由自检来撞。
+/// 没有是 `WARN` 不是 `FAIL`：画面/键鼠/文件全都照常，只是说不了话。
+fn check_mic(r: &mut Report, cfg: &HostConfig) {
+    let sink = crate::mic::parse_sink(&cfg.mic_sink).unwrap_or(crate::mic::MicSink::Speaker);
+    match crate::mic::probe(sink) {
+        Ok(how) => r.ok("麦克风转接", format!("播放落点 {how}")),
+        Err(e) => r.warn(
+            "麦克风转接",
+            format!("本机播不了对面送来的声音：{e}"),
+            "麒麟桌面自带 alsa-utils（aplay）；这一项坏了不影响画面/键鼠/文件。",
         ),
     }
 }

@@ -460,6 +460,9 @@ pub struct SessionParams {
     /// 注入它才能验「锁屏后键鼠被丢掉、且是**在**进 Mapper 之前丢的」——
     /// 本机没有 X11 桌面可锁。
     pub lock_probe: Option<LockProbe>,
+    /// 麦克风转接（M7 上行）本机把声音送到哪儿。生产是 `Speaker`；
+    /// `Null` 是验收台专用（没声卡的机器也能把「上行 → 解码 → 统计」整条钉住）。
+    pub mic_sink: crate::mic::MicSink,
 }
 
 #[derive(Debug)]
@@ -606,10 +609,16 @@ pub async fn run_with_sink(
     control_wr.rekey(final_ctl.sending(Role::Host));
     let video = SecConn::new(video, &keys.channel(Channel::Video), Role::Host, Channel::Video);
     let bulk = SecConn::new(bulk, &keys.channel(Channel::Bulk), Role::Host, Channel::Bulk);
-    // 音频（M7）：通道一直开着，但**只有在控制端发 AudioStart 之后才会有字节**。
+    // 音频（M7）：通道一直开着，但**只有控制端发过 AudioStart / MicStart 之后才会有字节**。
     // 不开 `--audio` 的控制端也会拨这条连接（协议 v4 四条通道一起拨），
     // 这里就先握着，什么都不发 —— 空闲 TCP 不产生流量。
-    let audio_conn = SecConn::new(audio, &keys.channel(Channel::Audio), Role::Host, Channel::Audio);
+    //
+    // 2026-11-18 起这一条通道**两个方向各有主人**：下行（AudioCtl，写半端）与被控端
+    // 播控制端麦克风（MicCtl，读半端）。会话开头就拆开，而不是等谁先用谁拆 ——
+    // `into_split` 是一次性的，两条链路都能独立起停，互不挡路。
+    // 密钥与 nonce 计数器本来就按方向分开派生（`crypto::ChannelKeys`），双向并发没有互踩。
+    let (audio_rd, audio_wr) =
+        SecConn::new(audio, &keys.channel(Channel::Audio), Role::Host, Channel::Audio).into_split();
 
     // 视频参数的热更新通道：控制端改画质/帧率时不需要断开重连。
     let (set_tx, set_rx) = watch::channel(params.settings);
@@ -764,7 +773,9 @@ pub async fn run_with_sink(
     }
 
     // 音频控制：只在控制端发 AudioStart 时才拉起 ffmpeg。
-    let mut audio_ctl = AudioCtl::new(audio_conn, params.ffmpeg.clone(), audio_cfg, out_tx.clone());
+    let mut audio_ctl = AudioCtl::new(audio_wr, params.ffmpeg.clone(), audio_cfg, out_tx.clone());
+    // 麦克风转接（上行）：只在控制端发 MicStart 时才起「解码 + 本机播放」管道。
+    let mut mic_ctl = MicCtl::new(audio_rd, params.ffmpeg.clone(), params.mic_sink, out_tx.clone());
 
     let outcome = control_loop(
         &mut in_rx,
@@ -781,6 +792,7 @@ pub async fn run_with_sink(
         &lock,
         &mut sent_state,
         &mut audio_ctl,
+        &mut mic_ctl,
         &params.state,
     )
     .await;
@@ -788,6 +800,7 @@ pub async fn run_with_sink(
     // 会话结束（正常/异常/断线）都要把还按着的键松开、把全局状态还原，
     // 否则被控端上会留下一个「一直按住 Ctrl」的键盘。
     audio_ctl.shutdown().await;
+    mic_ctl.shutdown().await;
     input.finish().await;
     info!(
         events = input.events,
@@ -1160,7 +1173,7 @@ impl InputLoop {
 /// 任务里用 `select!` 收 —— 那是另一个量级的改动，而现场没有这种需求
 /// （音频码率在会话开头定一次就够）。改了就回一句「重开会话才生效」，别装作生效了。
 struct AudioCtl {
-    conn: Option<SecConn>,
+    wr: Option<SecWriteHalf>,
     task: Option<tokio::task::JoinHandle<()>>,
     ffmpeg: PathBuf,
     /// 配置里的音频源原文（`pulse:…` / `lavfi:…`），`None` = 自动探测。
@@ -1169,8 +1182,8 @@ struct AudioCtl {
 }
 
 impl AudioCtl {
-    fn new(conn: SecConn, ffmpeg: PathBuf, source: Option<String>, out: mpsc::UnboundedSender<Out>) -> Self {
-        AudioCtl { conn: Some(conn), task: None, ffmpeg, source, out }
+    fn new(wr: SecWriteHalf, ffmpeg: PathBuf, source: Option<String>, out: mpsc::UnboundedSender<Out>) -> Self {
+        AudioCtl { wr: Some(wr), task: None, ffmpeg, source, out }
     }
 
     fn running(&self) -> bool {
@@ -1188,8 +1201,8 @@ impl AudioCtl {
             }));
             return;
         }
-        let Some(conn) = self.conn.take() else {
-            // 会话开头已经交出过一次写端（理论上到不了这里）。
+        let Some(conn) = self.wr.take() else {
+            // 写半端只交得出一次（`Option::take`），第二次 start 走到这里。
             warn!("音频通道已经用掉了，无法再起");
             let _ = self.out.send(Out::Json(H2C::AudioState {
                 running: false,
@@ -1205,7 +1218,7 @@ impl AudioCtl {
             let _ = tx.send(Out::Json(m));
         });
         self.task = Some(tokio::spawn(async move {
-            crate::audio::run(ffmpeg, source, p, conn.into_write_half(), notify).await;
+            crate::audio::run(ffmpeg, source, p, conn, notify).await;
         }));
     }
 
@@ -1225,12 +1238,75 @@ impl AudioCtl {
     /// 会话收尾：先 abort，再等它真的退出（ffmpeg 是 `kill_on_drop`，drop 即收尸）。
     async fn shutdown(&mut self) {
         let Some(t) = self.task.take() else {
-            self.conn = None;
+            self.wr = None;
             return;
         };
         t.abort();
         let _ = tokio::time::timeout(Duration::from_secs(2), t).await;
-        self.conn = None;
+        self.wr = None;
+    }
+}
+
+/// 麦克风转接（M7 上行）的控制。结构与 [`AudioCtl`] 同款，方向相反：
+/// 一次会话最多一路，`MicStart` 才 spawn；「停」没有消息 —— 控制端放下
+/// 写半端后这里的 `read_frame` 拿到 EOF，任务自己收尾。
+struct MicCtl {
+    rd: Option<SecReadHalf>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    ffmpeg: PathBuf,
+    sink: crate::mic::MicSink,
+    out: mpsc::UnboundedSender<Out>,
+}
+
+impl MicCtl {
+    fn new(rd: SecReadHalf, ffmpeg: PathBuf, sink: crate::mic::MicSink, out: mpsc::UnboundedSender<Out>) -> Self {
+        MicCtl { rd: Some(rd), task: None, ffmpeg, sink, out }
+    }
+
+    fn running(&self) -> bool {
+        self.task.as_ref().is_some_and(|t| !t.is_finished())
+    }
+
+    fn start(&mut self) {
+        if self.running() {
+            warn!("麦克风转接已经在播，忽略重复的 MicStart（一路已够占声卡）");
+            let _ = self.out.send(Out::Json(H2C::MicState {
+                running: true,
+                codec: String::new(),
+                detail: "麦克风转接已在运行".into(),
+            }));
+            return;
+        }
+        let Some(rd) = self.rd.take() else {
+            warn!("麦克风上行通道已经用掉了，无法再起");
+            let _ = self.out.send(Out::Json(H2C::MicState {
+                running: false,
+                codec: String::new(),
+                detail: "audio 读半端已被占用（一路会话只接一路麦克风）".into(),
+            }));
+            return;
+        };
+        let ffmpeg = self.ffmpeg.clone();
+        let sink = self.sink;
+        let tx = self.out.clone();
+        let notify: Box<dyn Fn(H2C) + Send + Sync> = Box::new(move |m: H2C| {
+            let _ = tx.send(Out::Json(m));
+        });
+        self.task = Some(tokio::spawn(async move {
+            crate::mic::run(ffmpeg, sink, rd, notify).await;
+        }));
+    }
+
+    /// 会话收尾：abort 播放任务。ffmpeg 子进程随 spawn_blocking 的线程收尾，
+    /// 播放命令（aplay）的 stdin 被关 —— 它会自己退（`pump` 的收尾纪律）。
+    async fn shutdown(&mut self) {
+        let Some(t) = self.task.take() else {
+            self.rd = None;
+            return;
+        };
+        t.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(2), t).await;
+        self.rd = None;
     }
 }
 
@@ -1249,6 +1325,7 @@ async fn control_loop(
     lock: &Option<LockProbe>,
     sent_state: &mut Option<DesktopState>,
     audio: &mut AudioCtl,
+    mic: &mut MicCtl,
     state: &Arc<HostState>,
 ) -> Result<Closed, String> {
     let mut tick = tokio::time::interval(POLL_INTERVAL);
@@ -1391,6 +1468,13 @@ async fn control_loop(
                             }
                             C2H::AudioStop => {
                                 audio.stop();
+                            }
+                            C2H::MicStart { bitrate_kbps } => {
+                                // 上行只有「开」没有「停」：控制端结束采集 = 关写半端，
+                                // 这条通道上的 read_frame 拿到 EOF 自然收尾（见 mic.rs 模块头）。
+                                let b = bitrate_kbps;
+                                info!(bitrate_kbps = b, "控制端要求把它的麦克风播到本机");
+                                mic.start();
                             }
                             C2H::Power { action } => {
                                 // 电源动作要等子进程回话（最长几秒），**绝不能在 control_loop

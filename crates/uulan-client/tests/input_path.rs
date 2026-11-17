@@ -91,6 +91,7 @@ async fn spawn_host(server: &str, cfg: HostConfig, out: Arc<Mutex<Vec<Inject>>>)
             };
             if let ToEndpoint::Incoming { session: sid, client_addr, .. } = msg {
                 let params = SessionParams {
+                    mic_sink: uulan_host::mic::MicSink::Speaker,
                     state: state.clone(),
                     ffmpeg: ffmpeg.clone(),
                     capture: cfg.capture.clone(),

@@ -297,6 +297,16 @@ pub struct Plan {
     /// 被控端音频状态（`H2C::AudioState`）的观察器。也是跨会话共享一份：
     /// 上一轮「起不来」的原因，重连之后仍然能在统计行里看见。
     pub audio_watch: std::sync::Arc<crate::audioin::AudioWatch>,
+
+    /// 麦克风转接（M7 的最后一格）：`None` = 不要这条路；`Some(bitrate_kbps)` =
+    /// 会话一起来就把本机声音送上去、播到被控端。0 = 默认 64 kbps。
+    pub mic: Option<u32>,
+    /// `--mic-source` 的原文（`pulse:` / `dshow:` / `lavfi:`）。`None` = 按平台自动挑。
+    pub mic_source: Option<String>,
+    /// 上行计数与状态观察器。跨会话共享一份（与 `audio_stats`/`audio_watch` 同一理由：
+    /// 断线接回后是新的 ControlLink，而「这趟到底说没说成话」是整场会话的量）。
+    pub mic_stats: std::sync::Arc<crate::audioin::AudioStats>,
+    pub mic_watch: std::sync::Arc<crate::audioin::AudioWatch>,
 }
 
 impl Plan {
@@ -420,6 +430,8 @@ pub struct Open {
     pub link: ControlLink,
     /// 音频接收（M7）。`None` = 这条会话没开音频。Drop 时连解码器一起收掉。
     pub audio: Option<crate::audioin::AudioIn>,
+    /// 麦克风转接的发送侧（M7）。Drop = 结束采集 + 关上行写半端（= 对被控端的「停」）。
+    pub mic: Option<crate::micin::MicOut>,
     /// 输入口。headless 不用它，但**必须留着**：全掉了控制通道的写任务会退出，
     /// 被控端看到控制通道 EOF 就会把整条会话收掉（画面跟着断）——
     /// 那就成了「客户端自己把会话关掉，然后怪网络」。
@@ -463,12 +475,14 @@ pub async fn open(
             clip,
             l.input_stats(),
             plan.audio_watch.clone(),
+            plan.mic_watch.clone(),
         ),
         None => ControlLink::start_full(
             c.control,
             clip,
             Arc::new(InputStats::default()),
             plan.audio_watch.clone(),
+            plan.mic_watch.clone(),
         ),
     };
     let input = if c.host.has_desktop && !plan.no_input {
@@ -495,9 +509,18 @@ pub async fn open(
 
     // 音频（M7）：先起接收端再发 AudioStart —— 反过来的话，被控端前几百毫秒的
     // 声音会在没有读者的通道上堆着（socket 缓冲），而控制端以为「已经开始了」。
+    // audio 通道一条、两个方向：下行接收（`audioin`）与上行麦克风（`micin`）
+    // 各吃一半 —— 密钥与 nonce 计数器本来就按方向分开派生（`crypto` 的 channel key），
+    // 同一条 TCP 连接双向并发没有互踩问题。
+    let (mut audio_rd, mut audio_wr) = if plan.audio.is_some() || plan.mic.is_some() {
+        let (rd, wr) = c.audio.into_split();
+        (Some(rd), Some(wr))
+    } else {
+        (None, None)
+    };
     let audio = match (&plan.audio, c.host.caps.contains(&Cap::Audio)) {
         (Some(sink), true) => {
-            let (rd, _wr) = c.audio.into_split();
+            let rd = audio_rd.take().expect("audio 读半端只在这里被取走一次");
             let mut a = crate::audioin::start(
                 rd,
                 plan.ffmpeg.clone(),
@@ -531,6 +554,59 @@ pub async fn open(
         (None, _) => None,
     };
 
+    // 麦克风转接（M7 的最后一格）：**本机采集起来了才发 MicStart**。
+    // 反过来的话，被控端白起一条播放管道（ffmpeg + aplay 占着声卡），而失败原因
+    // 只留在本机日志里 —— 与下行「先起接收端再发 AudioStart」是同一条时序纪律的两个方向。
+    let mic = match (plan.mic, audio_wr.take()) {
+        (Some(bitrate), Some(wr)) => {
+            let ff = plan
+                .ffmpeg
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from("ffmpeg"));
+            let started = match crate::micin::resolve_source(plan.mic_source.as_deref(), &ff).await {
+                Err(e) => {
+                    plan.mic_watch.note_local_dead(&e);
+                    warn!(error = %e, "麦克风采集源没配好，MicStart 不发（免得对面白起管道）");
+                    Err(e)
+                }
+                Ok(src) => crate::micin::start(
+                    plan.ffmpeg.clone(),
+                    src,
+                    bitrate,
+                    wr,
+                    plan.mic_stats.clone(),
+                )
+                .await
+                .map_err(|e| {
+                    plan.mic_watch.note_local_dead(&format!("ffmpeg 启动失败：{e}"));
+                    e.clone()
+                }),
+            };
+            match started {
+                Ok(out) => {
+                    if link.input().send(C2H::MicStart { bitrate_kbps: bitrate }) {
+                        info!(bitrate, "已请求被控端播放本机麦克风（转接上行）");
+                        plan.mic_watch.note_requested(crate::audioin::AudioWatch::clock_ms());
+                    } else {
+                        warn!("麦克风请求没能下发：控制通道已经关了");
+                    }
+                    Some(out)
+                }
+                Err(e) => {
+                    warn!(error = %e, "麦克风采集没起来，本次会话没有转接");
+                    None
+                }
+            }
+        }
+        (Some(_), None) => {
+            // 到不了：audio_wr 与 plan.mic 同生共死。真到了就是上面改坏了 —— 如实说，别静默。
+            plan.mic_watch.note_local_dead("audio 写半端已被别处取走（内部时序错乱）");
+            warn!("麦克风转接没能接线：audio 写半端不在");
+            None
+        }
+        (None, _) => None,
+    };
+
     if let Some(l) = live {
         l.mark_live(c.host.clone(), watcher.stats(), link.status(), input.clone());
     }
@@ -541,7 +617,7 @@ pub async fn open(
         "会话已建立"
     );
 
-    Ok(Open { host: c.host, watcher, link, audio, _input: input })
+    Ok(Open { host: c.host, watcher, link, audio, mic, _input: input })
 }
 
 /// 音频看门狗（一条会话一个，最多活 30 秒，随 `AudioIn` 一起 abort）。
