@@ -21,9 +21,11 @@
 //! 填中继 → 刷新设备 → 选中一台 → 输口令 → 点「开始远程控制」。中间任何一步失败，
 //! 面板都会把对面程序的**原话**显示出来（而不是替它编一句好话）。
 
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +64,11 @@ pub struct App {
     devices: Vec<DeviceRow>,
     status: String,
     log: Vec<String>,
+    /// 显眼的失败提示。**v1 的教训**：失败只写在底部一行小字里，用户点了按钮看不出
+    /// 任何反应，于是报「没有任何反应」—— 反馈藏在角落等于没有反馈。
+    alert: String,
+    /// 最近一次启动的子进程：秒退就必须当场说出口（并把它的输出留在盘上）。
+    child: Option<(std::process::Child, std::time::Instant, PathBuf)>,
 }
 
 impl App {
@@ -88,6 +95,8 @@ impl App {
             devices: Vec::new(),
             status: "就绪。填中继地址，点「刷新设备」。".to_string(),
             log: Vec::new(),
+            alert: String::new(),
+            child: None,
         }
     }
 
@@ -232,12 +241,14 @@ impl App {
             self.status = "找不到 uulan-client —— 请把它和面板放在同一目录。".into();
             return;
         };
+        // 这两条以前只改底部小字，结果用户报「点了没反应」—— 表单没填全必须有显眼回应。
         if self.device.trim().is_empty() {
-            self.status = "先选一台设备（或手填设备 ID）。".into();
+            self.alert = "还没填设备 ID —— 点上面列表里那一行，或自己写进来。".into();
             return;
         }
         if self.password.trim().is_empty() {
-            self.status = "需要访问口令。被控端首次启动时终端上会打印一次。".into();
+            self.alert = "需要访问口令（在「访问口令」框里填）。\n\
+                忘了口令：在被控端上跑 `uulan-host --show`，或直接看被控端配置文件里 password 字段。".into();
             return;
         }
         let pw = match self.write_pw_file() {
@@ -248,23 +259,47 @@ impl App {
             }
         };
         let args = self.build_args(&pw, mode.clone());
+        let shown = sanitize(&args);
+        // 子进程的输出**必须留盘**：改成 GUI 子系统后它没有控制台，
+        // 不接住就永远看不到它为什么没起窗。
+        let log_path = App::cfg_dir().join("gui-session.log");
+        let _ = std::fs::create_dir_all(App::cfg_dir());
+        let out = std::fs::File::create(&log_path);
         let mut cmd = Command::new(&client);
         cmd.args(&args);
         hide_console(&mut cmd);
-        let shown = sanitize(&args);
+        match out {
+            Ok(f) => {
+                match f.try_clone() {
+                    Ok(f2) => {
+                        cmd.stdout(Stdio::from(f2)).stderr(Stdio::from(f));
+                    }
+                    Err(e) => {
+                        self.alert = format!("会话日志句柄复制失败（{e}），无法诊断子进程。");
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                self.alert = format!("会话日志建不了（{e}），也就无法诊断子进程为什么不起窗。");
+                return;
+            }
+        }
+        self.alert.clear();
         match cmd.spawn() {
             Ok(child) => {
+                let pid = child.id();
                 self.save_cfg();
                 self.status = format!(
-                    "已启动（PID {}）。{}  口令走的是文件，没进命令行。",
-                    child.id(),
+                    "已启动（PID {pid}），窗口应该已经出现。{}  口令走的是文件，没进命令行。",
                     match mode { Mode::Desktop => "远程控制窗口", Mode::Term => "终端会话" }
                 );
                 self.push_log(format!("执行：{} {}", client.file_name().unwrap_or_default().to_string_lossy(), shown));
+                self.child = Some((child, std::time::Instant::now(), log_path));
             }
             Err(e) => {
-                self.status = format!("启动失败：{e}");
-                self.push_log(self.status.clone());
+                self.alert = format!("启动失败：{e}\n控制端路径：{}", client.display());
+                self.push_log(self.alert.clone());
             }
         }
     }
@@ -332,6 +367,21 @@ fn sanitize(args: &[String]) -> String {
     out
 }
 
+/// 找同目录（以及上级）里那个口令文件。口令本身从不写进 gui.json。
+fn sibling_pwfile() -> Option<PathBuf> {
+    let mut cands: Vec<PathBuf> = Vec::new();
+    if let Ok(cur) = std::env::current_exe() {
+        if let Some(dir) = cur.parent() {
+            cands.push(dir.join("host.pw"));
+            cands.push(dir.join("..").join("host.pw"));
+        }
+    }
+    if let Ok(d) = std::env::var("USERPROFILE") {
+        cands.push(PathBuf::from(d).join("uulan").join("host.pw"));
+    }
+    cands.into_iter().find(|p| p.is_file())
+}
+
 fn config_path() -> PathBuf {
     App::cfg_dir().join("gui.json")
 }
@@ -374,7 +424,34 @@ impl eframe::App for App {
             });
         });
 
+        // 子进程秒退 = 「点了没反应」的真实形态。必须当场说，而不是等用户去猜。
+        // 写法用 take/放回而不是 as_mut：as_mut 里再访问 self 会撞借用检查。
+        if let Some((mut child, born, lp)) = self.child.take() {
+            match child.try_wait() {
+                Ok(Some(st)) => {
+                    let raw = std::fs::read_to_string(&lp).unwrap_or_default();
+                    let tail: String = raw.lines().rev().take(3).collect::<Vec<_>>().join(" ← ");
+                    if born.elapsed().as_secs() < 10 {
+                        self.alert = format!(
+                            "远程进程 {st} 就退了（不到 10 秒），所以你没看到窗口。\n最后三行输出：{}\n全文在 {}",
+                            tail.trim().replace('\n', " / "),
+                            lp.display()
+                        );
+                    }
+                }
+                // 还活着就放回原位，下一帧继续看。
+                _ => self.child = Some((child, born, lp)),
+            }
+        }
+
         egui::CentralPanel::default().show(root, |ui| {
+            if !self.alert.is_empty() {
+                ui.colored_label(egui::Color32::from_rgb(200, 40, 40), &self.alert);
+                if ui.button("我知道了").clicked() {
+                    self.alert.clear();
+                }
+                ui.separator();
+            }
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     ui.label("中继地址");
@@ -392,6 +469,20 @@ impl eframe::App for App {
                             .password(true)
                             .desired_width(200.0),
                     );
+                    // 少一次「自己去开文件复制粘贴」的折腾：同目录有 host.pw 就直接读进来。
+                    // 注意这是**填进输入框**，不是记进配置 —— gui.json 永不存口令。
+                    if ui.button("从 host.pw 读取").clicked() {
+                        match sibling_pwfile() {
+                            Some(p) => match std::fs::read_to_string(&p) {
+                                Ok(t) => {
+                                    self.password = t.trim_end_matches(['\n', '\r']).to_string();
+                                    self.status = format!("口令已读入（来自 {}，{} 字符）。", p.display(), self.password.chars().count());
+                                }
+                                Err(e) => self.alert = format!("读不了 {}：{e}", p.display()),
+                            },
+                            None => self.alert = "同目录没有 host.pw —— 请把口令文件和控制端放在一处，或直接手输口令。".into(),
+                        }
+                    }
                 });
             });
 
@@ -464,17 +555,50 @@ impl eframe::App for App {
     }
 }
 
-fn main() -> eframe::Result<()> {
-    // 日志一律走 stderr（项目纪律）；GUI 里没有终端，就让它安静地不打印。
+/// 没有控制台 ⇒ panic 和启动错误没人看得见。「双击没反应」是最难报修的一类故障，
+/// 所以把它写进文件（下次排查不用再靠猜）。
+fn error_log() -> PathBuf {
+    App::cfg_dir().join("gui-error.log")
+}
+
+fn note_error(what: &str) {
+    let line = format!("{}  {what}\n", chrono_free_stamp());
+    let _ = std::fs::create_dir_all(App::cfg_dir());
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(error_log()) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// 不引 chrono：内网里少一个依赖就少一个装不上的理由。这是本地时区的粗粒度时间戳，
+/// 够用来排序故障，不承担协议语义。
+fn chrono_free_stamp() -> String {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|x| x.as_secs())
+        .unwrap_or(0);
+    format!("@{d}")
+}
+
+fn main() {
+    // 日志一律走 stderr（项目纪律）；改成 GUI 子系统后 stderr 没有去处，
+    // 所以这里把 panic 与启动错误**同时**落到 gui-error.log。
+    std::panic::set_hook(Box::new(|info| {
+        note_error(&format!("panic: {info}"));
+    }));
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([720.0, 520.0]).with_min_inner_size([560.0, 420.0]),
         ..Default::default()
     };
-    eframe::run_native(
+    if let Err(e) = eframe::run_native(
         "uulan 内网远控",
         opts,
         Box::new(|_cc| Ok(Box::new(App::new()))),
-    )
+    ) {
+        note_error(&format!("启动失败：{e}"));
+        // 起不来时留一句能看见的话，比静默退出强。
+        eprintln!("面板起不来，原因写在 {}", error_log().display());
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
