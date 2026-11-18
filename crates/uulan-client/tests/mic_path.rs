@@ -18,7 +18,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::time::timeout;
 
@@ -220,11 +220,22 @@ async fn mic_uplink_flows_and_stops_by_eof() {
     //    这条迁移只能由流 EOF 触发** —— 它就是本测试存在的理由。
     // 先等计数跑完再等相位：`-re` 下 3 秒源该有 ~150 帧（33 KB / 16 KiB 取整前是 20ms 页），
     // 快照取早了会把「还在流」误读成「量级不对」（2026-11-18 首跑就是这么假红过一次）。
-    wait_until("上行计数接近 3 秒的量（>120 帧）", || {
+    // 3 秒源单跑实测 135 帧 / 33740 字节；满载时**必须看得见实测数**才知道是掉帧还是慢，
+    // 所以这里不用通用 wait_until（它只说「等不到」）。量级的最终判据是下面第 4 步的
+    // 24 KB..120 KB 字节区间，这里守的是「确实在流、不是只握了个手」。
+    {
         use std::sync::atomic::Ordering::Relaxed;
-        stats.frames.load(Relaxed) >= 120
-    })
-    .await;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while stats.frames.load(Relaxed) < 120 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let got = stats.frames.load(Relaxed);
+        assert!(
+            got >= 120,
+            "上行计数没到 3 秒的量：实测 {got} 帧（单跑基线 135 帧；字节 {} ）",
+            stats.ogg_bytes.load(Relaxed)
+        );
+    }
     wait_until("被控端按 EOF 收尾（Ended 且不是失败）", || {
         watch.phase() == AudioPhase::Ended
     })
