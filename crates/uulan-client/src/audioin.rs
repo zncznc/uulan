@@ -28,7 +28,10 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
+// 唯一用处是 Windows 锚点句（speaker 的 program=waveOut）；别端的 import 会成麒麟上的未用警告。
+#[cfg(windows)]
+use tracing::info;
 
 use uulan_media::playback::{self, Counters, PcmSink};
 use uulan_protocol::crypto::SecReadHalf;
