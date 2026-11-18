@@ -179,9 +179,14 @@ if cmd == "onset90":
     if steady < 1e-8:
         print("NONE 0 0"); sys.exit(0)
     thr = 0.9 * steady
-    for i in range(len(pw) - hold + 1):
-        if all(pw[j] >= thr for j in range(i, i + hold)):
-            print("%.3f %.3g %.3g" % (i * HOP + WIN / 2, steady, pw[i])); sys.exit(0)
+    # 用「窗口段的中位数」而不是「每一窗都过线」：双向同会话时 440 与 880 会拍频，
+    # 逐窗功率带着纹波上下窜，硬与门让起声时刻随纹波抽签（真机同一二进制两轮
+    # 1.550 / 2.000 s —— 0.45 s 的抖动全在判据里，不在产品里）。中位数把纹波压掉。
+    half = hold // 2
+    for i in range(half, len(pw) - half):
+        seg = sorted(pw[i - half:i + half + 1])
+        if seg[len(seg) // 2] >= thr:
+            print("%.3f %.3g %.3g" % ((i - half) * HOP + WIN / 2, steady, seg[len(seg) // 2])); sys.exit(0)
     print("NONE %.3g 0" % steady); sys.exit(0)
 if cmd == "powermin":
     # 稳态段里的最小窗功率 / 全体窗功率中位数 —— 播放缓冲压薄之后，
@@ -298,7 +303,8 @@ POS4=$(python3 "$WORK/an.py" onset90 "$WORK/loop.wav" 440 | awk '{print $1}')
 POS8=$(python3 "$WORK/an.py" onset90 "$WORK/loop.wav" 880 | awk '{print $1}')
 RECDUR=$(python3 "$WORK/an.py" dur "$WORK/loop.wav")
 echo "  录制 ${RECDUR}s；440 起声 @${POS4}s，880 起声 @${POS8}s（相对录音数据起点；"
-echo "    起声判据 = 达到稳态 90% 且稳住 0.45 s（2026-11-19 起用这条；旧「过半」落在启动爬坡里，偏早）"
+echo "    起声判据 = 逐窗功率的 0.45 s 段中位数达到稳态 90%（2026-11-19 起用这条；"
+echo "    旧「过半」落在启动爬坡里偏早，而「每窗都过线」又被拍频纹波抽签，都已否掉）"
 { [ -n "$POS4" ] && [ "$POS4" != "NONE" ]; } || bad "录回来的声音里没有 440 起声 —— 下行没出声，延迟无从谈起"
 { [ -n "$POS8" ] && [ "$POS8" != "NONE" ]; } || bad "录回来的声音里没有 880 起声 —— 上行没出声，延迟无从谈起"
 if [ "$POS4" = "NONE" ] || [ "$POS8" = "NONE" ] || [ -z "$POS4" ] || [ -z "$POS8" ]; then
@@ -354,9 +360,15 @@ print("")
 PY
 )
 if [ -n "$PA_US" ]; then
-  echo "  PulseAudio 自报（会话中途，这条 aplay 流）：末端段 $(calc "$PA_US / 1000000") s（缓冲延迟+信宿延迟，与录音时间基无关）"
+  PA_S=$(calc "$PA_US / 1000000")
+  echo "  PulseAudio 自报（会话中途，这条 aplay 流）：末端段 ${PA_S} s（缓冲延迟+信宿延迟，与录音时间基无关）"
+  # 这条比 monitor 口径可信得多（真机两轮 0.0675 / 0.0533 s，同一判据下 monitor 抖 0.45 s），
+  # 所以拿它当播放档位的验收线：< 0.25 s = 缓冲参数真的到了流上；旧二进制在这里是 0.40 s。
+  awk -v v="$PA_S" 'BEGIN{exit !(v < 0.25)}' \
+    && ok "Pulse 自报末端段 ${PA_S} s < 0.25 s（播放缓冲确实钉薄了）" \
+    || bad "Pulse 自报末端段 ${PA_S} s ≥ 0.25 s —— 档位没生效或这台机器的信宿自己就这么慢"
 else
-  echo "  PulseAudio 的账采不到（$WORK/si-during.txt 里没有 aplay 那条流）—— 只报 monitor 口径"
+  skip "PulseAudio 的账采不到（$WORK/si-during.txt 里没有 aplay 那条流）—— 只剩 monitor 口径"
 fi
 # —— 小缓冲的代价是 xrun：稳态里若掉过声音，最小窗功率会明显低于稳态中位数。
 #    窗口从「起声 +0.6 s」起（起声用的是 onset90，本身已经站在稳态上）：
