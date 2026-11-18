@@ -1,0 +1,22 @@
+[package]
+name = "uulan-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "uulan 内网远控的图形面板（控制端入口）"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+# 纯 Rust 的 immediate-mode GUI：走 winit + glow，跟 uulan-client 同一套窗口后端。
+# 选它而不是 GTK：项目从 M2 起就明确「不依赖 GTK」（GTK 在锁屏时停止重绘，而且
+# 麒麟/Windows 两侧的打包负担完全不同）。
+# 默认后端是 wgpu，在这台机器上一起一就段错误（空模板探针同样崩，所以不是本 crate 的
+# 代码问题）。这里显式改走 glow（OpenGL），绕开 wgpu/DX 初始化。
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "system_fonts", "clipboard", "links", "accesskit"] }
+# UI 代码直接写 egui::*，所以它必须是直接依赖，不能只靠 eframe 的再导出。
+egui = "0.37"
+
+[target.'cfg(windows)'.dependencies]

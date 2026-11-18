@@ -9,6 +9,7 @@ members = [
     "crates/uulan-server",
     "crates/uulan-host",
     "crates/uulan-client",
+    "crates/uulan-gui",
 ]
 
 [workspace.package]
