@@ -289,6 +289,74 @@ pub fn pipe_speaker() -> Result<Box<dyn PcmSink>, String> {
     Err("这个平台的共享播放后端还没实现（控制端在 Windows 用 waveOut，与被控端无关）".into())
 }
 
+/// 播放末端段的时钟账（纯状态机，时钟由调用方给，微秒）。
+///
+/// 为什么需要它：跨机（麒麟→Windows）没有回采录音路 —— 这台 Windows 的 dshow
+/// 录音枚举为空（11-16/11-18 两轮真机批实测），「信宿 monitor 当数字回采路」那招
+/// 只在麒麟侧成立。但「解码器首次吐音」「首块写入播完」两个时刻是**进程内量**，
+/// 任何平台不用对表都能测 —— Windows 侧的播放末端段就此有自己的数字，不再空着。
+#[derive(Debug, Default, Clone)]
+pub struct TailWatch {
+    ready_us: Option<u64>,
+    first_pcm_us: Option<u64>,
+    first_done_us: Option<u64>,
+    blocks: u64,
+    sum_us: u64,
+    max_us: u64,
+}
+
+impl TailWatch {
+    /// 解码器就绪（`on_ready` 被调的那一刻）—— 后面一切以它为原点。
+    pub fn note_ready(&mut self, now: u64) {
+        self.ready_us = Some(now);
+    }
+
+    /// 一块 PCM 刚从解码器出来（只记第一块；原点未定时不算）。
+    pub fn note_pcm_out(&mut self, now: u64) {
+        if self.ready_us.is_some() && self.first_pcm_us.is_none() {
+            self.first_pcm_us = Some(now);
+        }
+    }
+
+    /// `sink.write` 返回（`dur` = 这次调用耗时，含等缓冲放完）。
+    /// 返回是否是「首块播完」—— 调用方据此打一次性的时刻行（跨机锚点）。
+    pub fn note_write_done(&mut self, now: u64, dur: u64) -> bool {
+        let first = self.ready_us.is_some() && self.first_done_us.is_none();
+        if first {
+            self.first_done_us = Some(now);
+        }
+        self.blocks += 1;
+        self.sum_us = self.sum_us.saturating_add(dur);
+        self.max_us = self.max_us.max(dur);
+        first
+    }
+
+    fn ms_since(base: Option<u64>, v: Option<u64>) -> Option<u64> {
+        match (base, v) {
+            (Some(b), Some(x)) => Some(x.saturating_sub(b) / 1000),
+            _ => None,
+        }
+    }
+
+    /// 一行可 grep 的账。缺原点写「—」，不许编毫秒数。
+    pub fn summary(&self) -> String {
+        let fmt = |v: Option<u64>| match v {
+            Some(x) => format!("{x}ms"),
+            None => "\u{2014}".to_string(),
+        };
+        let avg = if self.blocks > 0 { Some(self.sum_us / self.blocks / 1000) } else { None };
+        let max = if self.blocks > 0 { Some(self.max_us / 1000) } else { None };
+        format!(
+            "首包解码={} 首包播完={} 块数={} 平均块={} 最大块={}",
+            fmt(Self::ms_since(self.ready_us, self.first_pcm_us)),
+            fmt(Self::ms_since(self.ready_us, self.first_done_us)),
+            self.blocks,
+            fmt(avg),
+            fmt(max),
+        )
+    }
+}
+
 /// `pump` 的结局。每一端把它接成自己那句「为什么结束了」。
 #[derive(Debug, Clone)]
 pub enum PumpEnd {
@@ -345,6 +413,10 @@ pub fn pump(
         on_end(&end, stats);
         return end;
     };
+    let t_clock = std::time::Instant::now();
+    let mut tail = TailWatch::default();
+    let us = || t_clock.elapsed().as_micros() as u64;
+    tail.note_ready(us());
     on_ready();
 
     // 喂字节的线程：`din.write_all` 阻塞，正好由它承担反压。
@@ -372,6 +444,7 @@ pub fn pump(
                 break;
             }
         };
+        tail.note_pcm_out(us());
         stats.pcm_bytes.fetch_add(n as u64, Ordering::Relaxed);
         // 峰值：s16le 小端，两字节一个样本。
         let mut peak = 0u32;
@@ -385,6 +458,7 @@ pub fn pump(
         if peak as u64 > cur {
             stats.peak.store(peak as u64, Ordering::Relaxed);
         }
+        let w_start = std::time::Instant::now();
         if let Err(e) = sink.write(&pcm[..n]) {
             stats.bump_errors();
             // 原因必须落日志：只加计数就 break，现场分不清是播放器退了、管道被抢、还是声卡没了
@@ -392,6 +466,12 @@ pub fn pump(
             warn!(error = %e, "播放后端写入失败，本机出声到此中断（解码与统计照常收尾）");
             early_err = Some(format!("播放后端写入失败：{e}"));
             break;
+        }
+        let w_dur = w_start.elapsed().as_micros() as u64;
+        if tail.note_write_done(us(), w_dur) {
+            // 这句的行首时间戳 = 「本机把第一块音频放到扬声器上放完」的最早时刻。
+            // 跨机测播放末端段没有回采路（Windows dshow 枚举为空），只能靠播放器自报 —— 它就是那个锚。
+            info!(dur_ms = w_dur / 1000, "实时播放首包已播完");
         }
         stats.played_bytes.fetch_add(n as u64, Ordering::Relaxed);
     }
@@ -408,6 +488,7 @@ pub fn pump(
     sink.finish();
     let _ = child.wait();
     info!(pcm = stats.pcm_bytes.load(Ordering::Relaxed), "音频解码结束");
+    info!(tail = %tail.summary(), "播放末端统计");
     let end = match early_err {
         Some(why) => PumpEnd::SinkGone(why),
         None => PumpEnd::Ended,
@@ -469,5 +550,42 @@ mod tests {
         assert!(s.contains("音频：收到 1 帧 / 100 字节"), "{s}");
         assert!(s.contains("峰值 0"), "默认没有峰值：{s}");
         assert!(c.got_bytes(), "收到过 100 字节就该说收到过");
+    }
+    #[test]
+    fn tail_watch_measures_first_pcm_and_first_write_from_ready() {
+        let mut t = TailWatch::default();
+        t.note_ready(1_000_000);
+        t.note_pcm_out(1_120_000);
+        assert!(t.note_write_done(1_330_000, 85_000), "第一块必须报一次");
+        assert!(!t.note_write_done(1_415_000, 85_000), "第二块不许再报");
+        let s = t.summary();
+        assert!(s.contains("首包解码=120ms"), "{s}");
+        assert!(s.contains("首包播完=330ms"), "{s}");
+        assert!(s.contains("块数=2"), "{s}");
+        assert!(s.contains("平均块=85ms"), "{s}");
+    }
+
+    #[test]
+    fn tail_watch_without_ready_does_not_fabricate_milliseconds() {
+        // 原点未定的事件 → 「—」。钉住「测不出来就如实说」的纪律（与对照组同族）。
+        let mut t = TailWatch::default();
+        t.note_pcm_out(10_000);
+        assert!(!t.note_write_done(20_000, 5_000));
+        let s = t.summary();
+        assert!(s.contains("首包解码=\u{2014}"), "{s}");
+        assert!(s.contains("首包播完=\u{2014}"), "{s}");
+        assert!(s.contains("块数=1"), "块数是实数、不受原点影响：{s}");
+    }
+
+    #[test]
+    fn tail_watch_tracks_worst_and_average_block() {
+        let mut t = TailWatch::default();
+        t.note_ready(0);
+        t.note_write_done(90_000, 90_000);
+        t.note_write_done(200_000, 110_000);
+        t.note_write_done(260_000, 60_000);
+        let s = t.summary();
+        assert!(s.contains("最大块=110ms"), "{s}");
+        assert!(s.contains("平均块=86ms"), "260/3=86.67 截尾成 86：{s}");
     }
 }

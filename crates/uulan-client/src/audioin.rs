@@ -28,7 +28,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use uulan_media::playback::{self, Counters, PcmSink};
 use uulan_protocol::crypto::SecReadHalf;
@@ -164,7 +164,10 @@ pub fn start(
 /// 按平台挑实时播放后端。
 #[cfg(windows)]
 fn speaker() -> Result<Box<dyn PcmSink>, String> {
-    Ok(Box::new(winmm::WaveOut::open()?))
+    let sink = winmm::WaveOut::open()?;
+    // 与 unix 侧 pipe_speaker 同一句措辞 —— 脚本 grep 一条就够，跨机锚点靠它的行首时间戳。
+    info!("实时播放已接上 program=waveOut");
+    Ok(Box::new(sink))
 }
 
 #[cfg(not(windows))]
@@ -258,15 +261,21 @@ mod winmm {
         cb_size: u16,
     }
 
+    /// 与 Win32 `WAVEHDR`（x64）逐字段对齐：`dwUser`（DWORD_PTR）排在 `dwFlags` **之前**，
+    /// `lpNext` 是指针宽度。把两个 DWORD 紧挨着写会让内核把指针碎片读成 dwFlags，
+    /// `waveOutPrepareHeader` 直接回 11（MMSYSERR_INVALPARAM）—— 2026-11-19 跨机台架
+    /// 第一次往真设备出声才撞上；此前 Windows 播放路径只被 `--audio-save`（WAV 落盘）
+    /// 测过，结构体从没被真驱动校验过。布局由下面的断言测试钉死，不再靠肉眼。
     #[repr(C)]
     struct WaveHdr {
         data: *mut u8,
         buffer_length: u32,
         bytes_recorded: u32,
+        user: usize,
         flags: u32,
         loops: u32,
-        lp_data: usize,
-        reserved: usize,
+        next: *mut c_void,
+        reserved: u32,
     }
 
     #[link(name = "winmm")]
@@ -325,9 +334,10 @@ mod winmm {
                     data: std::ptr::null_mut(),
                     buffer_length: 0,
                     bytes_recorded: 0,
+                    user: 0,
                     flags: 0,
                     loops: 0,
-                    lp_data: 0,
+                    next: std::ptr::null_mut(),
                     reserved: 0,
                 }),
             })
@@ -399,6 +409,27 @@ mod winmm {
                     waveOutClose(self.h);
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod layout_tests {
+        use super::*;
+
+        /// x64 WAVEHDR：lpData(0) dwBufferLength(8) dwBytesRecorded(12) dwUser(16)
+        /// dwFlags(24) dwLoops(28) lpNext(32) reserved(40) → sizeof 48。
+        /// 错一个偏移，真驱动上的表现就是本轮撞到的 prepare 11 —— 这条测试是它的墓碑。
+        #[test]
+        fn wavehdr_matches_win32_abi_x64() {
+            assert_eq!(std::mem::size_of::<WaveHdr>(), 48, "WAVEHDR(x64) 是 48 字节");
+            assert_eq!(std::mem::offset_of!(WaveHdr, data), 0);
+            assert_eq!(std::mem::offset_of!(WaveHdr, buffer_length), 8);
+            assert_eq!(std::mem::offset_of!(WaveHdr, bytes_recorded), 12);
+            assert_eq!(std::mem::offset_of!(WaveHdr, user), 16);
+            assert_eq!(std::mem::offset_of!(WaveHdr, flags), 24, "dwFlags 不能在 dwUser 之前");
+            assert_eq!(std::mem::offset_of!(WaveHdr, loops), 28);
+            assert_eq!(std::mem::offset_of!(WaveHdr, next), 32);
+            assert_eq!(std::mem::offset_of!(WaveHdr, reserved), 40);
         }
     }
 }
