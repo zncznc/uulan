@@ -1,0 +1,55 @@
+IME 上屏端到端验收（Windows 控制端 → 麒麟 pluma）—— 2026-11-18 通过 8/0
+
+这条一直挂着「未验：真实 IME 上屏的中文（只把输入码页切成 UTF-8，没验过真实 IME）」。
+本轮把它拆开，结论跟一开始的猜测完全不同，所以两个错误判断都要写下来。
+
+## 先说我错在哪（两连错）
+
+1. 我第一反应是「窗口事件循环只处理 `KeyboardInput`，全仓库没人读 `event.text`，
+   所以 IME 根本没有通路」——**错**。`crates/uulan-client/src/window.rs:508` 明明白白
+   把 `event.text.as_deref()` 传进了 `key_action(...)`。
+2. 再读 `key_action` 又发现它不但认，还写得很讲究：
+   - 非 ASCII 文本 → **只发字符、不发物理键**（否则会打出「拼音字母 + 汉字」）；
+   - 有 Ctrl/Alt 这类组合键时**物理键优先**（`!mods.shortcut()` 守卫）；
+   - 松开事件永不发字符（成对发会造成重复字）；
+   - 没有物理键只有文本（软键盘、某些 IME 的提交事件）→ 发字符。
+   而且这些语义**已经有 5 条单测钉着**（`ime_text_becomes_chars_not_physical_keys`、
+   `shortcuts_win_over_text`、`key_release_never_produces_text`、
+   `text_without_a_physical_key_still_types`、`key_messages_pair_chars_and_pass_vk_through`）。
+
+教训：只 grep 到 `Event::Text` 没匹配上就下"没有通路"的断言，是把**搜索词的写法**
+当成了**代码的事实**。winit 0.29 里 IME 结果是通过 `KeyboardEvent.text` 承载的，
+不是 `Event::Text` —— 我按记忆里的事件名去找，自然找不到。
+
+## 真正没验的那一半，以及怎么把它变成可验的
+
+「单测钉住了纯函数」不等于「OS 真的会把 IME 提交送进这条分支」。而
+**Windows 上 IME 上屏一个汉字，进应用的就是 WM_CHAR（Unicode 包、没有扫描码）**；
+`SendInput` 用 `KEYEVENTF_UNICODE` 注入走的正是同一条 OS 路径 —— 于是这条"必须人手
+打中文"的欠账变成可以自动验收的东西。归档口径写清楚：验的是 OS 提交形态能不能走通，
+**不覆盖第三方 IME 自己的候选窗行为**（那不属于 uulan）。
+
+## 结果（`scripts/verify-ime-e2e.sh`，8 通过 / 0 失败，退出码 0）
+
+    ⓿ 被控端解锁态：:0 可用，1920x1080，锁屏 否                 PASS
+    ① 会话真的连上了（不是只开了窗口）                          PASS
+    ② 本地窗口已在收画面（画面 1280x720 · 24 fps）              PASS
+    ③ 对面 pluma 仍是键盘焦点                                    PASS
+       UNICODE '中文测试IME上屏' sent=18/18
+    ① 中文落进应用文档：文件变成 中文测试IME上屏BEFORE-144557    PASS
+    ② 物理键对照：VK A/B 也进去了（…上屏abBEFORE…）两条分支并存  PASS
+    ③ 没有拼音字母残骸（「只发字符不发物理键」这条纪律成立）      PASS
+    ④ 全程没有「指针锁定失败」                                   PASS
+
+## 过程中修掉的三个自己的错（都不是产品问题）
+
+1. **「窗口已就绪」不等于「会话已连上」**。第一版拿到的是
+   `画面 0x0 · 0 fps · 正在连接` 的窗口就去注键，全部落空 —— 报出来像"IME 坏了"，
+   实际是没人接。改成等日志出现「已连上」，并加一条判据「标题里画面尺寸不是 0x0」。
+2. **置前与注入必须在同一次调用里**。`capture-sendkey.py` 的 `--unicode` 分支写在了
+   `--focus` 处理**之前**就 `return`，所以那一次压根没置前；而单独一次调用里的置前
+   到下一次调用时早已过期（前台又被人拿回去了）。重写成 `--focus` 先做、随后同进程
+   注入，并在注入**前打印当前前台窗口标题** —— 从此"键没送到"和"功能坏了"分得开。
+3. **反面对照用错了注入方式**。④ 原本用 `--unicode "ab"`，那走的还是 IME 那条分支，
+   等于用被测分支去考被测分支；改成物理键 VK 65/66（A/B），才真的证明
+   「IME 分支没有把普通打字一起改掉」。

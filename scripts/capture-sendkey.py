@@ -18,6 +18,7 @@ import sys
 ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004   # IME 提交 / 软键盘：只有字符、没有扫描码
 
 
 class KEYBDINPUT(ctypes.Structure):
@@ -46,6 +47,27 @@ def _send_vk(vk: int, down: bool) -> int:
     arr[0].u.ki = KEYBDINPUT(wVk=vk, wScan=0, dwFlags=0 if down else KEYEVENTF_KEYUP,
                              time=0, dwExtraInfo=0)
     return user32.SendInput(1, ctypes.byref(arr), ctypes.sizeof(INPUT))
+
+
+def send_unicode(text: str) -> int:
+    """按 IME 提交的形态送字符：KEYEVENTF_UNICODE，wVk=0、wScan=该字符。
+
+    为什么这能当 IME 判据：微软拼音/搜狗上屏一个汉字时，进应用的就是
+    WM_CHAR（Unicode 包，无扫描码）；SendInput 用同样的标志送进去，落在
+    winit 上是 physical_key=Unidentified + text=该字符 —— 正是被测的那条分支。
+    「第三方 IME 自己的候选界面行为」不在本判据范围，如实写进归档。
+    """
+    user32 = ctypes.windll.user32
+    n = 0
+    for ch in text:
+        for down in (True, False):
+            arr = (INPUT * 1)()
+            arr[0].type = INPUT_KEYBOARD
+            flags = KEYEVENTF_UNICODE | (0 if down else KEYEVENTF_KEYUP)
+            arr[0].u.ki = KEYBDINPUT(wVk=0, wScan=ord(ch), dwFlags=flags, time=0, dwExtraInfo=0)
+            n += user32.SendInput(1, ctypes.byref(arr), ctypes.sizeof(INPUT))
+    print(f"UNICODE {text!r} sent={n}/{len(text) * 2}")
+    return 0 if n == len(text) * 2 else 1
 
 
 def focus(title_sub: str) -> int:
@@ -106,21 +128,51 @@ def send_vk(vk: int) -> int:
     return 0 if got == 2 else 1
 
 
+def fg_title() -> str:
+    """当前前台窗口的标题 —— 注入前必须看得见它，否则「键没送到」会被误读成「功能坏了」。"""
+    u = ctypes.windll.user32
+    h = u.GetForegroundWindow()
+    if not h:
+        return "<无前台窗口>"
+    n = u.GetWindowTextLengthW(h)
+    b = ctypes.create_unicode_buffer(n + 1)
+    u.GetWindowTextW(h, b, n + 1)
+    return b.value or "<无标题>"
+
+
 def main() -> int:
     args = sys.argv[1:]
-    title = None
-    if "--focus" in args:
-        i = args.index("--focus")
-        title = args[i + 1]
-        del args[i:i + 2]
+
+    def take(flag):
+        if flag in args:
+            i = args.index(flag)
+            v = args[i + 1]
+            del args[i:i + 2]
+            return v
+        return None
+
+    down_vk = take("--down")
+    up_vk = take("--up")
+    uni = take("--unicode")
+    title = take("--focus")
+
     rc = 0
+    # 顺序很重要：先置前，再在**同一个进程里**注入 —— 分两次调用时，第二次早就
+    # 不是前台了（上一版 --unicode 直接 return，把置前整段跳过，于是注入无人接收）。
     if title is not None:
         rc |= focus(title)
+    if uni is not None:
+        print(f"  注入前前台窗口：{fg_title()!r}")
+        rc |= send_unicode(uni)
+    if down_vk is not None:
+        rc |= 0 if _send_vk(int(down_vk, 0), down=True) == 1 else 1
+    if up_vk is not None:
+        rc |= 0 if _send_vk(int(up_vk, 0), down=False) == 1 else 1
     if args:
-        vk = int(args[0], 0)
-        rc |= send_vk(vk)
-    if not args and title is None:
-        print("用法: capture-sendkey.py [VK] [--focus <标题子串>]")
+        print(f"  注入前前台窗口：{fg_title()!r}")
+        rc |= send_vk(int(args[0], 0))
+    if not any([uni is not None, down_vk is not None, up_vk is not None, title is not None, args]):
+        print("用法: capture-sendkey.py [--focus 子串] [--unicode 文本] [VK|--down VK|--up VK]")
         return 1
     return rc
 
