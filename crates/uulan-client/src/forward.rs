@@ -60,32 +60,80 @@ pub struct ForwardSpec {
     pub target_port: u16,
 }
 
+/// 按 `:` 切分，但把 `[...]` 当一个整体（里面可以有冒号）。返回值第二项 = 这一段
+/// 是不是从方括号里出来的（用来强制「方括号里必须是 IPv6 字面量」）。
+fn split_top_level(s: &str) -> Result<Vec<(String, bool)>> {
+    let mut out: Vec<(String, bool)> = Vec::new();
+    let mut cur = String::new();
+    let mut in_br = false;
+    let mut br_used = false;
+    for c in s.chars() {
+        match c {
+            '[' if !in_br && cur.is_empty() && !br_used => in_br = true,
+            ']' if in_br => {
+                in_br = false;
+                br_used = true;
+            }
+            ':' if !in_br => {
+                out.push((std::mem::take(&mut cur), br_used));
+                br_used = false;
+            }
+            '[' | ']' => bail!("方括号位置不对（不能嵌套，也不能只写半边）"),
+            _ => cur.push(c),
+        }
+    }
+    if in_br {
+        bail!("方括号没闭合");
+    }
+    out.push((cur, br_used));
+    if out.iter().any(|(p, _)| p.is_empty()) {
+        bail!("有空的段（多余的冒号？）");
+    }
+    Ok(out)
+}
+
+fn parse_ip(part: &(String, bool), what: &str, whole: &str) -> Result<IpAddr> {
+    part.0
+        .parse::<IpAddr>()
+        .with_context(|| format!("--forward 的{what}看不懂：{}（整串 {whole}）", part.0))
+}
+
 impl ForwardSpec {
     /// 解析 `[绑定地址:]本地端口:目标主机:目标端口`。
     ///
-    /// 只接受 IPv4 绑定地址与主机名/IPv4 目标。IPv6 字面量要写成 `[::1]` 形式，
-    /// 第一版不支持（远控的典型用法都是 `127.0.0.1` 或内网 IP）；
-    /// 与其猜错分隔符，不如明确报错。
+    /// IPv6 字面量必须写成方括号（`[::1]:2222:[::1]:22`）—— 不去猜「第几个冒号是分隔符」：
+    /// 猜错的代价是把用户送进错误的地址。方括号里只接受 IPv6 字面量，写 `[somehost]`
+    /// 属于笔误，直接报错而不是当主机名用。
     pub fn parse(s: &str) -> Result<Self> {
-        let t = s.trim();
-        if t.contains('[') {
-            bail!("--forward 第一版不支持 IPv6 字面量：{s}（请用 IPv4 或主机名）");
-        }
-        let parts: Vec<&str> = t.split(':').collect();
-        let (bind_ip, local_port, host, port) = match parts.len() {
-            3 => (IpAddr::V4(Ipv4Addr::LOCALHOST), parts[0], parts[1], parts[2]),
-            4 => (
-                parts[0]
-                    .parse::<IpAddr>()
-                    .with_context(|| format!("--forward 的绑定地址看不懂：{}", parts[0]))?,
-                parts[1],
-                parts[2],
-                parts[3],
-            ),
-            _ => bail!(
-                "--forward 的格式是 [绑定地址:]本地端口:目标主机:目标端口（例如 2222:127.0.0.1:22），收到：{s}"
-            ),
-        };
+            let t = s.trim();
+            // 方括号是 IPv6 的唯一非歧义写法：`[::1]:2222` 里那个冒号属于地址，不属于分隔符。
+            // 不去猜「第几个冒号算分隔」—— 猜错的代价是把用户送进错误的地址。
+            let parts = split_top_level(t)
+                .with_context(|| format!("--forward 的方括号写法不对：{s}"))?;
+            let (bind_ip, local_port, host, port) = match parts.len() {
+                3 => (
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    parts[0].0.as_str(),
+                    parts[1].0.as_str(),
+                    parts[2].0.as_str(),
+                ),
+                4 => (
+                    parse_ip(&parts[0], "绑定地址", s)?,
+                    parts[1].0.as_str(),
+                    parts[2].0.as_str(),
+                    parts[3].0.as_str(),
+                ),
+                _ => bail!(
+                    "--forward 的格式是 [绑定地址:]本地端口:目标主机:目标端口（例如 2222:127.0.0.1:22、[::1]:2222:[::1]:22；IPv6 字面量必须写成方括号），收到：{s}"
+                ),
+            };
+            // 方括号里只能是 IPv6 字面量：写 [somehost] 是笔误，不能让它在后面偷偷当主机名用。
+            if parts.len() >= 3 {
+                let host_idx = parts.len() - 2;
+                if parts[host_idx].1 && parts[host_idx].0.parse::<IpAddr>().is_err() {
+                    bail!("--forward 目标主机方括号里必须是 IPv6 字面量，看不懂：{}", parts[host_idx].0);
+                }
+            }
         let local_port: u16 = local_port
             .parse()
             .with_context(|| format!("--forward 的本地端口不是数字：{local_port}"))?;
@@ -413,12 +461,38 @@ mod tests {
     }
 
     #[test]
-    fn bad_specs_are_errors_not_defaults() {
-        assert!(ForwardSpec::parse("2222:127.0.0.1").is_err(), "少一段必须报错");
-        assert!(ForwardSpec::parse("x:127.0.0.1:22").is_err(), "本地端口不是数字");
-        assert!(ForwardSpec::parse("2222:127.0.0.1:y").is_err(), "目标端口不是数字");
-        assert!(ForwardSpec::parse("2222::22").is_err(), "目标主机不能为空");
-        assert!(ForwardSpec::parse("2222:127.0.0.1:0").is_err(), "目标端口不能是 0");
-        assert!(ForwardSpec::parse("[::1]:2222:[::1]:22").is_err(), "IPv6 字面量第一版不支持");
+        fn bad_specs_are_errors_not_defaults() {
+            assert!(ForwardSpec::parse("2222:127.0.0.1").is_err(), "少一段必须报错");
+            assert!(ForwardSpec::parse("x:127.0.0.1:22").is_err(), "本地端口不是数字");
+            assert!(ForwardSpec::parse("2222:127.0.0.1:y").is_err(), "目标端口不是数字");
+            assert!(ForwardSpec::parse("2222::22").is_err(), "目标主机不能为空");
+            assert!(ForwardSpec::parse("2222:127.0.0.1:0").is_err(), "目标端口不能是 0");
+        }
+
+        #[test]
+        fn parses_ipv6_target_with_brackets() {
+            let s = spec("2222:[::1]:22");
+            assert_eq!(s.bind, SocketAddr::from(([127, 0, 0, 1], 2222)));
+            assert_eq!(s.target_host, "::1", "方括号要去掉：剩下的字面量才交给连接层");
+            assert_eq!(s.target_port, 22);
+        }
+
+        #[test]
+        fn parses_ipv6_bind_and_ipv6_target() {
+            let s = spec("[::1]:2222:[fe80::1]:22");
+            assert_eq!(s.bind, SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 2222)));
+            assert_eq!(s.target_host, "fe80::1");
+            assert_eq!(s.target_port, 22);
+        }
+
+        #[test]
+        fn ipv6_needs_brackets_and_brackets_need_ipv6() {
+            // 不带方括号的 IPv6 会被切成一堆段：明确报格式错，**不许猜**第几个冒号是分隔符
+            assert!(ForwardSpec::parse("::1:2222:::1:22").is_err(), "无方括号的 IPv6 不许猜");
+            // 方括号里写主机名是笔误（不能让它悄悄当主机名用）
+            assert!(ForwardSpec::parse("2222:[db.internal]:22").is_err(), "[主机名] 必须报错");
+            // 半边方括号
+            assert!(ForwardSpec::parse("2222:[::1:22").is_err(), "方括号没闭合要报错");
+            assert!(ForwardSpec::parse("2222:::1]:22").is_err(), "半边方括号要报错");
+        }
     }
-}
