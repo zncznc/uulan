@@ -17,6 +17,53 @@ paplay -d "$SINK" "$WORK/sil.wav" >/dev/null 2>&1 & KEEP=$!
 sleep 2
 echo "信宿状态（保活流挂着，应当是 RUNNING）：$(pactl list sinks short | awk '{print $NF}')"
 
+# ---- 第 0 步：判据自己的标定（不碰声卡、纯数学）----
+# 造一个「t=2.000 s 处硬起始」的 440 Hz 文件，让脚本里那两版起声判据各量一次。
+# 偏差不是 0 就说明后面所有「起声时刻」都带着系统误差 —— 2026-11-19 实测两版都是
+# +0.000 s（旧「过半」靠 -0.10 的人工标定凑正，中位数版天生就对），
+# 所以「monitor 台架说 0.44~0.59 s 而 Pulse 说 0.064 s」那段差**不是判据偏晚**造成的，
+# 是「PCM 进 aplay 之前」真的花了那么多时间。
+cat > "$WORK/calib.py" <<'PY'
+import math, os, struct, subprocess, sys
+wav = os.path.join(sys.argv[1], "calib.wav")
+subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                "-i", "aevalsrc=0.5*sin(2*PI*440*t)*gte(t\\,2):s=48000:d=6",
+                "-ac", "2", "-sample_fmt", "s16", wav], check=True)
+b = open(wav, "rb").read()
+off, data = 12, b""
+while off + 8 <= len(b):
+    cid = b[off:off+4]; sz = struct.unpack_from("<I", b, off+4)[0]
+    if cid == b"data":
+        sz = sz or (len(b) - off - 8); data = b[off+8:off+8+sz]; break
+    off += 8 + sz + (sz & 1)
+ch = struct.unpack_from("<H", b, 22)[0]; rate = struct.unpack_from("<I", b, 24)[0]
+n = len(data)//2; sm = struct.unpack_from("<%dh" % n, data, 0)
+mono = [(sm[i]+sm[i+1])//2 for i in range(0, n-(n % 2), 2)]
+def gtr(seg):
+    c = 2*math.cos(2*math.pi*440.0/rate); a = q = 0.0
+    for v in seg:
+        z = v + c*a - q; q, a = a, z
+    return a*a + q*q - c*a*q
+WIN, HOP = int(0.4*rate), int(0.05*rate)
+pw = []; i = 0
+while i + WIN <= len(mono):
+    pw.append(gtr(mono[i:i+WIN])/(WIN*WIN)); i += HOP
+top = sorted(pw)[max(1, int(len(pw)*0.75)):]; steady = top[len(top)//2]
+TRUE = 2.0
+o50 = next((k for k, p in enumerate(pw) if p >= 0.5*steady), None)
+half = 4; o90 = None
+for k in range(half, len(pw)-half):
+    seg = sorted(pw[k-half:k+half+1])
+    if seg[len(seg)//2] >= 0.9*steady:
+        o90 = k; break
+p50 = o50*0.05 + 0.2 - 0.10 if o50 is not None else float("nan")
+p90 = (o90-half)*0.05 + 0.2 if o90 is not None else float("nan")
+print("  真值起声 2.000 s —— 旧「过半」报 %.3f s（偏差 %+.3f）；中位数版报 %.3f s（偏差 %+.3f）"
+      % (p50, p50-TRUE, p90, p90-TRUE))
+PY
+echo "== 0. 判据标定（纯数学，不碰声卡）=="
+python3 "$WORK/calib.py" "$WORK" || echo "  标定跑不了（缺 ffmpeg 或 python3）—— 后面的起声时刻请少一分信任"
+
 cat > "$WORK/prof.py" <<'PY'
 import struct, sys, math
 b = open(sys.argv[1], "rb").read()
