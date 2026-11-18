@@ -1,0 +1,43 @@
+被控端图形客户端 + 离线安装包（2026-11-18）
+
+用户诉求：「我想实现被控端麒麟电脑也安装个客户端，让对方告诉你设备ID及口令进行连接」
+→ 后修正为：「需要一个可以在麒麟上手动运行的客户端，需要远程时让他点开客户端进行远程协助」
+→ 再修正为交付形态：「或者生成一个安装包，发给远程麒麟机让他安装」
+
+## 做成了什么
+
+1. 面板加第二页「本机（被控端）信息」（crates/uulan-gui/src/local.rs）：
+   设备 ID、名称、中继地址、一次性临时验证码（大字 + 复制）、永久口令（默认掩码，需显式展开）。
+2. **主张 changed**：默认念的是**一次性临时码**，不是永久口令。理由写在 local.rs 头部注释里：
+   临时码用一次即失效、每整点轮换；永久口令一直有效且连错 5 次锁 60 秒。
+3. 单实例锁（127.0.0.1:45579）：第二个实例发信号后自己退出，第一个实例在界面上显示
+   「又有人双击了一次图标」。为什么必须有：**两个窗口会各自显示不同的验证码**，
+   坐在屏幕前的人会把已作废的那张念出去 —— 我在真机上亲眼看到两个同名窗口并存。
+4. 这一屏每 2 秒自动重读配置（eframe 默认不重绘 → request_repaint_after 约醒；
+   用 repaint 会连续重绘空转）。
+5. 「关闭本机空闲锁屏与休眠锁」按钮：做成显式按钮，不偷偷改桌面配置。
+6. 桌面图标（不是开机自启）：scripts/install-kylin-gui.sh，装到 ~/桌面 与开始菜单，
+   并把之前我加的 autostart 项改名 .disabled。
+7. 离线安装包：deploy/make-package.sh 新增 --with-gui，产出含 bin/{server,host,client,gui,wait-x}
+   + install.sh + install-gui.sh + systemd + doc 的 tar.gz。
+
+## 真机验证（192.168.223.15，麒麟 V10 SP1）
+
+- 包：uulan-20261118-x86_64-linux.tar.gz，10613069 字节，
+  sha256 f658c87c5cbd44a7234977c4c6ee677f68ead75759fdbac75b261ca12de9f411（本机 certutil 与麒麟 md5 双验一致）
+- env -i PATH=/usr/bin:/bin 里跑 install-gui.sh：不需要 cargo、不需要源码，装成功
+- desktop-file-validate 合法；metadata::trusted: true（双击不弹"不受信任"）
+- gtk-launch（图标走这条路）→ 存活=1 窗=1；再 launch 一次 → 仍 1 进程 1 窗
+- 面板点「生成一次性临时码」→ 配置里真生成了 12 字符的码
+- **端到端**：用这张临时码从 Windows 连过去，对面日志
+  「鉴权通过 used_temp_code=true cred_slot=1」→「会话已授权，开始推流」→ 用完配置里 temp_code 变空
+- eframe/glow 在海光 C86 + Glenfly 上能编译能起窗（release 36s~1m19s）
+
+## 三个把我绊住的坑（都记下来）
+
+1. **pkill -x 打不中 ukui-screensaver-dialog**：Linux 的 comm 只留 15 字符，
+   必须按 PID 反查（第二次踩同一个坑了）。
+2. **UKUI 的 `lock-blank-screen=true` 是"黑屏即锁"**：锁屏页一盖，对面的人对着登录框
+   什么也念不出来，还会误报"软件坏了"。今天三次中断全来自它（包括那次 ssh 超时）。
+3. **gio launch 在这台麒麟上不存在**：我第一次用它测"双击可用"，得到的是 usage 文本和
+   两个 0，差点把"我的测试命令无效"当成"产品不行"报上去。改用 gtk-launch + desktop-file-validate。

@@ -23,6 +23,11 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod local;
+use local::LocalPanel;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -67,12 +72,20 @@ pub struct App {
     /// 显眼的失败提示。**v1 的教训**：失败只写在底部一行小字里，用户点了按钮看不出
     /// 任何反应，于是报「没有任何反应」—— 反馈藏在角落等于没有反馈。
     alert: String,
+    /// 0 = 远程控制（连别人）；1 = 本机（被控端）信息 —— 给对方念 ID 与一次性验证码那一屏。
+    tab: usize,
+    local: LocalPanel,
+    /// 被控端信息页必须**自动刷新**：这一屏的唯一用途就是把码念给别人，
+    /// 而临时码是一次性的 —— 屏幕上的旧值会让人念出一张已作废的码。
+    local_next: std::time::Instant,
+    /// 第二个实例被双击起来时竖起的旗子（由后台线程写、主线程读）。
+    relaunch: Arc<AtomicBool>,
     /// 最近一次启动的子进程：秒退就必须当场说出口（并把它的输出留在盘上）。
     child: Option<(std::process::Child, std::time::Instant, PathBuf)>,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(relaunch: Arc<AtomicBool>) -> Self {
         let cfg_path = config_path();
         let cfg = load_cfg(&cfg_path);
         let relay = if cfg.relay.is_empty() {
@@ -96,6 +109,10 @@ impl App {
             status: "就绪。填中继地址，点「刷新设备」。".to_string(),
             log: Vec::new(),
             alert: String::new(),
+            tab: 0,
+            local: LocalPanel::new(),
+            local_next: std::time::Instant::now(),
+            relaunch,
             child: None,
         }
     }
@@ -367,7 +384,7 @@ fn sanitize(args: &[String]) -> String {
     out
 }
 
-/// 找同目录（以及上级）里那个口令文件。口令本身从不写进 gui.json。
+/// 找同目录（以及上级）那个口令文件。口令本身从不写进 gui.json。
 fn sibling_pwfile() -> Option<PathBuf> {
     let mut cands: Vec<PathBuf> = Vec::new();
     if let Ok(cur) = std::env::current_exe() {
@@ -424,6 +441,12 @@ impl eframe::App for App {
             });
         });
 
+        // 每秒醒一次去看旗子（第二个实例被双击起来、或用户又点了一次图标）。
+        root.ctx().request_repaint_after(std::time::Duration::from_millis(1000));
+        if self.relaunch.swap(false, Ordering::Relaxed) && self.alert.is_empty() {
+            self.alert = "又有人双击了一次图标 —— 已经有一个面板在跑了，就是这个窗口。\n                两个窗口会各自显示不同的验证码，所以第二个被拒绝启动。".into();
+        }
+
         // 子进程秒退 = 「点了没反应」的真实形态。必须当场说，而不是等用户去猜。
         // 写法用 take/放回而不是 as_mut：as_mut 里再访问 self 会撞借用检查。
         if let Some((mut child, born, lp)) = self.child.take() {
@@ -445,6 +468,38 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(root, |ui| {
+            // 两页：这台机器去连别人 / 别人来连这台机器。UU 也是这么分的。
+            ui.horizontal(|ui| {
+                if ui.selectable_label(self.tab == 0, "远程控制").clicked() {
+                    self.tab = 0;
+                    self.alert.clear();
+                }
+                if ui.selectable_label(self.tab == 1, "本机（被控端）信息").clicked() {
+                    self.tab = 1;
+                    self.alert.clear();
+                    self.local.reload();
+                }
+            });
+            ui.separator();
+            if self.tab == 1 {
+                // eframe 默认只在有输入时重绘，所以必须显式约醒，否则这一屏永远停在旧值。
+                // 用 repaint_after 而不是 repaint：后者等于连续重绘，空转把 CPU 拉满。
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(600));
+                if std::time::Instant::now() >= self.local_next {
+                    self.local.reload();
+                    self.local_next = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                }
+                if !self.local.info.as_ref().map(|i| i.temp.clone()).unwrap_or_default().is_empty() {
+                    ui.label(egui::RichText::new(
+                        "↑ 这一屏每两秒自动重读配置；临时码用一次即失效，念出去的那张用完就作废。",
+                    )
+                    .weak()
+                    .small());
+                }
+                self.local.ui(ui);
+                return;
+            }
+
             if !self.alert.is_empty() {
                 ui.colored_label(egui::Color32::from_rgb(200, 40, 40), &self.alert);
                 if ui.button("我知道了").clicked() {
@@ -580,6 +635,18 @@ fn chrono_free_stamp() -> String {
 }
 
 fn main() {
+    // 单实例：同一台机器开两个面板，旧的那个会挂着**已作废的验证码**继续显示，
+    // 坐在屏幕前的人就会把废码念给你 —— 这不是难看，是让人白跑一趟。
+    let relaunch = Arc::new(AtomicBool::new(false));
+    match local::acquire_single_instance() {
+        Some(listener) => local::watch_relaunch(listener, relaunch.clone()),
+        None => {
+            note_error("已有一个面板在运行 —— 本次启动退出（避免两个窗口显示不同的验证码）。");
+            eprintln!("已有一个 uulan 面板在运行，请在任务栏里找到它。");
+            return;
+        }
+    }
+
     // 日志一律走 stderr（项目纪律）；改成 GUI 子系统后 stderr 没有去处，
     // 所以这里把 panic 与启动错误**同时**落到 gui-error.log。
     std::panic::set_hook(Box::new(|info| {
@@ -592,7 +659,7 @@ fn main() {
     if let Err(e) = eframe::run_native(
         "uulan 内网远控",
         opts,
-        Box::new(|_cc| Ok(Box::new(App::new()))),
+        Box::new(move |_cc| Ok(Box::new(App::new(relaunch.clone())))),
     ) {
         note_error(&format!("启动失败：{e}"));
         // 起不来时留一句能看见的话，比静默退出强。

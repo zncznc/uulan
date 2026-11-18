@@ -6,6 +6,7 @@
 #   bash deploy/make-package.sh                    # 版本号默认用今天日期
 #   bash deploy/make-package.sh --version 0.3.0 --out /tmp
 #   bash deploy/make-package.sh --with-client      # 连控制端 uulan-client 一起打进去
+#   bash deploy/make-package.sh --with-gui         # 连图形面板 uulan-gui 一起打进去（被控端那一屏）
 #
 # 产物：/tmp/uulan-<version>-x86_64-linux.tar.gz
 #       （解包即得 uulan-<version>-x86_64-linux/{bin,systemd,install.sh,uninstall.sh,doc}）
@@ -20,12 +21,14 @@ ROOT="$(cd "$HERE/.." && pwd)"
 VERSION="$(date +%Y%m%d)"
 OUT=/tmp
 WITH_CLIENT=0
+WITH_GUI=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --version) VERSION="$2"; shift 2 ;;
         --out)     OUT="$2"; shift 2 ;;
         --with-client) WITH_CLIENT=1; shift ;;
+    --with-gui)    WITH_GUI=1; shift ;;
         -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
         *) echo "未知参数 $1" >&2; exit 2 ;;
     esac
@@ -37,6 +40,7 @@ trap 'rm -rf "$STAGE"' EXIT
 
 PKGS="-p uulan-server -p uulan-host"
 [ "$WITH_CLIENT" = 1 ] && PKGS="$PKGS -p uulan-client"
+[ "$WITH_GUI" = 1 ] && PKGS="$PKGS -p uulan-gui"
 echo "==> 编译 $PKGS（原生，release）"
 ( cd "$ROOT" && cargo build --release $PKGS )
 
@@ -49,6 +53,13 @@ if [ "$WITH_CLIENT" = 1 ]; then
     install -m 0755 "$ROOT/target/release/uulan-client" "$STAGE/$NAME/bin/"
 fi
 install -m 0755 "$HERE/uulan-wait-x.sh"             "$STAGE/$NAME/bin/uulan-wait-x"
+if [ "$WITH_GUI" = 1 ]; then
+    # 面板是给**坐在被控端前的人**用的那一屏，装完之后要能在桌面上双击，
+    # 所以连用户态的图标安装脚本一起打进去（install.sh 是 root 跑的，装不了桌面图标）。
+    [ -x "$ROOT/target/release/uulan-gui" ] || { echo "打包失败：没有编出 uulan-gui" >&2; exit 1; }
+    install -m 0755 "$ROOT/target/release/uulan-gui" "$STAGE/$NAME/bin/"
+    install -m 0644 "$ROOT/scripts/install-kylin-gui.sh" "$STAGE/$NAME/install-gui.sh"
+fi
 install -m 0644 "$HERE/systemd/"*.service           "$STAGE/$NAME/systemd/"
 install -m 0755 "$HERE/install.sh"                  "$STAGE/$NAME/install.sh"
 install -m 0755 "$HERE/uninstall.sh"                "$STAGE/$NAME/uninstall.sh"
@@ -66,4 +77,8 @@ echo "==> $TARBALL"
 echo "    大小 $(du -h "$TARBALL" | cut -f1)；sha256："
 sha256sum "$TARBALL" | sed 's/^/    /'
 echo
-echo "对方机器上：tar xzf $NAME.tar.gz && cd $NAME && sudo bash install.sh"
+echo "对方机器上："
+echo "  tar xzf $NAME.tar.gz && cd $NAME && sudo bash install.sh --user <桌面用户> --server <中继IP:端口>"
+if [ "$WITH_GUI" = 1 ]; then
+    echo "  再切到那个桌面用户：bash install-gui.sh        # 装桌面图标「uulan 远程协助」"
+fi
