@@ -121,17 +121,86 @@ pub struct PlayerCandidate {
     pub args: Vec<String>,
 }
 
+/// 播放末端段的缓冲档位（微秒）—— aplay 的 `-B` / `-F`。
+///
+/// 为什么这是**产品参数**而不是「播放器自己的事」：2026-11-18 夜批把音频总延迟定位到
+/// 几乎全落在「PCM 进播放后端 → 信宿出声」这一段。2026-11-19 用两条互相独立的口径把
+/// 这一段拆开量（真麒麟，USB 声卡 + PulseAudio 13.99）：
+///
+/// - **PulseAudio 自己的账**（`pactl list sink-inputs` 的「缓冲延迟 + 信宿延迟」，
+///   不经过任何录音台架）：不给参数 = 300 + 137 = **437 ms**；
+///   `-B 100000 -F 25000` = 93 ms；`-B 50000 -F 12500` = **46 ms**；`-B 20000 -F 5000` = 34 ms。
+/// - **monitor 回采台架**（`scripts/probe-sink-tail-latency.sh`，起声位置判据）：
+///   1.10 → 0.60 → 0.50 → 0.50 s（绝对值偏高是 parecord 首块落盘的滞后，见归档；
+///   两边**都在 50 ms 这一档饱和**，所以再往下压没有可测收益，只剩 xrun 风险）。
+///
+/// 默认取 50 ms 缓冲 / 12.5 ms 周期：比「不给参数」低一个数量级，又给声卡留四个周期 ——
+/// 缓冲薄到 20 ms 以下时，进程被调度打断一次，现场听到的就是一声「咔哒」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TailBuffer {
+    /// aplay `-B`：缓冲总时长（微秒）。
+    pub buffer_us: u32,
+    /// aplay `-F`：周期时长（微秒）—— Pulse 按周期唤醒，这一段直接加在起声之前。
+    pub period_us: u32,
+}
+
+/// 实测饱和档（见 `TailBuffer` 的说明）。改这两个数就要重新在真机上量一遍末端段。
+pub const DEFAULT_BUFFER_US: u32 = 50_000;
+pub const DEFAULT_PERIOD_US: u32 = 12_500;
+
+impl Default for TailBuffer {
+    fn default() -> Self {
+        TailBuffer { buffer_us: DEFAULT_BUFFER_US, period_us: DEFAULT_PERIOD_US }
+    }
+}
+
+/// 现场换档位的开关（**整数毫秒**，不用重新编二进制）。
+/// 值不合法就**报错**、不静默退回默认 —— 与 `power_allow` / `mic_sink` 同一条纪律：
+/// 「拼错的词被当成没配」的静默降级，在现场比直接起不来难查得多。
+pub const TAIL_MS_ENV: &str = "UULAN_AUDIO_TAIL_MS";
+
+/// 5..=1000 毫秒 → 档位（周期 = 缓冲的四分之一）。
+pub fn parse_tail_ms(raw: &str) -> Result<TailBuffer, String> {
+    let ms: u32 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("{TAIL_MS_ENV}=\"{raw}\" 不是整数毫秒（合法的写法如 20 / 50 / 100）"))?;
+    if !(5..=1000).contains(&ms) {
+        return Err(format!("{TAIL_MS_ENV}={ms} 超出范围（5..=1000 毫秒）"));
+    }
+    Ok(TailBuffer { buffer_us: ms * 1_000, period_us: ms * 250 })
+}
+
+/// 从进程环境取档位（生产入口）。
+pub fn tail_setting() -> Result<TailBuffer, String> {
+    tail_setting_from(|k| std::env::var(k).ok())
+}
+
+/// 环境由调用方给 —— 纯函数，本机（没有 aplay 的 Windows）也能钉住「这个开关到底怎么被采用」。
+/// 空值按「没配」处理（导出了空串等于没导，这是 shell 里的常态）。
+pub fn tail_setting_from(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<TailBuffer, String> {
+    match lookup(TAIL_MS_ENV) {
+        None => Ok(TailBuffer::default()),
+        Some(raw) if raw.trim().is_empty() => Ok(TailBuffer::default()),
+        Some(raw) => parse_tail_ms(&raw),
+    }
+}
+
 /// 候选表。**只列实测过能吃 raw stdin 的命令**：`paplay` 在真麒麟上明确不行（见模块头），
 /// `pw-play` 手边没有 PipeWire 机器可验 —— 写进来就是拿没验证过的东西去抢播放顺序。
 ///
 /// 为什么它是纯函数：参数错一个字符，现场的表现是「流在动、统计在涨、一声不响」，
 /// 那是最难查的一类故障，所以两个平台的单测都得能钉住这张表。
-pub fn player_candidates() -> Vec<PlayerCandidate> {
+pub fn player_candidates_with(tail: TailBuffer) -> Vec<PlayerCandidate> {
     vec![PlayerCandidate {
         program: "aplay",
         // raw 模式必须把格式说全：少了任何一项，ALSA 要么当场报错退出，要么按错的规格播。
         args: vec![
             "-q".into(),
+            "-B".into(),
+            tail.buffer_us.to_string(),
+            "-F".into(),
+            tail.period_us.to_string(),
             "-t".into(),
             "raw".into(),
             "-f".into(),
@@ -144,6 +213,14 @@ pub fn player_candidates() -> Vec<PlayerCandidate> {
         ],
     }]
 }
+
+/// 默认档位的那张表（自检这类「只要知道用哪个命令」的场合用它，不起进程、不读环境）。
+pub fn player_candidates() -> Vec<PlayerCandidate> {
+    player_candidates_with(TailBuffer::default())
+}
+
+/// 生产用：按进程环境决定档位。环境值写坏时 `tail_setting()` 就失败，错误一路带到
+/// 「音频起不来」的回话里 —— 别等到 aplay 起来才发现参数是猜的。
 
 /// 按 PATH 的顺序找可执行文件；「算不算可执行」由调用方给，单测因此不碰磁盘。
 pub fn find_in_path_with(
@@ -259,7 +336,8 @@ pub fn pipe_speaker() -> Result<Box<dyn PcmSink>, String> {
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
     let mut tried = Vec::new();
-    for cand in player_candidates() {
+    let tail = tail_setting()?;
+    for cand in player_candidates_with(tail) {
         let Some(found) = find_in_path(cand.program, &dirs) else {
             tried.push(format!("{}（不在 PATH）", cand.program));
             continue;
@@ -268,7 +346,10 @@ pub fn pipe_speaker() -> Result<Box<dyn PcmSink>, String> {
             Ok(o) => {
                 // 这行是「本机到底有没有出声」唯一可 grep 的证据：统计里那个播放字节数只说明
                 // 字节写进了管道，而管道能一声不响地吞掉一整晚。
-                info!(program = %cand.program, rate = SAMPLE_RATE, channels = CHANNELS,
+                // program 必须是第一个字段：验收脚本 grep 的是「实时播放已接上 program=aplay」。
+                // buffer_us/period_us 跟着上日志，是为了事后能回答「这台当时用的是哪一档」。
+                info!(program = %cand.program, buffer_us = tail.buffer_us,
+                      period_us = tail.period_us, rate = SAMPLE_RATE, channels = CHANNELS,
                       "实时播放已接上");
                 return Ok(Box::new(o));
             }
@@ -513,7 +594,52 @@ mod tests {
         assert_eq!(val("-f").as_deref(), Some("S16_LE"));
         assert_eq!(val("-c").as_deref(), Some(CHANNELS.to_string()).as_deref());
         assert_eq!(val("-r").as_deref(), Some(SAMPLE_RATE.to_string()).as_deref());
+        assert_eq!(val("-B").as_deref(), Some(DEFAULT_BUFFER_US.to_string()).as_deref(),
+                  "缓冲时长必须进参数 —— 不给就是实测的 437 ms 末端段");
+        assert_eq!(val("-F").as_deref(), Some(DEFAULT_PERIOD_US.to_string()).as_deref());
         assert_eq!(a.last().map(|s| s.as_str()), Some("-"), "数据必须从 stdin 进");
+    }
+
+    /// 档位是实测出来的，不是猜的：默认必须是「50 ms 缓冲 / 12.5 ms 周期」这一档
+    /// （再小没有可测收益、只有 xrun 风险；再大就是把 0.4 s 白送给缓冲）。
+    #[test]
+    fn tail_default_is_the_measured_saturation_setting() {
+        assert_eq!(TailBuffer::default().buffer_us, 50_000);
+        assert_eq!(TailBuffer::default().period_us, 12_500, "周期 = 缓冲的四分之一");
+        let with = player_candidates_with(TailBuffer { buffer_us: 20_000, period_us: 5_000 });
+        let a = with[0].args.join(" ");
+        assert!(a.contains("-B 20000 -F 5000"), "换档位必须换到参数上：{a}");
+        assert_eq!(player_candidates(), player_candidates_with(TailBuffer::default()),
+                   "默认表与 default 档位算出来的表必须一字不差（别出现两份默认值）");
+    }
+
+    /// 现场开关只收 5..=1000 的整数毫秒；写坏了**报错**，不静默用默认
+    /// （与 power_allow / mic_sink 同一条纪律）。空值按没配处理。
+    #[test]
+    fn tail_env_is_strict_and_empty_means_unset() {
+        assert_eq!(parse_tail_ms("50").unwrap(), TailBuffer::default());
+        assert_eq!(parse_tail_ms(" 20 ").unwrap(), TailBuffer { buffer_us: 20_000, period_us: 5_000 });
+        for bad in ["4", "1001", "abc", "50ms", "-20"] {
+            let e = parse_tail_ms(bad).unwrap_err();
+            assert!(e.contains(TAIL_MS_ENV), "错误里必须写出开关名，现场才知道改哪：{e}");
+        }
+        let no_env = |_: &str| None;
+        assert_eq!(tail_setting_from(no_env).unwrap(), TailBuffer::default());
+        let empty = |_: &str| Some("   ".to_string());
+        assert_eq!(tail_setting_from(empty).unwrap(), TailBuffer::default(), "空值=没配");
+        let bad = |_: &str| Some("99999".to_string());
+        assert!(tail_setting_from(bad).is_err(), "写坏了就失败，不许退回默认");
+    }
+
+    /// 参数里除格式与档位之外不许混进「按机器状态猜」的东西：同一档位在任何机器上
+    /// 算出来的字节必须一字不差（否则验收数字没法归因到参数上）。
+    #[test]
+    fn player_args_do_not_depend_on_machine_state() {
+        let a = player_candidates_with(TailBuffer::default())[0].args.clone();
+        let b = player_candidates_with(TailBuffer::default())[0].args.clone();
+        assert_eq!(a, b);
+        assert_eq!(a.iter().filter(|s| *s == "-B").count(), 1, "-B 只出现一次");
+        assert_eq!(a.iter().filter(|s| *s == "-F").count(), 1);
     }
 
     /// 解码输出的格式与播放命令要的格式共用同一组常量 —— 这条钉的是「别改一端」。

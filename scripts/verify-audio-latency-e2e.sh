@@ -169,6 +169,30 @@ if cmd == "onset":
             # 命中窗的覆盖约 3/4（本机合成音硬起始标定：恒偏晚 0.10 s，已扣）
             print("%.3f %.3g %.3g" % (i * HOP + WIN / 2 - 0.10, steady, p)); sys.exit(0)
     print("NONE %.3g 0" % steady); sys.exit(0)
+if cmd == "onset90":
+    # 「真的响了」而不是「爬坡爬过一半」：首次达到稳态 90% 且随后 0.45 s 都站得住。
+    # 为什么不用 50%：这块信宿在会话起来后有约 2.2 s 的两路同步启动爬坡（2026-11-19 逐窗
+    # 功率实测），50% 阈值落在爬坡里，起声时刻随爬坡形状抽签（同一二进制两轮差 0.75 s）。
+    freq = float(sys.argv[3]); hold = int(sys.argv[4]) if len(sys.argv) > 4 else 9
+    pw = winpowers(samples, rate, freq)
+    steady = steady_of(pw)
+    if steady < 1e-8:
+        print("NONE 0 0"); sys.exit(0)
+    thr = 0.9 * steady
+    for i in range(len(pw) - hold + 1):
+        if all(pw[j] >= thr for j in range(i, i + hold)):
+            print("%.3f %.3g %.3g" % (i * HOP + WIN / 2, steady, pw[i])); sys.exit(0)
+    print("NONE %.3g 0" % steady); sys.exit(0)
+if cmd == "powermin":
+    # 稳态段里的最小窗功率 / 全体窗功率中位数 —— 播放缓冲压薄之后，
+    # 一次 xrun 就是一次「掉下去一块」，这里不靠日志也能抓到。
+    freq = float(sys.argv[3]); t0 = float(sys.argv[4]); t1 = float(sys.argv[5])
+    pw = winpowers(samples, rate, freq)
+    i0 = max(0, int(round(t0 / HOP))); i1 = min(len(pw) - 1, int(round(t1 / HOP)))
+    seg = pw[i0:i1+1]
+    if not seg:
+        print("0 0"); sys.exit(0)
+    print("%.4g %.4g" % (min(seg), steady_of(pw))); sys.exit(0)
 if cmd == "power":
     freq = float(sys.argv[3]); t0 = float(sys.argv[4]); t1 = float(sys.argv[5])
     pw = winpowers(samples, rate, freq)
@@ -237,6 +261,12 @@ fi
 
 echo "== 2. 双向延迟同会话（--audio + --mic；下行 440 / 上行 880，${RUN_SECS}s）=="
 start_rec "$WORK/loop.wav"
+# 会话中途（起流后约 5 s，稳态里）采一次 PulseAudio 自己的延迟账。
+# 为什么要第二个口径：monitor 那套的时间基是「parecord 首块落盘」，而首块是成块刷出来的
+# （2026-11-19 实测：spawn→首块可见 1.2~2.2 s），绝对值天然偏高；pactl 的
+# 「缓冲延迟 + 信宿延迟」是 Pulse 按设备进度算的，两者互为对照，差值才是可信的那部分。
+( sleep 5; LC_ALL=C pactl list sink-inputs > "$WORK/si-during.txt" 2>&1 ) &
+SAMPLER=$!
 sleep 1
 RUST_LOG=info timeout 60 "$CLI" --server "127.0.0.1:$PORT_D" --device "$duplex_DEVICE" \
   --password-file "$duplex_PW" --headless --seconds "$RUN_SECS" \
@@ -244,6 +274,7 @@ RUST_LOG=info timeout 60 "$CLI" --server "127.0.0.1:$PORT_D" --device "$duplex_D
   --audio --mic --mic-source "lavfi:sine=frequency=880:sample_rate=48000" \
   >"$WORK/client-dup.log" 2>&1
 CRC=$?
+wait "$SAMPLER" 2>/dev/null
 stop_rec
 sed -E 's/\x1b\[[0-9;]*m//g' "$WORK/client-dup.log" > "$WORK/client-dup.plain"
 [ "$CRC" -eq 0 ] && ok "双向会话控制端正常收工（退出码 0）" || bad "控制端退出码 $CRC"
@@ -263,10 +294,11 @@ else
   echo; echo "结论：$PASS 通过 / $FAIL 失败 / $SKIP 跳过（$WORK）"; exit 1
 fi
 
-POS4=$(python3 "$WORK/an.py" onset "$WORK/loop.wav" 440 | awk '{print $1}')
-POS8=$(python3 "$WORK/an.py" onset "$WORK/loop.wav" 880 | awk '{print $1}')
+POS4=$(python3 "$WORK/an.py" onset90 "$WORK/loop.wav" 440 | awk '{print $1}')
+POS8=$(python3 "$WORK/an.py" onset90 "$WORK/loop.wav" 880 | awk '{print $1}')
 RECDUR=$(python3 "$WORK/an.py" dur "$WORK/loop.wav")
-echo "  录制 ${RECDUR}s；440 起声 @${POS4}s，880 起声 @${POS8}s（相对录音数据起点）"
+echo "  录制 ${RECDUR}s；440 起声 @${POS4}s，880 起声 @${POS8}s（相对录音数据起点；"
+echo "    起声判据 = 达到稳态 90% 且稳住 0.45 s（2026-11-19 起用这条；旧「过半」落在启动爬坡里，偏早）"
 { [ -n "$POS4" ] && [ "$POS4" != "NONE" ]; } || bad "录回来的声音里没有 440 起声 —— 下行没出声，延迟无从谈起"
 { [ -n "$POS8" ] && [ "$POS8" != "NONE" ]; } || bad "录回来的声音里没有 880 起声 —— 上行没出声，延迟无从谈起"
 if [ "$POS4" = "NONE" ] || [ "$POS8" = "NONE" ] || [ -z "$POS4" ] || [ -z "$POS8" ]; then
@@ -289,10 +321,59 @@ in_range "$L_UP" && ok "上行总延迟在合理区间 (0.02, 3.0)s：${L_UP} s"
 awk -v v="$TAIL_DOWN" 'BEGIN{exit !(v>-0.2 && v<2.0)}' && ok "下行末端段自洽（就绪→出声，${TAIL_DOWN} s）" || bad "下行末端段异常：${TAIL_DOWN} s（锚点顺序可疑）"
 awk -v v="$TAIL_UP" 'BEGIN{exit !(v>-0.2 && v<2.0)}' && ok "上行末端段自洽（${TAIL_UP} s）" || bad "上行末端段异常：${TAIL_UP} s"
 
+# 起声同刻在这台机器上是**预期**（两路共用同一个信宿的启动爬坡，onset90 量的就是爬到稳态
+# 那一刻），所以它不是失败判据；「两个频率没串」由下面两条功率比判据负责。
 SEP=$(calc "$POS4 - $POS8"); SEP=${SEP#-}
 awk -v v="$SEP" 'BEGIN{exit !(v>0.05)}' \
   && ok "两个起声相互独立（相差 ${SEP} s > 0.05 s，两个频率没串）" \
-  || bad "两个起声几乎同刻（${SEP} s）—— 判据器或频率没分开"
+  || skip "两个起声同刻（${SEP} s）—— 两路共用这台机器的启动爬坡，同刻是预期；串扰看下面的功率比"
+
+# —— 本轮到底用的是哪一档播放缓冲？让二进制自己说（旧二进制没这个字段 → 记 SKIP，别记成失败）
+TAILLINE=$(grep -aoE "实时播放已接上 program=[a-z]+ buffer_us=[0-9]+ period_us=[0-9]+" "$WORK/client-dup.plain" | head -1)
+if [ -z "$TAILLINE" ]; then
+  skip "客户端日志里没有 buffer_us/period_us 字段（旧二进制 = 不给缓冲参数那一档）"
+else
+  ok "档位自证：$TAILLINE"
+fi
+# —— 第二个口径：PulseAudio 自己算的这条 aplay 流的延迟（缓冲延迟 + 信宿延迟）。
+#    采样时用 LC_ALL=C 把 pactl 的输出钉成英文，判据不跟着现场语言走。
+PA_US=$(python3 - "$WORK/si-during.txt" <<'PY'
+import re, sys
+try:
+    t = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+except OSError:
+    print(""); sys.exit(0)
+for b in re.split(r"^Sink Input #\d+", t, flags=re.M)[1:]:
+    if 'application.process.binary = "aplay"' not in b:
+        continue
+    bl = re.search(r"Buffer Latency:\s*(\d+) usec", b)
+    sl = re.search(r"Sink Latency:\s*(\d+) usec", b)
+    if bl and sl:
+        print(int(bl.group(1)) + int(sl.group(1))); sys.exit(0)
+print("")
+PY
+)
+if [ -n "$PA_US" ]; then
+  echo "  PulseAudio 自报（会话中途，这条 aplay 流）：末端段 $(calc "$PA_US / 1000000") s（缓冲延迟+信宿延迟，与录音时间基无关）"
+else
+  echo "  PulseAudio 的账采不到（$WORK/si-during.txt 里没有 aplay 那条流）—— 只报 monitor 口径"
+fi
+# —— 小缓冲的代价是 xrun：稳态里若掉过声音，最小窗功率会明显低于稳态中位数。
+#    窗口从「起声 +0.6 s」起（起声用的是 onset90，本身已经站在稳态上）：
+#    会话起来后约 2.2 s 内有一个**两路一起**的启动暂态
+#    （功率冲到稳态的 63% → 掉回 0 → 再爬回稳态），那是流起来那一下的事，不是稳态 xrun；
+#    把它算进判据会把每次运行都判红（首跑就是这么红的，已核对逐窗功率数据）。
+for pair in "下行:440:$POS4" "上行:880:$POS8"; do
+  LBL=${pair%%:*}; rest=${pair#*:}; FQ=${rest%%:*}; AT=${rest#*:}
+  read -r PMIN PSTEADY <<<"$(python3 "$WORK/an.py" powermin "$WORK/loop.wav" "$FQ" $(calc "$AT + 0.6") $(calc "$AT + 4.6"))"
+  if [ -z "${PMIN:-}" ] || [ "$PMIN" = "0" ]; then
+    bad "$LBL 稳态段读不出功率（${FQ} Hz）—— 判不出有没有 xrun"
+  else
+    awk -v a="$PMIN" -v b="$PSTEADY" 'BEGIN{exit !(a > 0.5*b)}' \
+      && ok "$LBL 稳态里没掉过声音（${FQ} Hz 最小窗功率 ${PMIN} > 稳态 ${PSTEADY} 的一半）" \
+      || bad "$LBL 稳态里功率掉过块（最小 ${PMIN} vs 稳态 ${PSTEADY}）—— 播放缓冲太薄的表现"
+  fi
+done
 
 P4=$(python3 "$WORK/an.py" power "$WORK/loop.wav" 440 "$POS8" $(calc "$POS8 + 5"))
 P8=$(python3 "$WORK/an.py" power "$WORK/loop.wav" 880 "$POS8" $(calc "$POS8 + 5"))
