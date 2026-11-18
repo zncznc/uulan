@@ -84,7 +84,7 @@ cat > "$WORKW/clean.sh" <<'CLS'
 while read -r pid; do kill "$pid" 2>/dev/null; done < "$1/pids"
 CLS
 
-cleanup() { ssh "$KY" "bash $WORKK/clean.sh $WORKK" 2>/dev/null; return 0; }
+cleanup() { ssh "$KY" "bash $WORKK/clean.sh $WORKK" 2>/dev/null; python -c "import os,sys;[os.remove(p) for p in sys.argv[1:] if os.path.exists(p)]" "$WORKW/pw.txt" "$WORKW/pw.raw" 2>/dev/null; return 0; }
 trap cleanup EXIT
 
 echo "== 0. 前置：真机可达 + 物料 =="
