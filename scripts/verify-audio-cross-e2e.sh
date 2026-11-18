@@ -192,6 +192,32 @@ grep -aF "被控端正在推流" "$WORKW/client.plain" >/dev/null \
   && ok "音频到过「被控端正在推流」（AudioWatch 见过 running:true）" || bad "音频状态从没到 Running"
 FAILHOST=$(grep -acF "起不来" "$WORKW/host.plain")
 [ "${FAILHOST:-0}" -eq 0 ] && ok "被控端无「起不来」" || bad "被控端音频起不来（$FAILHOST 条）"
+echo "== 3b. 上行跨机（--mic，Windows 侧 lavfi 880Hz → 麒麟 aplay，${RUN_SECS}s）=="
+RUST_LOG=info timeout 120 "$CLI" --server "$KY_IP:$PORT" --device "$DEV" \
+  --password-file "$WORKW/pw.txt" --headless --seconds "$RUN_SECS" \
+  --no-input --no-clipboard \
+  --mic --mic-source "lavfi:sine=frequency=880:sample_rate=48000" > "$WORKW/client-up.log" 2>&1
+URC=$?
+sed -E 's/\x1b\[[0-9;]*m//g' "$WORKW/client-up.log" > "$WORKW/client-up.plain"
+[ "$URC" -eq 0 ] && ok "上行会话控制端正常收工（退出码 0）" || bad "上行会话控制端退出码 $URC"
+ssh "$KY" "cat $WORKK/host.log" > "$WORKW/host2.raw" 2>/dev/null
+sed -E 's/\x1b\[[0-9;]*m//g' "$WORKW/host2.raw" > "$WORKW/host2.plain"
+# 锚点变量带 UP 前缀：U1 在上面已是对表不确定度（同名互相覆盖是台架的老事故族）。
+UPA=$(log_epoch "$WORKW/client-up.plain" "麦克风转接已开始")
+UPE=$(log_epoch "$WORKW/host2.plain" "实时播放首包已播完")
+[ -n "$UPA" ] && ok "锚：控制端「麦克风转接已开始」" || bad "缺「麦克风转接已开始」锚点"
+[ -n "$UPE" ] && ok "锚：被控端「实时播放首包已播完」（上行也有机内账了）" || bad "缺被控端首包播完锚点"
+if [ -n "$UPA" ] && [ -n "$UPE" ]; then
+  LU=$(calc "$UPE - $UPA - ($OK1)")
+  UTAIL=$(grep -aF "播放末端统计" "$WORKW/host2.plain" | tail -1 | grep -oE "首包播完=[0-9]+" | cut -d= -f2)
+  echo "  跨机上行为时（转接已开始 → 被控端首块在 aplay 上放完）= ${LU}s（对表 ±${U1}s）"
+  [ -n "$UTAIL" ] && echo "  其中麒麟机内末端段 = ${UTAIL}ms（aplay 首块含唤醒）"
+  python -c "import sys; sys.exit(0 if 0.0 < float('$LU') < 6.0 else 1)" \
+    && ok "跨机上行为时合理（0 < ${LU} < 6 s）" || bad "跨机上行为时 ${LU}s 出界"
+else
+  bad "上行锚点不齐，跨机上行数值没算"
+fi
+
 
 echo
 echo "结论：$PASS 通过 / $FAIL 失败 / $SKIP 跳过（本地 $WORKW 远端 $WORKK）"
