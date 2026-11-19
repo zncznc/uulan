@@ -324,7 +324,7 @@ impl App {
             self.alert = "还没填设备 ID —— 点上面列表里那一行，或自己写进来。\n                （想不经中继直接连，就在「直连地址」里填 被控端IP:21117，那时不用设备 ID）".into();
             return;
         }
-        if (self.password.trim().is_empty() && self.os_user.trim().is_empty()) {
+        if self.password.trim().is_empty() && self.os_user.trim().is_empty() {
             // 这一格装的是**一次性临时码**（被控端那一屏大字显示的那张），不是永久口令。
             // 加密握手（PAKE）拿它当共享密钥，所以它必填；用户名+登录密码是第二因素。
             self.alert = "请填「临时码/口令」。\n\
