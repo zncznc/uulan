@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
@@ -552,12 +552,20 @@ pub async fn run_with_sink(
     if want_os && !os_mode {
         // 客户端明确要求用户名密码，但这台没开（或 pam 没开）。宁可当场拒绝，
         // 也不能悄悄回落成 PAKE —— 客户端手里没有临时码，回落只会变成"连不上"。
+        //
+        // **拒绝也必须说明原因**（同「电源动作每次都要回一句」的纪律）：只说在日志里，
+        // 控制端那边就是一句「握手期间被控端断开」—— 现场会去查网络/防火墙，而真相
+        // 是一条配置。这一帧还必须**加密**发：控制端发完 AuthMode 就立刻用同一把 DH
+        // 密钥包好了 SecControl，明文帧在它那里是「解密失败」，比不说更糟。
+        let reason = os_mode_refusal(snap0.auth_os, snap0.pam.enabled);
         warn!(
             %peer,
             auth_os = snap0.auth_os,
             pam = snap0.pam.enabled,
-            "控制端要求系统账户口令认证，但这台未启用（--auth os 需要同时开 --pam）"
+            %reason,
+            "控制端要求系统账户口令认证，但这台未启用 —— 已把原因回给控制端"
         );
+        let _ = refuse_os_mode(control, &keys0, Role::Host, &reason).await;
         return SessionOutcome::Unauthenticated(peer);
     }
 
@@ -2379,6 +2387,59 @@ async fn read_c2h<R: AsyncRead + Unpin>(s: &mut R) -> Result<Option<C2H>, String
     f.decode_json().map(Some).map_err(|e| e.to_string())
 }
 
+/// 「控制端要系统账户认证、这台没有」时**说给对方听的那句话**。
+///
+/// 两种配错必须说得出区别：没开 OS 模式（认的仍是口令/临时码）与开了但 PAM 没开
+/// （谁都不许登录）。混成一句「认证失败」等于让现场去猜配置。
+fn os_mode_refusal(auth_os: bool, pam: bool) -> String {
+    if !auth_os {
+        "这台被控端没有启用「系统账户」认证，它认的是临时码/口令。\
+         请改填临时码/口令；要让系统账户能登录，得让管理员在被控端用 --auth os 并开启 --pam。"
+            .to_string()
+    } else if !pam {
+        format!(
+            "这台被控端配了「系统账户」认证，但 PAM 没开（pam.enabled=false）—— 系统账户一律登不进来。\
+             让管理员在被控端 host.json 里打开 pam.enabled 后重启被控端。"
+        )
+    } else {
+        // 到这里说明 os_mode_enabled 与这里的判断不一致（真出 bug 了），
+        // 但也必须回一句话，不许静默。
+        "这台被控端暂时不能做系统账户认证。".to_string()
+    }
+}
+
+/// 拒绝 OS 模式请求：把原因**加密**回一帧 `H2C::Bye`，然后把对面写来的字节读干再收尾。
+///
+/// 抽成泛型函数是为了能在本机用 `duplex` 钉住「这句话真的变成了对面读得到的一帧」——
+/// 与画面中断原因那条的 `the_reason_really_goes_on_the_wire_as_a_decodable_frame` 同一手法。
+///
+/// **为什么发完还要读一会儿**：控制端发完 AuthMode 就立刻发 Hello，那几帧还在路上/在对端
+/// 缓冲里。带着未读数据直接关 socket，Windows 会给对面一个 RST —— 排队中的 Bye 当场被丢掉，
+/// 控制端看到的又变回「远程主机强迫关闭了一个现有的连接」。实测就是这么撞上的（本机台架，
+/// 2026-11-20），所以这不是理论洁癖。
+async fn refuse_os_mode<S>(stream: S, keys: &SessionKeys, role: Role, reason: &str) -> Result<(), String>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut rd, wr) = tokio::io::split(stream);
+    let mut w = crypto::SecWriter::new(wr, &keys.channel(Channel::Control), role, Channel::Control);
+    send_h2c(&mut w, &H2C::Bye { reason: reason.to_string() }).await?;
+    // write_frame 已经 flush 过，这里再 flush 一次是防「半条记录」留在缓冲里。
+    w.flush().await.map_err(|e| format!("拒绝帧没写出去：{e}"))?;
+    // 给对面把话读完的时间（它读到 Bye 就自己关，实测毫秒级；上限 2 秒只是兜底）。
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut sink = [0u8; 1024];
+        loop {
+            match rd.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    Ok(())
+}
+
 async fn send_h2c<W: tokio::io::AsyncWrite + Unpin>(s: &mut W, m: &H2C) -> Result<(), String> {
     let bytes = serde_json::to_vec(m).map_err(|e| e.to_string())?;
     write_frame(s, FrameKind::Json, &bytes).await.map_err(|e| e.to_string())
@@ -3050,6 +3111,49 @@ mod tests {
             }
             _ => panic!("解出来不是 VideoError"),
         }
+    }
+
+    #[test]
+    fn os_mode_refusal_names_the_missing_knob() {
+        // 两种配错混成一句「认证失败」，现场就只能靠猜。
+        let no_mode = os_mode_refusal(false, false);
+        assert!(no_mode.contains("临时码"), "没开 OS 模式时必须告诉对方该用什么：{no_mode}");
+        let no_pam = os_mode_refusal(true, false);
+        assert!(no_pam.contains("PAM"), "开了 OS 但没开 PAM 必须点名 PAM：{no_pam}");
+        assert_ne!(no_mode, no_pam, "两种配错必须说得出区别");
+    }
+
+    /// 「为什么拒绝」必须真的出现在线上，而且**是加密的**：控制端发完 AuthMode 就把
+    /// 控制流包成了 SecControl，明文帧在那边是解密失败。
+    #[tokio::test]
+    async fn a_refused_os_mode_says_why_and_the_client_can_decrypt_it() {
+        let (mut a, mut b) = tokio::io::duplex(64 * 1024);
+        let (ck, hk) = tokio::join!(
+            uulan_protocol::crypto::client_handshake(&mut a),
+            uulan_protocol::crypto::host_handshake(&mut b)
+        );
+        let (ck, hk) = (ck.expect("控制端握手"), hk.expect("被控端握手"));
+        // 控制端这一侧与 connect() 同步：AuthMode 是明文，之后立刻用同一把 DH 密钥读。
+        let mut rd = uulan_protocol::crypto::SecReader::new(
+            a,
+            &ck.channel(Channel::Control),
+            Role::Client,
+            Channel::Control,
+        );
+        let reason = os_mode_refusal(false, false);
+        let host = tokio::spawn(async move { refuse_os_mode(b, &hk, Role::Host, &reason).await });
+        let f = read_frame(&mut rd).await.expect("控制端应当读到一帧");
+        assert_eq!(f.kind, FrameKind::Json, "拒绝走 Json 帧");
+        match serde_json::from_slice::<H2C>(&f.payload).expect("必须是 H2C JSON") {
+            H2C::Bye { reason } => {
+                assert!(reason.contains("系统账户"), "原因要说得具体：{reason}");
+                assert!(reason.contains("临时码"), "要给出可操作的下一步：{reason}");
+            }
+            other => panic!("拒绝时发出去的不是 Bye：{other:?}"),
+        }
+        // 读到之后就断开：被控端那半边的「读干」会立刻结束，测试不用等兜底超时。
+        drop(rd);
+        host.await.expect("拒绝任务不该 panic").expect("拒绝帧要能写出去");
     }
 
     /// 真链路测试只能走到「正常结束」（有界合成源），因为「ffmpeg 半路崩了」在这台

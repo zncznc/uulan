@@ -235,7 +235,7 @@ impl App {
 
     /// 组命令行。**这里出现过的每个参数都必须已经在真机验收里出现过**，
     /// GUI 不发明新语义。
-    fn build_args(&self, pw_file: &Path, mode: Mode) -> Vec<String> {
+    fn build_args(&self, pw_file: Option<&Path>, mode: Mode) -> Vec<String> {
         // 直连与经中继是两条互斥的路：填了直连地址就**只发 --direct**，
         // 绝不同时带 --server/--device —— 那会让控制端自己猜哪条算，行为不可复现。
         let mut a = route_args(self.direct.trim(), self.relay.trim(), self.device.trim(), pw_file);
@@ -314,43 +314,54 @@ impl App {
         }
     }
 
+    /// 校验表单 → 写凭据文件 → 拼命令行。
+    ///
+    /// **dry-run（`--print-args`）与真正启动走同一段**：否则「脚本验过的形状」和
+    /// 「按钮跑的形状」是两套，验了也不算数。
+    fn prepare(&mut self, mode: Mode) -> Result<Vec<String>, String> {
+        // 设备 ID 只在经中继时需要：直连走的是地址，没有设备目录语义。
+        // 旧写法在这里无条件要 ID，而错误提示自己写着「直连那时不用设备 ID」——
+        // 检查比提示更早生效，于是**照着提示做的人反而过不去**。
+        if self.direct.trim().is_empty() && self.device.trim().is_empty() {
+            return Err("还没填设备 ID —— 点上面列表里那一行，或自己写进来。\n                （想不经中继直接连，就在「直连地址」里填 被控端IP:21117，那时不用设备 ID）".into());
+        }
+        if self.password.trim().is_empty() && self.os_user.trim().is_empty() {
+            // 这一格装的是**一次性临时码**（被控端那一屏大字显示的那张），不是永久口令。
+            // 但被控端以「系统账户」认证时它根本不存在 —— 那种形态只填用户名 + 登录密码。
+            return Err("请填「临时码/口令」，或填系统账户（用户名 + 登录密码）。\n\
+                平时填被控端屏幕上那张**一次性临时码**（用完即废、每整点自动换新）。\n\
+                只有长期无人值守接入时才用永久口令：在被控端跑 `uulan-host --show` 能看。".into());
+        }
+        if !self.os_user.trim().is_empty() && self.os_password.trim().is_empty() {
+            return Err("填了系统账户名，但没给它的登录密码（第二因素要用）。".into());
+        }
+        if !self.os_password.trim().is_empty() {
+            // 只在真要带第二因素时写这个文件：不留多余的明文副本在盘上。
+            self.write_os_pw_file().map_err(|e| format!("第二因素的密码文件写不了：{e}"))?;
+        }
+        // **没有访问口令就不写口令文件**（见 route_args 的注释：空文件会让控制端在
+        // 参数阶段直接退出来）。顺带也少一份明文副本。
+        let pw = if self.password.trim().is_empty() {
+            None
+        } else {
+            Some(self.write_pw_file().map_err(|e| format!("口令文件写不了：{e}"))?)
+        };
+        Ok(self.build_args(pw.as_deref(), mode))
+    }
+
     fn launch(&mut self, mode: Mode) {
         let Some(client) = self.client_exe() else {
             self.status = "找不到 uulan-client —— 请把它和面板放在同一目录。".into();
             return;
         };
-        // 这两条以前只改底部小字，结果用户报「点了没反应」—— 表单没填全必须有显眼回应。
-        if self.device.trim().is_empty() {
-            self.alert = "还没填设备 ID —— 点上面列表里那一行，或自己写进来。\n                （想不经中继直接连，就在「直连地址」里填 被控端IP:21117，那时不用设备 ID）".into();
-            return;
-        }
-        if self.password.trim().is_empty() && self.os_user.trim().is_empty() {
-            // 这一格装的是**一次性临时码**（被控端那一屏大字显示的那张），不是永久口令。
-            // 加密握手（PAKE）拿它当共享密钥，所以它必填；用户名+登录密码是第二因素。
-            self.alert = "请填「临时码/口令」。\n\
-                平时填被控端屏幕上那张**一次性临时码**（用完即废、每整点自动换新）。\n\
-                只有长期无人值守接入时才用永久口令：在被控端跑 `uulan-host --show` 能看。".into();
-            return;
-        }
-        if !self.os_user.trim().is_empty() && self.os_password.trim().is_empty() {
-            self.alert = "填了系统账户名，但没给它的登录密码（第二因素要用）。".into();
-            return;
-        }
-        if !self.os_password.trim().is_empty() {
-            // 只在真要带第二因素时写这个文件：不留多余的明文副本在盘上。
-            if let Err(e) = self.write_os_pw_file() {
-                self.alert = format!("第二因素的密码文件写不了：{e}");
-                return;
-            }
-        }
-        let pw = match self.write_pw_file() {
-            Ok(p) => p,
-            Err(e) => {
-                self.status = format!("口令文件写不了：{e}");
+        // 表单没填全必须有显眼回应：旧版只改底部小字，用户报「点了没反应」。
+        let args = match self.prepare(mode.clone()) {
+            Ok(a) => a,
+            Err(msg) => {
+                self.alert = msg;
                 return;
             }
         };
-        let args = self.build_args(&pw, mode.clone());
         let shown = sanitize(&args);
         // 子进程的输出**必须留盘**：改成 GUI 子系统后它没有控制台，
         // 不接住就永远看不到它为什么没起窗。
@@ -442,17 +453,24 @@ fn parse_devices(text: &str) -> (Vec<DeviceRow>, usize) {
 ///
 /// 直连与经中继**互斥**：填了直连地址就只发 `--direct`，不再带 `--server/--device`。
 /// 同时带上等于把"走哪条路"交给控制端自己去猜，那种不确定性最难在现场复现。
-fn route_args(direct: &str, relay: &str, device: &str, pw_file: &Path) -> Vec<String> {
-    let pw = pw_file.to_string_lossy().into_owned();
-    if !direct.trim().is_empty() {
-        vec!["--direct".into(), direct.trim().to_string(), "--password-file".into(), pw]
+fn route_args(direct: &str, relay: &str, device: &str, pw_file: Option<&Path>) -> Vec<String> {
+    let mut a = if !direct.trim().is_empty() {
+        vec!["--direct".into(), direct.trim().to_string()]
     } else {
         vec![
             "--server".into(), relay.trim().to_string(),
             "--device".into(), device.trim().to_string(),
-            "--password-file".into(), pw,
         ]
+    };
+    // **没有访问口令就不发 --password-file**。OS 模式（用户名 + 该账户的登录密码）
+    // 压根没有共享口令这回事；旧写法总会写一个**空文件**再把路径递过去，控制端在
+    // 解析参数时就以 `--password-file 的第一行是空的` 退出 —— 面板还在、子进程立刻死、
+    // GUI 子系统没有控制台，现场只看到「点了没反应」。这是本面板最贵的一条接缝。
+    if let Some(p) = pw_file {
+        a.push("--password-file".into());
+        a.push(p.to_string_lossy().into_owned());
     }
+    a
 }
 
 
@@ -623,8 +641,8 @@ impl eframe::App for App {
                     ui.label("系统账户(可选)");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.os_user)
-                            .hint_text("被控端开了第二因素才填")
-                            .desired_width(110.0),
+                            .hint_text("用户名：被控端用「系统账户」认证时填这里")
+                            .desired_width(150.0),
                     );
                     ui.add(
                         egui::TextEdit::singleline(&mut self.os_password)
@@ -632,6 +650,10 @@ impl eframe::App for App {
                             .hint_text("该账户的登录密码")
                             .desired_width(110.0),
                     );
+                    if !self.os_user.trim().is_empty() && self.password.trim().is_empty() {
+                        // 这一句是给现场的人看的：填了系统账户就可以不填临时码。
+                        ui.label(egui::RichText::new("只用系统账户认证（临时码可留空）").weak().small());
+                    }
                 });
             });
 
@@ -728,7 +750,73 @@ fn chrono_free_stamp() -> String {
     format!("@{d}")
 }
 
+/// `--print-args`：把「面板会怎么跑控制端」原样打出来，不建窗口、不连网、不抢单实例锁。
+///
+/// 两个用途，都不是调试玩具：
+///   · 现场：报「点了没反应」时，第一件要知道的就是子进程拿到的到底是什么参数
+///     （GUI 子系统没有控制台，参数错了只能靠猜）；
+///   · 验收：脚本可以直接拿这份 argv 跑真控制端，于是「面板拼出来的命令行能不能用」
+///     第一次成为机器可查的量，而不是靠人点一下看窗口有没有出现。
+///
+/// 口令与系统密码从环境变量 `UULAN_GUI_PASSWORD` / `UULAN_GUI_OS_PASSWORD` 取 ——
+/// **不进 argv**，与面板本身同一条纪律。
+fn dry_run() -> Option<i32> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if !argv.iter().any(|a| a == "--print-args") {
+        return None;
+    }
+    let mut direct = String::new();
+    let mut relay = String::new();
+    let mut device = String::new();
+    let mut os_user = String::new();
+    let mut term = false;
+    let mut argv_out: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--direct" => { direct = argv.get(i + 1).cloned().unwrap_or_default(); i += 2; }
+            "--relay" => { relay = argv.get(i + 1).cloned().unwrap_or_default(); i += 2; }
+            "--device" => { device = argv.get(i + 1).cloned().unwrap_or_default(); i += 2; }
+            "--os-user" => { os_user = argv.get(i + 1).cloned().unwrap_or_default(); i += 2; }
+            "--argv-out" => { argv_out = argv.get(i + 1).map(PathBuf::from); i += 2; }
+            "--term" => { term = true; i += 1; }
+            _ => i += 1,
+        }
+    }
+    let mut app = App::new(Arc::new(AtomicBool::new(false)));
+    if !direct.is_empty() { app.direct = direct; }
+    if !relay.is_empty() { app.relay = relay; }
+    if !device.is_empty() { app.device = device; }
+    app.os_user = os_user;
+    app.password = std::env::var("UULAN_GUI_PASSWORD").unwrap_or_default();
+    app.os_password = std::env::var("UULAN_GUI_OS_PASSWORD").unwrap_or_default();
+    let mode = if term { Mode::Term } else { Mode::Desktop };
+    match app.prepare(mode) {
+        Ok(args) => {
+            println!("模式：{}", if term { "终端" } else { "远程控制" });
+            // 打的是脱敏后的形状：口令文件路径抹成占位符，口令本身从不上屏。
+            println!("{}", sanitize(&args));
+            if let Some(p) = argv_out {
+                // 一行一个参数：脚本直接读，不用再去猜引号。
+                if let Err(e) = std::fs::write(&p, format!("{}\n", args.join("\n"))) {
+                    eprintln!("写不了 --argv-out：{e}");
+                    return Some(3);
+                }
+            }
+            Some(0)
+        }
+        Err(msg) => {
+            eprintln!("表单不完整：{msg}");
+            Some(2)
+        }
+    }
+}
+
 fn main() {
+    // `--print-args` 必须在单实例锁**之前**：现场诊断往往正是面板开着的时候。
+    if let Some(code) = dry_run() {
+        std::process::exit(code);
+    }
     // 单实例：同一台机器开两个面板，旧的那个会挂着**已作废的验证码**继续显示，
     // 坐在屏幕前的人就会把废码念给你 —— 这不是难看，是让人白跑一趟。
     let relaunch = Arc::new(AtomicBool::new(false));
@@ -820,7 +908,7 @@ mod tests {
         // 直连与经中继互斥：填了直连地址就**只发 --direct**。
         // 同时带 --server/--device 等于让控制端自己猜走哪条路，现场最难复现。
         let pw = std::path::Path::new("PW");
-        let a = route_args("192.168.1.20:21117", "10.0.0.9:21116", "805747189", pw);
+        let a = route_args("192.168.1.20:21117", "10.0.0.9:21116", "805747189", Some(pw));
         assert_eq!(a[0], "--direct");
         assert_eq!(a[1], "192.168.1.20:21117");
         assert!(!a.contains(&"--server".to_string()), "直连还带了 --server：{a:?}");
@@ -828,14 +916,37 @@ mod tests {
         let i = a.iter().position(|x| x == "--password-file").unwrap();
         assert_eq!(a[i + 1], "PW", "口令文件必须紧跟在 --password-file 后，否则 sanitize 漏脱敏");
 
-        let b = route_args("", "10.0.0.9:21116", "805747189", pw);
+        let b = route_args("", "10.0.0.9:21116", "805747189", Some(pw));
         assert!(b.contains(&"--server".to_string()) && b.contains(&"--device".to_string()));
         assert!(!b.contains(&"--direct".to_string()));
 
         // 只填空白也算没直连（并把空白擦掉，不发一个空参数给控制端）
-        let c = route_args("   ", " 10.0.0.9:21116 ", " 805747189 ", pw);
+        let c = route_args("   ", " 10.0.0.9:21116 ", " 805747189 ", Some(pw));
         assert_eq!(c[1], "10.0.0.9:21116");
         assert_eq!(c[3], "805747189");
+    }
+
+    #[test]
+    fn no_access_password_means_no_password_file_argument() {
+        // OS 模式（用户名 + 系统登录密码）根本没有访问口令。旧写法总会写一个**空文件**
+        // 并把 --password-file 递过去，控制端在参数阶段就 `第一行是空的` 退出 ——
+        // 面板在、子进程立刻死、GUI 没有控制台，现场只看到「点了没反应」。
+        let a = route_args("192.168.1.20:21117", "", "", None);
+        assert!(!a.contains(&"--password-file".to_string()), "没口令却给了口令文件：{a:?}");
+        assert_eq!(a[0], "--direct");
+        // 直连不需要设备 ID（这条以前被表单拦在前面，和它自己的提示自相矛盾）。
+        assert!(!a.contains(&"--device".to_string()), "直连还带了 --device：{a:?}");
+    }
+
+    #[test]
+    fn missing_password_file_only_shortens_the_argv_it_does_not_reorder_it() {
+        // 拼装顺序不是风格问题：`--password-file` 必须紧跟在它的值前面（sanitize()
+        // 靠这个位置脱敏），附加参数只能往后加。
+        let a = route_args("", "10.0.0.9:21116", "805747189", None);
+        assert!(a.contains(&"--device".to_string()), "经中继必须带设备 ID：{a:?}");
+        assert!(!a.contains(&"--password-file".to_string()));
+        assert_eq!(a[0], "--server");
+        assert_eq!(a[1], "10.0.0.9:21116");
     }
 
 }
