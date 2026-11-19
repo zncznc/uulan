@@ -36,7 +36,11 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_RELAY: &str = "192.168.223.15:21116";
 
-/// 持久化的只有这三样（中继、设备、直连地址）—— 口令永远不进这个文件。
+/// 面板自己的配置。**这里现在会存访问口令**（`remember_pw=true` 时）——
+/// 用户明确要求去掉 `host.pw` 那个"读文件"的拐弯，选择"内网图省事"。
+/// 这条改动的真实含义要说出来：访问口令从此以明文留在 `gui.json` 里，
+/// 任何能读这个文件的人都能连走内网被控端。Linux 下建 0600，Windows 靠用户档保护。
+/// 不想留就把"记住这条口令"取消，或删掉这个文件。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct GuiConfig {
     #[serde(default)]
@@ -46,6 +50,11 @@ struct GuiConfig {
     /// 非空 = 这台控制端**不经中继**，直接连被控端的监听端口。
     #[serde(default)]
     direct: String,
+    /// 记住访问口令（下次打开面板自动填）。
+    #[serde(default)]
+    remember_pw: bool,
+    #[serde(default)]
+    password: String,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +76,8 @@ pub struct App {
     ///
     /// 面板**不新增任何语义**：它就是 `uulan-client --os-user/--os-password-file` 的
     /// 按钮版（那两个参数已在真机验收里出现）。密码同样走 0600 文件，不进命令行。
+    /// 记住这条口令（勾了才把口令写进 gui.json）。
+    remember_pw: bool,
     os_user: String,
     os_password: String,
     // 选项（每一项都对应控制端一个已验过的开关）
@@ -109,7 +120,8 @@ impl App {
             relay,
             device: cfg.device,
             direct: cfg.direct,
-            password: String::new(),
+            password: if cfg.remember_pw { cfg.password.clone() } else { String::new() },
+            remember_pw: cfg.remember_pw,
             os_user: String::new(),
             os_password: String::new(),
             audio: false,
@@ -164,9 +176,19 @@ impl App {
             relay: self.relay.trim().to_string(),
             device: self.device.trim().to_string(),
             direct: self.direct.trim().to_string(),
+            // 只有勾了才落盘；不勾就主动抹掉，不留历史副本。
+            remember_pw: self.remember_pw,
+            password: if self.remember_pw { self.password.clone() } else { String::new() },
         };
         let _ = std::fs::create_dir_all(Self::cfg_dir());
         let _ = std::fs::write(&self.cfg_path, serde_json::to_string_pretty(&cfg).unwrap_or_default());
+        // 一旦这个文件里存了访问口令，权限就得跟上：Linux/麒麟默认 umask 会写出 0644，
+        // 那等于把"能连走内网被控端"的凭据交给同机所有账户。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.cfg_path, std::fs::Permissions::from_mode(0o600));
+        }
     }
 
     fn push_log(&mut self, s: impl Into<String>) {
@@ -303,8 +325,11 @@ impl App {
             return;
         }
         if self.password.trim().is_empty() {
-            self.alert = "需要访问口令（在「访问口令」框里填）。\n\
-                忘了口令：在被控端上跑 `uulan-host --show`，或直接看被控端配置文件里 password 字段。".into();
+            // 这一格装的是**一次性临时码**（被控端那一屏大字显示的那张），不是永久口令。
+            // 加密握手（PAKE）拿它当共享密钥，所以它必填；用户名+登录密码是第二因素。
+            self.alert = "请填「临时码/口令」。\n\
+                平时填被控端屏幕上那张**一次性临时码**（用完即废、每整点自动换新）。\n\
+                只有长期无人值守接入时才用永久口令：在被控端跑 `uulan-host --show` 能看。".into();
             return;
         }
         if !self.os_user.trim().is_empty() && self.os_password.trim().is_empty() {
@@ -452,21 +477,6 @@ fn sanitize(args: &[String]) -> String {
     out
 }
 
-/// 找同目录（以及上级）那个口令文件。口令本身从不写进 gui.json。
-fn sibling_pwfile() -> Option<PathBuf> {
-    let mut cands: Vec<PathBuf> = Vec::new();
-    if let Ok(cur) = std::env::current_exe() {
-        if let Some(dir) = cur.parent() {
-            cands.push(dir.join("host.pw"));
-            cands.push(dir.join("..").join("host.pw"));
-        }
-    }
-    if let Ok(d) = std::env::var("USERPROFILE") {
-        cands.push(PathBuf::from(d).join("uulan").join("host.pw"));
-    }
-    cands.into_iter().find(|p| p.is_file())
-}
-
 fn config_path() -> PathBuf {
     App::cfg_dir().join("gui.json")
 }
@@ -601,14 +611,15 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     ui.label("设备 ID");
                     ui.add(egui::TextEdit::singleline(&mut self.device).desired_width(140.0));
-                    ui.label("访问口令");
+                    // 措辞对齐现场说法：对方念给你的是**临时码**（一次性），
+                    // 永久口令只是备选。写"访问口令"会让人以为必须去翻口令文件。
+                    ui.label("临时码/口令");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.password)
                             .password(true)
                             .desired_width(200.0),
                     );
-                    // 少一次「自己去开文件复制粘贴」的折腾：同目录有 host.pw 就直接读进来。
-                    // 注意这是**填进输入框**，不是记进配置 —— gui.json 永不存口令。
+                    ui.checkbox(&mut self.remember_pw, "记住这条口令");
                     ui.label("系统账户(可选)");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.os_user)
@@ -621,18 +632,6 @@ impl eframe::App for App {
                             .hint_text("该账户的登录密码")
                             .desired_width(110.0),
                     );
-                    if ui.button("从 host.pw 读取").clicked() {
-                        match sibling_pwfile() {
-                            Some(p) => match std::fs::read_to_string(&p) {
-                                Ok(t) => {
-                                    self.password = t.trim_end_matches(['\n', '\r']).to_string();
-                                    self.status = format!("口令已读入（来自 {}，{} 字符）。", p.display(), self.password.chars().count());
-                                }
-                                Err(e) => self.alert = format!("读不了 {}：{e}", p.display()),
-                            },
-                            None => self.alert = "同目录没有 host.pw —— 请把口令文件和控制端放在一处，或直接手输口令。".into(),
-                        }
-                    }
                 });
             });
 

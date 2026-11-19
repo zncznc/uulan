@@ -58,6 +58,8 @@ struct Args {
     no_listen: bool,
     /// 打开 PAM 第二因素，并把名单写进配置（这样 systemd 单元不必带参数）。
     pam: bool,
+    /// 关掉第二因素（现场要收回这个权限时不用去手改 JSON）。
+    no_pam: bool,
     pam_allow: Option<String>,
 }
 
@@ -67,6 +69,7 @@ uulan-host —— uulan 内网远控的被控端
   --listen <地址:端口> 直连监听地址（默认 0.0.0.0:21117；控制端用 --direct 直连它）
   --no-listen         不监听任何端口（只走中继）
   --pam               打开第二因素：口令过了之后还要输对**系统登录密码**
+  --no-pam            关掉第二因素（改完即退出，不常驻）
   --pam-allow <名单>  允许从远端登录的系统账户，逗号分隔（空名单 = 谁都不许）
   --users             列出本机额外登录身份（口令一律不打印）
   --user-add <名字>   加一个人并现场生成一份独立口令（只打印一次）
@@ -112,6 +115,7 @@ fn parse_args() -> Result<Args> {
         listen: None,
         no_listen: false,
         pam: false,
+        no_pam: false,
         pam_allow: None,
     };
     let mut it = std::env::args().skip(1);
@@ -142,6 +146,7 @@ fn parse_args() -> Result<Args> {
             "--listen" => a.listen = Some(it.next().unwrap_or_default()),
             "--no-listen" => a.no_listen = true,
             "--pam" => a.pam = true,
+            "--no-pam" => a.no_pam = true,
             "--pam-allow" => a.pam_allow = Some(it.next().unwrap_or_default()),
             "--once" => a.once = true,
             "-h" | "--help" => {
@@ -237,15 +242,26 @@ async fn main() -> Result<()> {
     if args.pam {
         cfg.pam.enabled = true;
     }
+    if args.no_pam {
+        cfg.pam.enabled = false;
+    }
     if let Some(list) = &args.pam_allow {
         cfg.pam.allow_users = list.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
     }
-    if cfg.pam.enabled {
-        if cfg.pam.allow_users.is_empty() {
+    // 管理参数一律"改完就退出"：`--pam` 若继续往下走，就会把这条命令变成
+    // 一个前台被控端（我第一次实测就把自己的 ssh 挂到超时，见里程碑文档）。
+    if args.pam || args.no_pam || args.pam_allow.is_some() {
+        if cfg.pam.enabled && cfg.pam.allow_users.is_empty() {
             anyhow::bail!("--pam 已打开，但允许名单是空的（空名单 = 谁都不许登录）。加 --pam-allow 用户名1,用户名2");
         }
         cfg.save(&cfg_path)?;
-        info!(allow = ?cfg.pam.allow_users, "PAM 第二因素已开启并写入配置（口令本身仍先过 PAKE，密码只在加密通道里传）");
+        if cfg.pam.enabled {
+            println!("PAM 第二因素：已开启，允许名单 {:?}", cfg.pam.allow_users);
+        } else {
+            println!("PAM 第二因素：已关闭（allow_users 仅作保留，未生效）");
+        }
+        println!("已写进配置并立即生效；常驻服务会自己重读（不需要重启）。");
+        return Ok(());
     }
 
     // 用户表管理：改完就存盘退出，常驻服务会通过 adopt_external_config 立刻看见。

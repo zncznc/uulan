@@ -926,6 +926,13 @@ where
         // 注意：这里**没有**调用校验器 —— 不在名单的名字连一次 PAM 都不该碰到。
         // 否则任何拿到连接口令的人都能反复用 root 去触发系统账户锁定。
         warn!(%peer, user = %user, "第二因素拒绝：该账户不在允许名单（未做任何校验尝试）");
+        // 必须回一条 AuthFail：不回来的时候控制端会停在「已连上…正在打开窗口」上干等，
+        // 那就是我上一轮刚批评过的「失败藏在看不见的地方」。真机测出来过。
+        send_h2c(
+            wr,
+            &H2C::AuthFail { reason: AuthFailReason::NotAllowed, retry_after_ms: 0 },
+        )
+        .await?;
         return Err(format!("{user} 不在远端允许名单里"));
     }
 
