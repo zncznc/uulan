@@ -110,7 +110,9 @@ async fn harness(opts: Options) -> TermLink {
     let device = spawn_host(&srv, test_config(&srv)).await;
     let c = timeout(
         Duration::from_secs(15),
-        connect::connect(&srv, &device, PW, "term-cli", vec![Cap::Terminal]),
+        connect::connect(&srv, &device, PW, "term-cli", vec![Cap::Terminal],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("连接超时")

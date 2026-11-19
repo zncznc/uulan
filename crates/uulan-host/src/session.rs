@@ -229,7 +229,7 @@ pub enum AuthResult {
     /// `host_proof` 是被控端自己的口令证明（`HMAC(会话密钥,"uulan-auth-v2"…"uulan-auth-h2")`），
     /// 由这里算好交给调用方发出去 —— **口令明文不离开这个函数**。
     /// 控制端拿到它会校验；不校验的话中继可以冒充被控端收走输入。
-    Ok { used_temp_code: bool, idx: u32, host_proof: String },
+    Ok { used_temp_code: bool, idx: u32, who: String, host_proof: String },
     /// 密码不对。
     Bad,
 }
@@ -287,6 +287,16 @@ impl HostState {
         if g.name != fresh.name {
             g.name = fresh.name;
         }
+        // 用户表也照样采用：`uulan-host --user-add/--user-del` 是另一个进程写的文件，
+        // 常驻服务不采用就等于**吊销不生效** —— 那比不加这个功能更危险，
+        // 因为管理员会以为人已经踢掉了。
+        if g.users != fresh.users {
+            info!(
+                user_count = fresh.users.len(),
+                "配置文件里的用户表变了，已采用（口令值一律不写日志）"
+            );
+            g.users = fresh.users;
+        }
     }
 
     /// 当前的候选凭据（顺序即 `PakeResp.ybs` 的顺序）：永久口令在前，临时码在后。
@@ -295,15 +305,11 @@ impl HostState {
     /// 用它连接不应打断主人自己用永久密码。
     ///
     /// 返回值带 `is_temp`：命中之后要靠它决定「要不要吃掉这个码」。
-    pub fn candidates(&self) -> Vec<(bool, String)> {
-        // 先看一眼磁盘：临时码/口令可能是 `uulan-host --new-temp-code` 写的。
+    pub fn candidates(&self) -> Vec<crate::config::Candidate> {
+        // 先看一眼磁盘：临时码/口令/用户表都可能是别的进程（CLI）刚写的。
         self.adopt_external_config();
         let g = self.cfg.lock().unwrap();
-        let mut v = vec![(false, g.password.clone())];
-        if let Some(t) = g.temp_code.clone() {
-            v.push((true, t));
-        }
-        v
+        g.candidates()
     }
 
     /// 校验控制端发来的一组证明（`proofs[i]` 对应 `candidates()[i]`）。
@@ -322,26 +328,32 @@ impl HostState {
         let Some(i) = proofs.iter().position(|p| keys.matches_client_proof(p)) else {
             return AuthResult::Bad;
         };
-        let (is_temp, value) = cands[i].clone();
-        // 命中之后回到锁里复核「这个凭据还是当前这个」再消费 ——
-        // 从 `candidates()` 到这里隔着一次 PAKE 往返，期间配置文件可能被改过。
+        let hit = cands[i].clone();
+        // 命中之后回到锁里复核「这份凭据现在还是不是它」再消费 ——
+        // 从 `candidates()` 到这里隔着一次 PAKE 往返，期间可能被改了口令、
+        // 也可能那个用户被 `--user-del` 吊销了。按 **(label, value) 成对**复核：
+        // 只比 value 不够 —— 主人换了口令而某个用户恰好拿到同一个值时，
+        // 只比值会把"已吊销的人"放进来。
         {
             let mut g = self.cfg.lock().unwrap();
-            if is_temp {
-                if g.temp_code.as_deref() != Some(value.as_str()) {
-                    return AuthResult::Bad;
-                }
-                // 临时码用掉即失效：在同一把锁里摘掉，避免并发会话各用一次。
-                g.temp_code = None;
-            } else if g.password != value {
+            let still = g
+                .candidates()
+                .into_iter()
+                .any(|c| c.label == hit.label && c.value == hit.value);
+            if !still {
                 return AuthResult::Bad;
             }
+            if hit.is_temp {
+                // 临时码用掉即失效：在同一把锁里摘掉，避免并发会话各用一次。
+                g.temp_code = None;
+            }
         }
-        if is_temp {
+        if hit.is_temp {
             self.persist();
         }
         AuthResult::Ok {
-            used_temp_code: is_temp,
+            used_temp_code: hit.is_temp,
+            who: hit.label,
             idx: i as u32,
             host_proof: keys.host_proof(),
         }
@@ -533,7 +545,7 @@ pub async fn run_with_sink(
         }
     };
     let cands = params.state.candidates();
-    let cand_values: Vec<String> = cands.iter().map(|(_, v)| v.clone()).collect();
+    let cand_values: Vec<String> = cands.iter().map(|c| c.value.clone()).collect();
     let (pake, pake_resp) = match PakeHost::respond(keys0.transcript(), &cand_values) {
         Ok(x) => x,
         Err(e) => {
@@ -933,12 +945,15 @@ where
 
     // 5) 校验：证明是对着「含 PAKE 的会话密钥」算的，所以中继重放/伪造都过不了
     match state.authenticate(keys, &proofs) {
-        AuthResult::Ok { used_temp_code, idx, host_proof: proof } => {
+        AuthResult::Ok { used_temp_code, idx, who, host_proof: proof } => {
             state.auth.record_success();
+            // user= 是这一整段改动的落点：出事后要能回答"当时是谁连的"。
+            // 口令值一个都不出现，只有身份名。
             info!(
                 %peer,
                 used_temp_code,
                 cred_slot = idx,
+                user = %who,
                 "鉴权通过"
             );
             send_h2c(wr, &H2C::AuthOk { idx, proof }).await?;
@@ -2844,4 +2859,59 @@ mod tests {
         let s = resolve_region(&cap, &cfg).await;
         assert_eq!(s, Region::full(1024, 768));
     }
+
+    /// 多用户口令的正身测试：**每个用户只知道自己那份**，也能连上，并且日志记对人。
+    ///
+    /// 为什么必须自己算真密钥而不是造假：PAKE 的命中判定靠的是"两边算出的共享点相等"，
+    /// 造假密钥等于没测这条路径。
+    #[tokio::test]
+    async fn each_user_password_authenticates_and_names_the_right_user() {
+        let mut cfg = HostConfig::default();
+        cfg.password = "own1Ab2cD3".into();
+        cfg.add_user("zhang", "zha1Ab2cD3").unwrap();
+        cfg.add_user("li", "li2Ab3cD4").unwrap();
+        let s = HostState::new(cfg.clone(), None);
+
+        let cands: Vec<String> = s.candidates().into_iter().map(|c| c.value).collect();
+        assert_eq!(cands.len(), 3, "主人 + 两个用户都该是候选");
+        let refs: Vec<&str> = cands.iter().map(|x| x.as_str()).collect();
+
+        // 李四手上只有自己那一条口令 —— 控制端会按收到的 ybs 各算一份证明，
+        // 但只有真口令那一份能对上被控端的共享点。
+        let (h, cw) = keys_pair(&refs, "li2Ab3cD4").await;
+        match s.authenticate(&h, &proofs(&cw)) {
+            AuthResult::Ok { who, idx, used_temp_code, .. } => {
+                assert_eq!(who, "li", "身份必须由密码学结果推出，不是客户端自报");
+                assert_eq!(idx, 2);
+                assert!(!used_temp_code);
+            }
+            AuthResult::Bad => panic!("李四的独立口令被拒 —— 多用户等于没做"),
+        }
+
+        let (h2, cw2) = keys_pair(&refs, "zha1Ab2cD3").await;
+        match s.authenticate(&h2, &proofs(&cw2)) {
+            AuthResult::Ok { who, .. } => assert_eq!(who, "zhang"),
+            AuthResult::Bad => panic!("张三的独立口令被拒"),
+        }
+
+        // 吊销必须当场生效：删掉用户后连候选数都对不上，鉴权直接失败（fail closed）。
+        // 这里刻意保留"条数不符即拒"这条严规矩：管理员在握手中途加/删用户时，
+        // 宁可让这一条连接重连一次，也不能放一个已被吊销的口令过去。
+        s.cfg.lock().unwrap().del_user("li");
+        let (h3, cw3) = keys_pair(&refs, "li2Ab3cD4").await;
+        assert!(
+            matches!(s.authenticate(&h3, &proofs(&cw3)), AuthResult::Bad),
+            "已吊销的用户必须连不上"
+        );
+        // 而主人不受牵连。
+        s.adopt_external_config();
+        let cur: Vec<String> = s.candidates().into_iter().map(|c| c.value).collect();
+        let refs2: Vec<&str> = cur.iter().map(|x| x.as_str()).collect();
+        let (h4, cw4) = keys_pair(&refs2, "own1Ab2cD3").await;
+        match s.authenticate(&h4, &proofs(&cw4)) {
+            AuthResult::Ok { who, .. } => assert_eq!(who, "主人"),
+            AuthResult::Bad => panic!("吊销别人不该把主人挡在门外"),
+        }
+    }
+
 }

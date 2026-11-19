@@ -148,7 +148,9 @@ async fn end_to_end_host_to_client_video() {
     // 控制端连上去
     let c = timeout(
         T,
-        connect::connect(&addr, &device_id, &cfg.password, "测试控制端", vec![]),
+        connect::connect(&addr, &device_id, &cfg.password, "测试控制端", vec![],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("连接超时")
@@ -234,7 +236,9 @@ async fn wrong_password_is_rejected() {
     let cfg = test_config(&addr);
     let (device_id, _done) = spawn_host(&addr, cfg.clone(), ff).await;
 
-    let err = connect::connect(&addr, &device_id, "wrongPass9", "测试控制端", vec![])
+    let err = connect::connect(&addr, &device_id, "wrongPass9", "测试控制端", vec![],
+            None,  // 集成测试都走中继
+)
         .await
         .expect_err("错密码必须被拒");
     let msg = format!("{err}");
@@ -244,7 +248,9 @@ async fn wrong_password_is_rejected() {
 #[tokio::test]
 async fn offline_device_is_reported_clearly() {
     let addr = spawn_server().await;
-    let err = connect::connect(&addr, "999999999", "aB3dE5fG", "测试控制端", vec![])
+    let err = connect::connect(&addr, "999999999", "aB3dE5fG", "测试控制端", vec![],
+            None,  // 集成测试都走中继
+)
         .await
         .expect_err("离线设备必须报错");
     let msg = format!("{err}");
@@ -263,12 +269,16 @@ async fn repeated_wrong_passwords_lock_the_host() {
 
     // 试 5 次错密码
     for _ in 0..5 {
-        let e = connect::connect(&addr, &device_id, "wrongPass9", "测试控制端", vec![]).await;
+        let e = connect::connect(&addr, &device_id, "wrongPass9", "测试控制端", vec![],
+            None,  // 集成测试都走中继
+).await;
         assert!(e.is_err());
     }
 
     // 第 6 次即使密码对，也必须被锁定拦下 —— 否则爆破照样能过。
-    let err = connect::connect(&addr, &device_id, &cfg.password, "测试控制端", vec![])
+    let err = connect::connect(&addr, &device_id, &cfg.password, "测试控制端", vec![],
+            None,  // 集成测试都走中继
+)
         .await
         .expect_err("锁定期间必须拒绝，哪怕密码是对的");
     let msg = format!("{err}");
@@ -279,7 +289,9 @@ async fn repeated_wrong_passwords_lock_the_host() {
 async fn client_refuses_to_guess_a_malformed_device_id() {
     let addr = spawn_server().await;
     for bad in ["", "123", "012345678", "abcdefghi"] {
-        let e = connect::connect(&addr, bad, "aB3dE5fG", "c", vec![]).await;
+        let e = connect::connect(&addr, bad, "aB3dE5fG", "c", vec![],
+            None,  // 集成测试都走中继
+).await;
         assert!(e.is_err(), "非法设备 ID {bad:?} 必须被拒绝");
     }
 }

@@ -202,7 +202,9 @@ async fn audio_flows_from_host_to_client_wav() {
 
     let c = timeout(
         T,
-        connect::connect(&addr, &device_id, &cfg.password, "音频测试控制端", vec![]),
+        connect::connect(&addr, &device_id, &cfg.password, "音频测试控制端", vec![],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("连接超时")
@@ -222,6 +224,7 @@ async fn audio_flows_from_host_to_client_wav() {
     let stats = Arc::new(AudioStats::default());
     let watch = Arc::new(AudioWatch::default());
     let plan = Plan {
+            direct: None,  // 测试都走中继
         server: addr.clone(),
         device: device_id.clone(),
         password: cfg.password.clone(),
@@ -318,7 +321,9 @@ async fn client_surfaces_a_source_that_never_produced_bytes() {
 
     let c = timeout(
         T,
-        connect::connect(&addr, &device_id, &cfg.password, "状态测试控制端", vec![]),
+        connect::connect(&addr, &device_id, &cfg.password, "状态测试控制端", vec![],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("连接超时")
@@ -337,6 +342,7 @@ async fn client_surfaces_a_source_that_never_produced_bytes() {
     let stats = Arc::new(AudioStats::default());
     let watch = Arc::new(AudioWatch::default());
     let plan = Plan {
+            direct: None,  // 测试都走中继
         server: addr.clone(),
         device: device_id.clone(),
         password: cfg.password.clone(),
@@ -401,7 +407,9 @@ async fn client_stops_the_host_when_it_cannot_decode() {
 
     let c = timeout(
         T,
-        connect::connect(&addr, &device_id, &cfg.password, "叫停测试控制端", vec![]),
+        connect::connect(&addr, &device_id, &cfg.password, "叫停测试控制端", vec![],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("连接超时")
@@ -415,6 +423,7 @@ async fn client_stops_the_host_when_it_cannot_decode() {
     let stats = Arc::new(AudioStats::default());
     let watch = Arc::new(AudioWatch::default());
     let plan = Plan {
+            direct: None,  // 测试都走中继
         server: addr.clone(),
         device: device_id.clone(),
         password: cfg.password.clone(),
@@ -480,7 +489,9 @@ async fn missing_audio_capability_is_recorded_not_only_logged() {
 
     let c = timeout(
         T,
-        connect::connect(&addr, &device_id, &cfg.password, "无能力测试端", vec![]),
+        connect::connect(&addr, &device_id, &cfg.password, "无能力测试端", vec![],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("连接超时")
@@ -507,6 +518,7 @@ async fn missing_audio_capability_is_recorded_not_only_logged() {
     let stats = Arc::new(AudioStats::default());
     let watch = Arc::new(AudioWatch::default());
     let plan = Plan {
+            direct: None,  // 测试都走中继
         server: addr.clone(),
         device: device_id.clone(),
         password: cfg.password.clone(),

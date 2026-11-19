@@ -135,7 +135,9 @@ async fn echo_server() -> u16 {
 async fn session_to(server: &str, device: &str) -> uulan_client::Connected {
     timeout(
         Duration::from_secs(15),
-        connect::connect(server, device, PW, "cli", vec![Cap::PortMap]),
+        connect::connect(server, device, PW, "cli", vec![Cap::PortMap],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("连接超时")

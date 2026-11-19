@@ -36,13 +36,16 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_RELAY: &str = "192.168.223.15:21116";
 
-/// 持久化的只有这两样 —— 口令永远不进这个文件。
+/// 持久化的只有这三样（中继、设备、直连地址）—— 口令永远不进这个文件。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct GuiConfig {
     #[serde(default)]
     relay: String,
     #[serde(default)]
     device: String,
+    /// 非空 = 这台控制端**不经中继**，直接连被控端的监听端口。
+    #[serde(default)]
+    direct: String,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +60,8 @@ pub struct App {
     cfg_path: PathBuf,
     relay: String,
     device: String,
+    /// 直连地址（`IP:端口`）。填了就绕过中继 —— 与命令行的 `--direct` 等价。
+    direct: String,
     password: String,
     // 选项（每一项都对应控制端一个已验过的开关）
     audio: bool,
@@ -97,6 +102,7 @@ impl App {
             cfg_path,
             relay,
             device: cfg.device,
+            direct: cfg.direct,
             password: String::new(),
             audio: false,
             mic: false,
@@ -146,7 +152,11 @@ impl App {
     }
 
     fn save_cfg(&mut self) {
-        let cfg = GuiConfig { relay: self.relay.trim().to_string(), device: self.device.trim().to_string() };
+        let cfg = GuiConfig {
+            relay: self.relay.trim().to_string(),
+            device: self.device.trim().to_string(),
+            direct: self.direct.trim().to_string(),
+        };
         let _ = std::fs::create_dir_all(Self::cfg_dir());
         let _ = std::fs::write(&self.cfg_path, serde_json::to_string_pretty(&cfg).unwrap_or_default());
     }
@@ -181,11 +191,9 @@ impl App {
     /// 组命令行。**这里出现过的每个参数都必须已经在真机验收里出现过**，
     /// GUI 不发明新语义。
     fn build_args(&self, pw_file: &Path, mode: Mode) -> Vec<String> {
-        let mut a: Vec<String> = vec![
-            "--server".into(), self.relay.trim().to_string(),
-            "--device".into(), self.device.trim().to_string(),
-            "--password-file".into(), pw_file.to_string_lossy().into_owned(),
-        ];
+        // 直连与经中继是两条互斥的路：填了直连地址就**只发 --direct**，
+        // 绝不同时带 --server/--device —— 那会让控制端自己猜哪条算，行为不可复现。
+        let mut a = route_args(self.direct.trim(), self.relay.trim(), self.device.trim(), pw_file);
         match mode {
             Mode::Desktop => {}
             Mode::Term => a.push("--term".into()),
@@ -260,7 +268,7 @@ impl App {
         };
         // 这两条以前只改底部小字，结果用户报「点了没反应」—— 表单没填全必须有显眼回应。
         if self.device.trim().is_empty() {
-            self.alert = "还没填设备 ID —— 点上面列表里那一行，或自己写进来。".into();
+            self.alert = "还没填设备 ID —— 点上面列表里那一行，或自己写进来。\n                （想不经中继直接连，就在「直连地址」里填 被控端IP:21117，那时不用设备 ID）".into();
             return;
         }
         if self.password.trim().is_empty() {
@@ -362,6 +370,24 @@ fn parse_devices(text: &str) -> (Vec<DeviceRow>, usize) {
     }
     (out, unparsed)
 }
+
+/// 连接路线的参数装配（抽成自由函数的理由与 `parse_devices` 一样：能被单测钉住）。
+///
+/// 直连与经中继**互斥**：填了直连地址就只发 `--direct`，不再带 `--server/--device`。
+/// 同时带上等于把"走哪条路"交给控制端自己去猜，那种不确定性最难在现场复现。
+fn route_args(direct: &str, relay: &str, device: &str, pw_file: &Path) -> Vec<String> {
+    let pw = pw_file.to_string_lossy().into_owned();
+    if !direct.trim().is_empty() {
+        vec!["--direct".into(), direct.trim().to_string(), "--password-file".into(), pw]
+    } else {
+        vec![
+            "--server".into(), relay.trim().to_string(),
+            "--device".into(), device.trim().to_string(),
+            "--password-file".into(), pw,
+        ]
+    }
+}
+
 
 /// 把参数里的口令文件路径脱敏掉 —— 日志里只留结构，不留可还原的信息。
 fn sanitize(args: &[String]) -> String {
@@ -496,7 +522,9 @@ impl eframe::App for App {
                     .weak()
                     .small());
                 }
-                self.local.ui(ui);
+                // 先 clone 再传：&self.relay 与 self.local.ui(..) 会同时借 self，直接传过不了借用检查。
+                let relay = self.relay.clone();
+                self.local.ui(ui, &relay);
                 return;
             }
 
@@ -513,6 +541,19 @@ impl eframe::App for App {
                     ui.add(egui::TextEdit::singleline(&mut self.relay).desired_width(240.0));
                     if ui.button("刷新设备").clicked() {
                         self.refresh_devices();
+                    }
+                });
+                // 直连：填了就绕开中继。放这一行而不是新开一页，是因为它只是"换地址写法"，
+                // 下面的选项、口令、按钮全部照用。
+                ui.horizontal(|ui| {
+                    ui.label("直连地址");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.direct)
+                            .hint_text("留空 = 经中继；例 192.168.1.20:21117")
+                            .desired_width(240.0),
+                    );
+                    if !self.direct.trim().is_empty() {
+                        ui.label(egui::RichText::new("不经中继，被控端需开着监听（默认 21117）").weak().small());
                     }
                 });
                 ui.horizontal(|ui| {
@@ -720,5 +761,29 @@ mod tests {
         assert!(s.contains("805747189"), "设备 ID 是要给人看的，别一起抹掉：{s}");
         assert!(s.contains("--audio"));
     }
+
+    #[test]
+    fn route_args_direct_drops_relay_and_device() {
+        // 直连与经中继互斥：填了直连地址就**只发 --direct**。
+        // 同时带 --server/--device 等于让控制端自己猜走哪条路，现场最难复现。
+        let pw = std::path::Path::new("PW");
+        let a = route_args("192.168.1.20:21117", "10.0.0.9:21116", "805747189", pw);
+        assert_eq!(a[0], "--direct");
+        assert_eq!(a[1], "192.168.1.20:21117");
+        assert!(!a.contains(&"--server".to_string()), "直连还带了 --server：{a:?}");
+        assert!(!a.contains(&"--device".to_string()), "直连还带了 --device：{a:?}");
+        let i = a.iter().position(|x| x == "--password-file").unwrap();
+        assert_eq!(a[i + 1], "PW", "口令文件必须紧跟在 --password-file 后，否则 sanitize 漏脱敏");
+
+        let b = route_args("", "10.0.0.9:21116", "805747189", pw);
+        assert!(b.contains(&"--server".to_string()) && b.contains(&"--device".to_string()));
+        assert!(!b.contains(&"--direct".to_string()));
+
+        // 只填空白也算没直连（并把空白擦掉，不发一个空参数给控制端）
+        let c = route_args("   ", " 10.0.0.9:21116 ", " 805747189 ", pw);
+        assert_eq!(c[1], "10.0.0.9:21116");
+        assert_eq!(c[3], "805747189");
+    }
+
 }
 

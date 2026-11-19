@@ -138,7 +138,9 @@ async fn the_client_learns_why_the_picture_stopped_without_waiting_for_the_watch
 
     let c = timeout(
         T,
-        connect::connect(&addr, &device_id, &cfg.password, "测试控制端", vec![]),
+        connect::connect(&addr, &device_id, &cfg.password, "测试控制端", vec![],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("连接超时")

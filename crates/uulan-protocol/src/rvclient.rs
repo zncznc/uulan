@@ -7,10 +7,11 @@
 //! 三条通道各有独立连接，控制连接只负责注册与收「有人要连你」的通知 ——
 //! 这样视频或文件的大流量不会把控制消息堵住。
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 
 use crate::frame::{read_frame, write_frame, FrameKind};
 use crate::rv::{Channel, DeviceEntry, ErrCode, Role, ToEndpoint, ToServer};
@@ -341,4 +342,120 @@ impl RvWriter {
     pub async fn ping(&mut self) -> Result<(), RvError> {
         self.send(&ToServer::Ping).await
     }
+}
+
+// ───────────────────────── 直连模式（不经中继）─────────────────────────
+//
+// 为什么要有这一条路：物理隔离内网里「IP + 口令」是最顺手的用法（VNC/RDP 都这样），
+// 而中继的价值在于跨网段/NAT/不被路由直达的机器。两者不该互相替代，所以这里
+// **复用同一套通道与同一套会话代码**，只把「谁在另一端」从中继换成控制端本身：
+// 认证（PAKE + 口令/临时码/每用户独立口令）、加密、四通道复用、锁屏判定全都照旧。
+//
+// 与中继的差别只有两点：
+// 1. 没有 `HostRegister`，也就没有设备 ID 路由 —— IP 就是地址；
+// 2. 每条通道开头由控制端自己声明是哪条通道（`ToServer::DirectOpen`），
+//    被控端回执仍用现成的 `ToEndpoint::RelayReady`，于是 await 逻辑与失败判定
+//    都不用重写：指错端口/连到别的HTTP服务，第一帧就报错，不会静默卡住。
+
+/// 拨一条直连通道并等被控端回执。
+async fn direct_dial_one(addr: &str, channel: Channel, role: Role) -> Result<TcpStream, RvError> {
+    let mut s = TcpStream::connect(addr).await?;
+    s.set_nodelay(true).ok();
+    write_frame(
+        &mut s,
+        FrameKind::Json,
+        &serde_json::to_vec(&ToServer::DirectOpen { channel, role })?,
+    )
+    .await?;
+    // 复用中继那套：被控端在每条通道上都回一个 RelayReady{channel}，
+    // 于是「对端是不是 uulan」这件事在拨号阶段就能确定，而不是等画面黑屏才发现。
+    await_relay_ready(&mut s).await?;
+    Ok(s)
+}
+
+/// 控制端：一次拨齐四条直连通道（顺序拨，被控端逐条回执，语义与 relay_open_all 对齐）。
+pub async fn direct_dial_all(addr: &str) -> Result<RelaySet, RvError> {
+    let control = direct_dial_one(addr, Channel::Control, Role::Client).await?;
+    let video = direct_dial_one(addr, Channel::Video, Role::Client).await?;
+    let bulk = direct_dial_one(addr, Channel::Bulk, Role::Client).await?;
+    let audio = direct_dial_one(addr, Channel::Audio, Role::Client).await?;
+    Ok(RelaySet { control, video, bulk, audio })
+}
+
+/// 被控端：收满四条通道（任何顺序都行，靠各自的声明归位）。
+///
+/// 为什么必须有期限：直连监听对**任何能到达这个端口的机器**开放，而四条通道是
+/// 分批到达的。半套就晾着的对端不会被"读一次"发现 —— intro 已经读完、回执已发，
+/// 那条流我们后面再没碰过，所以 EOF 不会自己找上门（这是我一开始写注释时想当然的地方，
+/// 被自己的测试当场打回）。因此这里的真实防线就是这一条超时。
+///
+/// 为什么是 5 秒：真客户端在毫秒级拨齐四条，5 秒已经很宽；而对想占端口的人来说，
+/// 他必须每 5 秒重投一次才能持续占位 —— 代价从"永久"降到"每轮 5 秒"。
+/// 要更严可以再缩，但再小就要开始怀疑慢速内网了。
+pub async fn direct_accept_all(listener: &TcpListener) -> Result<(RelaySet, SocketAddr), RvError> {
+    const GATHER_TIMEOUT: Duration = Duration::from_secs(5);
+    tokio::time::timeout(GATHER_TIMEOUT, gather_channels(listener)).await
+        .map_err(|_| RvError::Timeout(GATHER_TIMEOUT))?
+}
+
+async fn gather_channels(listener: &TcpListener) -> Result<(RelaySet, SocketAddr), RvError> {
+    let mut got: HashMap<Channel, TcpStream> = HashMap::new();
+    let mut peer: Option<SocketAddr> = None;
+    while got.len() < 4 {
+        let (mut s, addr) = listener.accept().await?;
+        s.set_nodelay(true).ok();
+        let f = read_frame(&mut s).await?;
+        let intro: ToServer = serde_json::from_slice(&f.payload)?;
+        let channel = match intro {
+            ToServer::DirectOpen { channel, role } => {
+                // 角色在这里只用于日志与"谁在监听"的直觉检查：直连时被控端是 Host 侧，
+                // 对端理应是 Client。真正的凭据判定在会话里的 PAKE，不在这里 ——
+                // 所以这条不合规**不能**当致命错误（免得以后改成谁都能自称 Host）。
+                if !matches!(role, Role::Client) {
+                    return Err(RvError::Unexpected {
+                        expected: "直连对端角色为 client",
+                        got: format!("{role:?}"),
+                    });
+                }
+                channel
+            }
+            other => {
+                return Err(RvError::Unexpected { expected: "direct_open", got: format!("{other:?}") })
+            }
+        };
+        if got.insert(channel, s).is_some() {
+            // 同一条通道拨两次：多半是对端重连而旧连接还没散。当场拒绝这一轮，
+            // 而不是留下两条流让会话自己碰上"谁在写这条通道"。
+            return Err(RvError::Unexpected {
+                expected: "每条通道只出现一次",
+                got: format!("{channel:?} 重复"),
+            });
+        }
+        if peer.is_none() {
+            peer = Some(addr);
+        }
+        // 回执：告诉控制端这条通道认下了（与中继的 RelayReady 同构）。
+        let s = got.get_mut(&channel).unwrap();
+        write_frame(
+            s,
+            FrameKind::Json,
+            &serde_json::to_vec(&ToEndpoint::RelayReady { channel })?,
+        )
+        .await?;
+    }
+    let mut take = |c: Channel| -> Result<TcpStream, RvError> {
+        got.remove(&c).ok_or(RvError::Unexpected {
+            expected: "四条通道齐了",
+            got: format!("{c:?} 缺"),
+        })
+    };
+    Ok((
+        RelaySet {
+            control: take(Channel::Control)?,
+            video: take(Channel::Video)?,
+            bulk: take(Channel::Bulk)?,
+            audio: take(Channel::Audio)?,
+        },
+        peer.expect("有连接就有地址"),
+    ))
 }

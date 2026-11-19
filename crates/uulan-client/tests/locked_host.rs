@@ -149,7 +149,9 @@ async fn locked_host_reports_state_and_load_and_the_client_stops_injecting() {
 
     let c = timeout(
         Duration::from_secs(20),
-        connect::connect(&addr, &device_id, &cfg.password, "锁屏测试控制端", vec![]),
+        connect::connect(&addr, &device_id, &cfg.password, "锁屏测试控制端", vec![],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("连接超时")
@@ -218,7 +220,9 @@ async fn host_itself_drops_input_while_locked_even_if_the_client_ignores_it() {
 
     let c = timeout(
         Duration::from_secs(20),
-        connect::connect(&addr, &device_id, &cfg.password, "无视状态的粗鲁控制端", vec![]),
+        connect::connect(&addr, &device_id, &cfg.password, "无视状态的粗鲁控制端", vec![],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("连接超时")

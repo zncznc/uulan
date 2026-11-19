@@ -262,6 +262,15 @@ impl Server {
             ToServer::ClientConnect { device_id, client_name, proto } => {
                 self.handle_client_connect(stream, peer, device_id, client_name, proto).await
             }
+            // 直连声明只该发给**被控端自己的监听端口**。发到这里说明客户端走错了路：
+            // 中继既不知道"这个 IP 是谁"，也不该猜 —— 这里必须明确拒绝，
+            // 不能顺手支持（顺手支持就等于中继偷偷变成了路由器）。
+            // 错误码用现成的 Denied 而不是新增一个：老客户端解析不了未知变体会整条消息崩掉。
+            ToServer::DirectOpen { .. } => {
+                // send_error 自己吞错（它尽力而为），所以这里补 Ok(()) 保持与其它分支同型。
+                send_error(&mut stream, ErrCode::Denied, "direct_open 要发给被控端本身，不是中继").await;
+                Ok(())
+            }
             ToServer::Query { device_id } => self.handle_query(stream, &device_id).await,
             ToServer::ListDevices => self.handle_list_devices(stream).await,
             ToServer::Ping => {

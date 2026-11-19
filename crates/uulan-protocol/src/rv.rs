@@ -91,6 +91,14 @@ pub enum ToServer {
     ClientConnect { device_id: String, client_name: String, proto: u32 },
     /// 两端各自拨出一条通道连接，用 session 配对。
     RelayOpen { session: String, channel: Channel, role: Role },
+    /// 直连模式（**不经过中继**）下，控制端在每条通道连接开头声明自己是哪条通道。
+    ///
+    /// 为什么不按"连接顺序"猜：拨号顺序是实现细节，猜错的后果是把视频流灌进
+    /// 控制通道 —— 那种错要等到画面出不来才会被发现，而且现场极难复述。
+    ///
+    /// 这条**不该发给中继**：中继遇到未知变体会报错断开，这是故意的 ——
+    /// 直连与经中继是两条路，混用必须当场失败，不许静默降级。
+    DirectOpen { channel: Channel, role: Role },
     /// 客户端查询设备在线状态（不发起会话）。
     Query { device_id: String },
     /// 拉一份设备目录（在线 + 台账），不发起会话。
@@ -255,6 +263,11 @@ mod tests {
             .unwrap(),
             r#"{"type":"relay_open","session":"ab","channel":"video","role":"host"}"#
         );
+        assert_eq!(
+            serde_json::to_string(&ToServer::DirectOpen { channel: Channel::Bulk, role: Role::Client }).unwrap(),
+            r#"{"type":"direct_open","channel":"bulk","role":"client"}"#
+        );
+
         assert_eq!(
             serde_json::to_string(&ToEndpoint::Error { code: ErrCode::Offline, message: "设备不在线".into() }).unwrap(),
             r#"{"type":"error","code":"offline","message":"设备不在线"}"#

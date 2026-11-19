@@ -233,7 +233,9 @@ async fn relay_sees_no_plaintext_of_clipboard_or_filenames() {
     // 控制端连的是**代理**，所以它看到的流量全被记录。
     let c = timeout(
         Duration::from_secs(25),
-        connect::connect(&proxy, &device_id, &cfg.password, "加密测试控制端", vec![]),
+        connect::connect(&proxy, &device_id, &cfg.password, "加密测试控制端", vec![],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("连接超时")

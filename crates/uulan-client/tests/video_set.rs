@@ -142,7 +142,9 @@ async fn video_set_scales_the_encoder_without_touching_screen_size() {
 
     let c = timeout(
         Duration::from_secs(30),
-        connect::connect(&addr, &device_id, &cfg.password, "画面参数测试控制端", vec![]),
+        connect::connect(&addr, &device_id, &cfg.password, "画面参数测试控制端", vec![],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("连接超时")

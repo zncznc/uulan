@@ -17,7 +17,7 @@ use anyhow::{bail, Context, Result};
 use tracing::{info, warn};
 
 use uulan_host::capture::{CaptureInput, Region};
-use uulan_host::config::HostConfig;
+use uulan_host::config::{gen_password, HostConfig};
 use uulan_host::session::{self, HostState, SessionOutcome, SessionParams, VideoSettings};
 use uulan_media::ffmpeg::{self, Encoder};
 use uulan_protocol::rv::{Role, ToEndpoint};
@@ -45,13 +45,27 @@ struct Args {
     name: Option<String>,
     show: bool,
     new_temp_code: bool,
+    /// 每人一份独立口令的管理入口。**口令绝不走命令行**（argv 会进 shell 历史、
+    /// 进程列表与审计日志），所以只有"自动生成并打印一次"这一条路。
+    user_add: Option<String>,
+    user_del: Option<String>,
+    list_users: bool,
     once: bool,
     diagnose: bool,
+    /// 直连监听地址。默认 `0.0.0.0:21117`：**装了就能用 IP 直接连**。
+    listen: Option<String>,
+    /// 关掉直连监听（敏感现场、或不想多开一个入站端口时用）。
+    no_listen: bool,
 }
 
 const HELP: &str = "\
 uulan-host —— uulan 内网远控的被控端
 
+  --listen <地址:端口> 直连监听地址（默认 0.0.0.0:21117；控制端用 --direct 直连它）
+  --no-listen         不监听任何端口（只走中继）
+  --users             列出本机额外登录身份（口令一律不打印）
+  --user-add <名字>   加一个人并现场生成一份独立口令（只打印一次）
+  --user-del <名字>   吊销一个人的口令（常驻服务当场生效）
   --config <path>     配置文件路径（默认 ~/.config/uulan/host.json）
   --server <addr>     中继地址，覆盖配置里的值（ip:port）
   --capture <spec>    采集源：x11 / x11::0.0 / x11::0.0@<显示器号(0基)> / lavfi:<合成源>[@帧数]
@@ -85,8 +99,13 @@ fn parse_args() -> Result<Args> {
         name: None,
         show: false,
         new_temp_code: false,
+        user_add: None,
+        user_del: None,
+        list_users: false,
         once: false,
         diagnose: false,
+        listen: None,
+        no_listen: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -110,6 +129,11 @@ fn parse_args() -> Result<Args> {
             "--show" => a.show = true,
             "--diagnose" => a.diagnose = true,
             "--new-temp-code" => a.new_temp_code = true,
+            "--user-add" => a.user_add = Some(it.next().unwrap_or_default()),
+            "--user-del" => a.user_del = Some(it.next().unwrap_or_default()),
+            "--users" => a.list_users = true,
+            "--listen" => a.listen = Some(it.next().unwrap_or_default()),
+            "--no-listen" => a.no_listen = true,
             "--once" => a.once = true,
             "-h" | "--help" => {
                 println!("{HELP}");
@@ -198,6 +222,42 @@ async fn main() -> Result<()> {
         std::process::exit(if report.all_ok() { 0 } else { 1 });
     }
 
+    // 用户表管理：改完就存盘退出，常驻服务会通过 adopt_external_config 立刻看见。
+    if let Some(name) = &args.user_add {
+        let pw = gen_password();
+        cfg.add_user(name, &pw)
+            .map_err(|e| anyhow::anyhow!("添加用户失败：{e}"))?;
+        cfg.save(&cfg_path)?;
+        println!("已添加用户: {}", name.trim());
+        println!("该用户的口令: {pw}");
+        println!("（只打印这一次；关掉它就等于没口令可用。吊销：uulan-host --user-del {}）", name.trim());
+        return Ok(());
+    }
+    if let Some(name) = &args.user_del {
+        if !cfg.del_user(name) {
+            println!("没有这个用户：{}（--users 看当前名单）", name.trim());
+            return Ok(());
+        }
+        cfg.save(&cfg_path)?;
+        println!("已吊销用户 {} 的口令。常驻服务下一次鉴权就不再接受它。", name.trim());
+        return Ok(());
+    }
+    if args.list_users {
+        println!("主人（配置里的访问口令）：已设");
+        if cfg.users.is_empty() {
+            println!("额外用户：（无）");
+        } else {
+            for u in &cfg.users {
+                // 只报长度，不报值 —— 这个命令的输出会被贴进工单和聊天窗口。
+                println!("  {}  口令 {} 位", u.name, u.password.chars().count());
+            }
+        }
+        if let Some(t) = &cfg.temp_code {
+            println!("一次性临时码：已有一张（{} 位，用一次即失效）", t.chars().count());
+        }
+        return Ok(());
+    }
+
     if args.new_temp_code {
         let c = cfg.refresh_temp_code();
         cfg.save(&cfg_path)?;
@@ -235,6 +295,32 @@ async fn main() -> Result<()> {
         info!("收到 Ctrl-C，退出");
         std::process::exit(0);
     });
+
+    // 直连监听：与中继循环**互不依赖**。中继挂了，坐在同一内网的人照样能用 IP 连进来；
+    // 反过来端口被人挡了，中继那条路也不受影响。两条路共用同一份 session::run。
+    if !args.no_listen {
+        let addr = args.listen.clone().unwrap_or_else(|| "0.0.0.0:21117".to_string());
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(l) => {
+                info!(%addr, "直连监听已开启（控制端：uulan-client --direct <本机IP>:21117）");
+                let st = state.clone();
+                let ff = ffmpeg.clone();
+                let enc = encoder;
+                tokio::spawn(async move {
+                    if let Err(e) = serve_direct(st, ff, enc, l).await {
+                        warn!(error = %e, "直连监听退出");
+                    }
+                });
+            }
+            Err(e) => {
+                // 端口被占/无权限：中继模式仍然可用，所以这不该让被控端整个起不来，
+                // 但必须在日志里说清楚，否则现场只会看到「直连连不上」而没人知道原因。
+                warn!(%addr, error = %e, "直连监听开不起来（只走中继仍可用；要关它就加 --no-listen）");
+            }
+        }
+    } else {
+        info!("按 --no-listen 的要求：不开直连监听，只走中继");
+    }
 
     run_forever(state, ffmpeg, cfg, screen, encoder, args.once).await
 }
@@ -490,6 +576,58 @@ async fn serve_relay(
             }
             other => tracing::debug!(shape = other.shape(), "中继推送"),
         }
+    }
+}
+
+/// 直连服务循环：等人用 IP 拨进来，走与中继**同一段**会话代码。
+///
+/// 参数装配是照 `serve_relay` 的 `Incoming` 分支抄的，不是重构出来的公共函数 ——
+/// 这里刻意留两份：两条路必须逐项一致（剪贴板/终端/端口映射/锁屏判定都由这些参数决定），
+/// 一旦哪天只改了其中一处，「走中继能用、走直连不能用」就是最难查的现场问题。
+/// 改这里必须同时改那边。
+async fn serve_direct(
+    state: Arc<HostState>,
+    ffmpeg: PathBuf,
+    encoder: Encoder,
+    listener: tokio::net::TcpListener,
+) -> Result<()> {
+    loop {
+        let (relays, peer) = match uulan_protocol::rvclient::direct_accept_all(&listener).await {
+            Ok(x) => x,
+            Err(e) => {
+                // 端口扫描、只拨了两条就断、20 秒没拨齐 —— 都落到这里。
+                // 必须记一笔（debug 级别），否则现场分不清「没人来连」和「来了但没连上」。
+                tracing::debug!(error = %e, "直连半途而废");
+                continue;
+            }
+        };
+        let snap = state.snapshot();
+        let screen = session::resolve_region(&snap.capture, &snap).await;
+        let params = SessionParams {
+            mic_sink: uulan_host::mic::parse_sink(&snap.mic_sink).expect("mic_sink 已在启动时校验"),
+            state: state.clone(),
+            ffmpeg: ffmpeg.clone(),
+            capture: snap.capture,
+            screen,
+            encoder,
+            settings: VideoSettings::from_config(&state.snapshot()),
+            clipboard: None,
+            screen_probe: None,
+            fs_roots: None,
+            pty: None,
+            sys_source: None,
+            lock_probe: None,
+        };
+        info!(%peer, "有人从直连拨进来");
+        tokio::spawn(async move {
+            // 中继路径里的 client_addr 本来就是字符串（中继报过来的人类可读地址），
+            // 直连这里给 SocketAddr 的文本形式，两条路的日志形状一致。
+            match session::run(params, relays, peer.to_string()).await {
+                SessionOutcome::Closed(why) => info!(%why, "直连会话结束"),
+                SessionOutcome::Unauthenticated(p) => warn!(peer = %p, "直连会话因鉴权未通过被拒"),
+                SessionOutcome::Error(e) => warn!(error = %e, "直连会话出错"),
+            }
+        });
     }
 }
 

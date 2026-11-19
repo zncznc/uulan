@@ -15,6 +15,21 @@ use crate::capture::CaptureInput;
 /// 默认中继端口，与 `uulan-protocol::DEFAULT_PORT` 保持一致。
 pub use uulan_protocol::DEFAULT_PORT;
 
+/// 一个可单独吊销的登录身份（用户名 → 该用户的访问口令）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserCred {
+    pub name: String,
+    pub password: String,
+}
+
+/// 被控端手上的一个候选凭据。`label` 只用于日志与吊销定位，**不参与密码学**。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    pub label: String,
+    pub value: String,
+    pub is_temp: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostConfig {
     /// 中继服务器地址（`ip:port`）。
@@ -36,6 +51,14 @@ pub struct HostConfig {
     /// 一次性临时验证码（可选）。用掉一次即失效。
     #[serde(default)]
     pub temp_code: Option<String>,
+
+    /// 额外登录身份：每人一份独立口令，可单独吊销，日志能分辨是谁连进来的。
+    ///
+    /// 为什么口令可以有很多份而线格式不用改：被控端本来就对**每个候选凭据**各算一个
+    /// PAKE 点（见 session.rs 的 `PakeHost::respond`），命中哪一下就知道对面用的是哪份
+    /// 凭据 —— "是谁"是从密码学结果推出来的，不是客户端自报的，冒充不了。
+    #[serde(default)]
+    pub users: Vec<UserCred>,
 
     /// 注册令牌：证明「我是这台机器」，好在中继重启/网络抖动后拿回同一个设备 ID。
     ///
@@ -174,6 +197,7 @@ impl Default for HostConfig {
             device_id: None,
             password: gen_password(),
             temp_code: None,
+            users: Vec::new(),
             reg_token: gen_password(),
             assist_enabled: false,
             capture: CaptureInput::default(),
@@ -623,5 +647,155 @@ mod tests {
         let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "配置文件里有访问密码，必须是 0600，实际 {mode:o}");
         let _ = std::fs::remove_file(&p);
+    }
+}
+
+impl HostConfig {
+    /// 当前所有候选凭据，顺序即 PAKE `ybs` 的顺序：**主人口令 → 各用户口令 → 临时码**。
+    ///
+    /// 临时码永远排最后：它是给"临时协助"的一次性凭据，用它连接不该顶掉主人自己的口令。
+    ///
+    /// **同值去重**：两个用户填了同一个口令时，被控端在密码学上**无法区分是谁**
+    /// （PAKE 只看值不看名字）。这里保留第一个出现的名字，并在 label 上标出歧义 ——
+    /// 日志宁可难看得也不说谎。
+    pub fn candidates(&self) -> Vec<Candidate> {
+        let mut out = vec![Candidate {
+            label: "主人".to_string(),
+            value: self.password.clone(),
+            is_temp: false,
+        }];
+        // 同值必须合并成一条候选：`authenticate()` 用 `position()` 找命中下标，
+        // 两份相同口令只会命中第一条 —— 于是日志会把后一个人记成前一个人。
+        // 合并之后把歧义写在**那一条**的 label 上，宁可难看也不说谎。
+        let mut seen: Vec<String> = vec![self.password.clone()];
+        for u in &self.users {
+            if u.name.trim().is_empty() || u.password.is_empty() {
+                continue;
+            }
+            if let Some(k) = seen.iter().position(|v| v == &u.password) {
+                out[k].label = format!("{}(与{}同口令,无法区分)", out[k].label, u.name);
+                continue;
+            }
+            seen.push(u.password.clone());
+            out.push(Candidate { label: u.name.clone(), value: u.password.clone(), is_temp: false });
+        }
+        if let Some(t) = &self.temp_code {
+            out.push(Candidate { label: "临时码".to_string(), value: t.clone(), is_temp: true });
+        }
+        out
+    }
+
+    /// 加/改一个用户。口令必须过与全局口令同样的强度校验（8–16 位且含字母数字）。
+    pub fn add_user(&mut self, name: &str, password: &str) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("用户名不能为空".into());
+        }
+        if name.contains(',') || name.contains(' ') {
+            return Err("用户名里别用空格和逗号（日志与命令行都靠它们分列）".into());
+        }
+        validate_password(password)?;
+        if let Some(u) = self.users.iter_mut().find(|u| u.name == name) {
+            u.password = password.to_string();
+        } else {
+            self.users.push(UserCred { name: name.to_string(), password: password.to_string() });
+        }
+        Ok(())
+    }
+
+    pub fn del_user(&mut self, name: &str) -> bool {
+        let n = self.users.len();
+        self.users.retain(|u| u.name != name.trim());
+        self.users.len() != n
+    }
+
+    /// 按用户名取口令（管理命令用；不参与鉴权判定）。
+    pub fn user_password(&self, name: &str) -> Option<&str> {
+        self.users.iter().find(|u| u.name == name.trim()).map(|u| u.password.as_str())
+    }
+
+}
+
+#[cfg(test)]
+mod tests_users {
+    use super::*;
+
+    #[test]
+    fn candidates_order_owner_users_then_temp() {
+        let mut c = HostConfig::default();
+        c.password = "aaaa1111".into();
+        c.add_user("zhang", "bbbb2222").unwrap();
+        c.add_user("li", "cccc3333").unwrap();
+        c.temp_code = Some("dddd4444".into());
+        let v: Vec<(String, bool)> = c
+            .candidates()
+            .into_iter()
+            .map(|x| (x.label, x.is_temp))
+            .collect();
+        assert_eq!(
+            v,
+            vec![
+                ("主人".to_string(), false),
+                ("zhang".to_string(), false),
+                ("li".to_string(), false),
+                ("临时码".to_string(), true)
+            ],
+            "临时码必须排最后：用它连接不该顶掉主人自己的口令"
+        );
+    }
+
+    #[test]
+    fn duplicate_password_is_flagged_not_silent() {
+        // 两个用户填了同一个口令时，PAKE 只看值不看名字 —— 被控端分不清是谁。
+        // 这种情况必须写在 label 上，否则日志会指着第一个名字说谎。
+        let mut c = HostConfig::default();
+        c.password = "same1111aa".into();
+        c.add_user("zhang", "bbbb2222").unwrap();
+        c.users.push(UserCred { name: "li".into(), password: "bbbb2222".into() });
+        let cands = c.candidates();
+        let hit = cands.iter().find(|x| x.label.contains("li")).expect("li 要有一条候选");
+        assert!(hit.label.contains("无法区分"), "同口令必须标明歧义，实际：{}", hit.label);
+        assert_eq!(cands.iter().filter(|x| x.value == "bbbb2222").count(), 1);
+    }
+
+    #[test]
+    fn add_user_validates_password_strength() {
+        let mut c = HostConfig::default();
+        assert!(c.add_user("wang", "short1").is_err(), "8 位以下必须拒");
+        assert!(c.add_user("wang", "abcdefgh").is_err(), "纯字母必须拒（可穷举）");
+        assert!(c.add_user("", "abcd1234").is_err(), "空用户名必须拒");
+        assert!(c.add_user("has space", "abcd1234").is_err(), "带空格的用户名会把日志分列搞坏");
+        c.add_user("wang", "abcd1234").unwrap();
+        assert_eq!(c.user_password("wang"), Some("abcd1234"));
+        // 同名再加 = 改口令，不是多出一条。
+        c.add_user("wang", "zzzz9999").unwrap();
+        assert_eq!(c.users.len(), 1);
+        assert_eq!(c.user_password("wang"), Some("zzzz9999"));
+    }
+
+    #[test]
+    fn del_user_removes_the_candidate_immediately() {
+        let mut c = HostConfig::default();
+        c.password = "owner12345".into();
+        c.add_user("zhang", "user123456").unwrap();
+        assert!(c.candidates().iter().any(|x| x.value == "user123456"));
+        assert!(c.del_user("zhang"));
+        assert!(!c.candidates().iter().any(|x| x.value == "user123456"), "吊销必须当场生效");
+        assert!(!c.del_user("zhang"), "再删一次要报告没有这个人");
+        assert_eq!(c.candidates().len(), 1, "主人那条不能被牵连");
+    }
+
+    #[test]
+    fn users_roundtrip_and_legacy_config_still_loads() {
+        let mut c = HostConfig::default();
+        c.add_user("wang", "abcd1234").unwrap();
+        let text = serde_json::to_string(&c).unwrap();
+        let back: HostConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.users, c.users);
+
+        // 老配置文件里根本没有 users 字段 —— 必须照样读得进来，不能因为加功能把现场打挂。
+        let legacy = "{\"server\":\"h:1\",\"password\":\"abcd1234\",\"reg_token\":\"t\"}";
+        let parsed: HostConfig = serde_json::from_str(legacy).unwrap_or_else(|e| panic!("{e}"));
+        assert!(parsed.users.is_empty());
     }
 }

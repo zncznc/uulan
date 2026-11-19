@@ -70,17 +70,154 @@ pub struct Info {
     pub server: String,
     pub password: String,
     pub temp: String,
+    /// (用户名, 口令位数)。**口令值绝不在这里** —— 这个结构每帧都被 clone。
+    pub users: Vec<(String, usize)>,
 }
 
 pub struct LocalPanel {
     pub info: Option<Info>,
     pub reveal: bool,
     pub status: String,
+    /// 「加一个人」输入的名字。
+    new_user: String,
+    /// 由本面板拉起的被控端进程。**关掉面板就下线**靠这个句柄实现 ——
+    /// 否则"打开程序当被控端"会变成"退出程序后本机还在被人连"，那是个惊喜的反面。
+    pub host_child: Option<std::process::Child>,
+    /// 上线的时刻，用来区分"正在向中继注册"和"注册失败"。
+    host_since: Option<std::time::Instant>,
+}
+
+
+impl Drop for LocalPanel {
+    /// 面板退出 ⇒ 自己拉起的被控端一起走。系统服务那种不归我们管（也不该管）。
+    fn drop(&mut self) {
+        if let Some(mut c) = self.host_child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+impl LocalPanel {
+    /// 本机现在的被控端状态。区分三种，因为**下线语义完全不同**：
+    /// systemd 常驻服务关掉面板也不会下线；面板拉起的才会。
+    fn host_state(&mut self) -> (&'static str, bool) {
+        // 自己拉起的进程先问它本人。
+        if let Some(c) = self.host_child.as_mut() {
+            match c.try_wait() {
+                Ok(None) => return ("由本程序拉起（关掉面板即下线）", true),
+                Ok(Some(_)) | Err(_) => {
+                    self.host_child = None;
+                    self.host_since = None;
+                }
+            }
+        }
+        // 再看系统里有没有别的 uulan-host 在跑（root 装的系统/用户服务就是这种）。
+        let found = || -> bool {
+            // 闭包里不能用 `?`（它得返回 bool），所以全程 map + unwrap_or：
+            // 探不到进程就当"没在跑"，绝不为这个把面板弄崩。
+            #[cfg(windows)]
+            {
+                std::process::Command::new("tasklist")
+                    .args(["/FI", "IMAGENAME eq uulan-host.exe", "/NH"])
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).contains("uulan-host.exe"))
+                    .unwrap_or(false)
+            }
+            #[cfg(not(windows))]
+            {
+                std::process::Command::new("ps")
+                    .args(["-eo", "args"])
+                    .output()
+                    .map(|o| {
+                        String::from_utf8_lossy(&o.stdout)
+                            .lines()
+                            .any(|l| l.contains("uulan-host") && !l.contains("ps -eo args"))
+                    })
+                    .unwrap_or(false)
+            }
+        };
+        match found() {
+            true => ("作为服务常驻（关掉本程序不会下线）", true),
+            false => ("未上线", false),
+        }
+    }
+
+    /// 让本机现在就能被连接：直接跑被控端，**不需要 root、不需要 install.sh**。
+    /// 设备 ID 由中继首次注册时下发（config.rs 里写明），口令由被控端自己生成并落盘，
+    /// 所以这里只是把它拉起来，不替它造任何身份。
+    pub fn start_host(&mut self, relay: &str) {
+        let Some(host) = Self::host_exe() else {
+            self.status = "找不到 uulan-host 二进制 —— 装了客户端还得带上被控端可执行文件才行。".into();
+            return;
+        };
+        if self.host_state().1 {
+            self.status = "本机已经在被控状态了，不需要再拉一个（两个被控端会抢同一个设备 ID）。".into();
+            return;
+        }
+        let dir = host.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let _ = std::fs::create_dir_all(&dir);
+        let log = dir.join("gui-host.log");
+        let mut cmd = Command::new(&host);
+        if !relay.trim().is_empty() {
+            cmd.args(["--server", relay.trim()]);
+        }
+        // 输出必须接住：没有控制台的时候，它是唯一能看到被控端为什么起不来的地方。
+        match std::fs::File::create(&log) {
+            Ok(f) => match f.try_clone() {
+                Ok(f2) => {
+                    cmd.stdout(std::process::Stdio::from(f2)).stderr(std::process::Stdio::from(f));
+                }
+                Err(_) => {
+                    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::from(f));
+                }
+            },
+            Err(_) => {
+                cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        match cmd.spawn() {
+            Ok(c) => {
+                self.host_child = Some(c);
+                self.host_since = Some(std::time::Instant::now());
+                self.status = "已拉起被控端，正在向中继注册…（设备 ID 由中继下发，口令写在本机配置里）".to_string();
+            }
+            Err(e) => self.status = format!("起不来 {}：{e}", host.display()),
+        }
+    }
+
+    pub fn stop_host(&mut self) {
+        // 先把子进程**取出来**再动 self，否则 as_mut 的借用会罩住后面的赋值。
+        if let Some(mut c) = self.host_child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+            self.host_since = None;
+            self.status = "本机已下线（由本程序拉起的被控端已停止）。".into();
+            return;
+        }
+        self.status = if self.host_state().1 {
+            "本机是被控端服务拉起来的，面板不越权去停它 —— 请用 systemctl。".into()
+        } else {
+            "本机本来就没在线。".into()
+        };
+    }
 }
 
 impl LocalPanel {
     pub fn new() -> Self {
-        let mut p = Self { info: None, reveal: false, status: String::new() };
+        let mut p = Self {
+            info: None,
+            reveal: false,
+            status: String::new(),
+            new_user: String::new(),
+            host_child: None,
+            host_since: None,
+        };
         p.reload();
         p
     }
@@ -130,6 +267,19 @@ impl LocalPanel {
                 Ok(v) => {
                     let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
                     let temp = v.get("temp_code").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    let users: Vec<(String, usize)> = v
+                        .get("users")
+                        .and_then(|x| x.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|u| {
+                                    let n = u.get("name")?.as_str()?.to_string();
+                                    let l = u.get("password")?.as_str()?.chars().count();
+                                    Some((n, l))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     self.status.clear();
                     Some(Info {
                         path: path.clone(),
@@ -138,6 +288,7 @@ impl LocalPanel {
                         server: g("server"),
                         password: g("password"),
                         temp,
+                        users,
                     })
                 }
                 Err(e) => {
@@ -222,6 +373,50 @@ impl LocalPanel {
         };
     }
 
+
+    /// 借被控端自己的 CLI 改用户表 —— 面板**不自己造口令、不自己写配置**：
+    /// 谁生成身份，谁才负责它的格式、强度校验与落盘（这里全在 `uulan-host` 里）。
+    /// 返回被控端 stdout 的尾部（`--user-add` 会在这里打印一次口令，正是给人看的）。
+    fn run_host_cli(&mut self, args: &[&str]) -> String {
+        let Some(host) = Self::host_exe() else {
+            self.status = "找不到 uulan-host 二进制，管不了用户表。".into();
+            return String::new();
+        };
+        let Some(path) = Self::config_path() else {
+            self.status = "没有配置文件，管不了用户表。".into();
+            return String::new();
+        };
+        let mut cmd = Command::new(&host);
+        for a in args {
+            cmd.arg(a);
+        }
+        cmd.arg("--config").arg(&path);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        match cmd.output() {
+            Ok(o) if o.status.success() => {
+                self.reload();
+                String::from_utf8_lossy(&o.stdout).to_string()
+            }
+            Ok(o) => {
+                let e = String::from_utf8_lossy(&o.stderr);
+                self.status = format!(
+                    "被控端拒绝执行（退出码 {:?}）：{}",
+                    o.status.code(),
+                    e.lines().rev().take(2).collect::<Vec<_>>().join(" ← ")
+                );
+                String::new()
+            }
+            Err(e) => {
+                self.status = format!("跑不了 {}：{e}", host.display());
+                String::new()
+            }
+        }
+    }
+
     fn kv(ui: &mut egui::Ui, ctx: &egui::Context, label: &str, value: &str, big: bool, copy: bool) {
         ui.horizontal(|ui| {
             ui.label(label);
@@ -238,10 +433,43 @@ impl LocalPanel {
         });
     }
 
-    pub fn ui(&mut self, root: &mut egui::Ui) {
+    pub fn ui(&mut self, root: &mut egui::Ui, relay: &str) {
         // Context 是 Arc 型的，克隆出来用；直接 root.ctx() 会把 root 借成只读，
         // 后面再 root.group(..) 就撞借用检查。
         let ctx = root.ctx().clone();
+        // 第一组就是「本机能不能被连」——这是"装了客户端就能当被控端"的落点。
+        let (state, online) = self.host_state();
+        root.group(|ui| {
+            ui.label(egui::RichText::new("本机被控状态").strong());
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(if online { "● 在线" } else { "○ 未上线" })
+                    .color(if online { egui::Color32::from_rgb(60, 190, 90) } else { egui::Color32::GRAY })
+                    .strong());
+                ui.label(state);
+            });
+            ui.horizontal(|ui| {
+                if !online {
+                    let label = if relay.trim().is_empty() { "让本机成为被控端" } else { "让本机成为被控端（上线）" };
+                    if ui.button(label).clicked() {
+                        self.start_host(relay);
+                    }
+                } else if ui.button("下线").clicked() {
+                    self.stop_host();
+                }
+                if self.host_child.is_none() && online {
+                    ui.label(egui::RichText::new("下线请在本机执行：systemctl --user stop uulan-host").small().weak());
+                }
+            });
+            ui.label(egui::RichText::new(
+                "不需要 root、不需要安装脚本：起来的就是本机的被控端。设备 ID 由中继首次注册时下发，\n\
+                 访问口令由被控端自己生成并写入本机配置 —— 面板不替机器编造身份。",
+            )
+            .small()
+            .weak());
+        });
+        root.add_space(6.0);
+
         if let Some(info) = self.info.clone() {
             root.group(|ui| {
                 ui.label(egui::RichText::new("这台机器的被控端身份").strong());
@@ -272,6 +500,60 @@ impl LocalPanel {
                         self.gen_temp();
                     }
                 }
+            });
+
+            root.add_space(6.0);
+            root.group(|ui| {
+                ui.label(egui::RichText::new("额外登录身份（每人一份独立口令）").strong());
+                ui.separator();
+                if info.users.is_empty() {
+                    ui.label(egui::RichText::new("还没有额外用户 —— 现在只有主人口令与临时码能连。").weak());
+                } else {
+                    for (n, l) in info.users.clone() {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(&n).monospace());
+                            ui.label(egui::RichText::new(format!("口令 {l} 位")).weak());
+                            if ui.button("吊销").clicked() {
+                                // 吊销走被控端自己的 CLI：身份归它生成、归它落盘、归它校验格式。
+                                let out = self.run_host_cli(&["--user-del", &n]);
+                                if !out.is_empty() {
+                                    self.status = format!("已吊销 {n}。他的口令下一次就通不过。");
+                                }
+                            }
+                        });
+                    }
+                }
+                ui.horizontal(|ui| {
+                    ui.label("新用户名");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_user)
+                            .hint_text("例 ops（别用空格和逗号）")
+                            .desired_width(150.0),
+                    );
+                    if ui.button("加一个人").clicked() {
+                        let name = self.new_user.trim().to_string();
+                        if name.is_empty() {
+                            self.status = "先起个名字。".into();
+                        } else {
+                            let out = self.run_host_cli(&["--user-add", &name]);
+                            if !out.is_empty() {
+                                // 被控端只在 stdout 打印这一次口令，抄下来就没了 ——
+                                // 所以这里原样转述，并当场提醒别往聊天窗口里贴。
+                                self.status =
+                                    format!("{}（只显示这一次，关掉界面就再也看不到）", out.trim());
+                            }
+                            self.new_user.clear();
+                        }
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "身份名不在线上送：被控端看命中哪一份凭据就知道是谁，报假名没用。\n\
+                         吊销当场生效；某人泄露只换他那一行，别人不受影响。",
+                    )
+                    .small()
+                    .weak(),
+                );
             });
 
             root.add_space(6.0);
@@ -317,10 +599,8 @@ impl LocalPanel {
                         .weak(),
                 );
                 ui.label(
-                    egui::RichText::new(
-                        "装了被控端的那台机器上运行本程序时，这一页会显示它的设备 ID 与一次性验证码。",
-                    )
-                    .weak(),
+                    egui::RichText::new("点上面「让本机成为被控端」，注册成功后这里就会出现设备 ID 与验证码。")
+                        .weak(),
                 );
             });
         }

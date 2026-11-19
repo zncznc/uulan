@@ -153,7 +153,9 @@ async fn keys_and_mouse_reach_the_host_injector() {
 
     let c = timeout(
         Duration::from_secs(20),
-        connect::connect(&addr, &device_id, &cfg.password, "输入测试控制端", vec![]),
+        connect::connect(&addr, &device_id, &cfg.password, "输入测试控制端", vec![],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("连接超时")
@@ -239,7 +241,9 @@ async fn unknown_vk_and_sub_notch_wheel_inject_nothing() {
 
     let c = timeout(
         Duration::from_secs(20),
-        connect::connect(&addr, &device_id, &cfg.password, "输入测试控制端", vec![]),
+        connect::connect(&addr, &device_id, &cfg.password, "输入测试控制端", vec![],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("连接超时")

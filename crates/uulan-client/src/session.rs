@@ -271,6 +271,8 @@ impl Default for Live {
 pub struct Plan {
     pub server: String,
     pub device: String,
+    /// 直连地址（Some = 这条会话完全不经中继）。断线重连靠它保持同一条路。
+    pub direct: Option<String>,
     /// 口令。**不进日志**：只有 `connect` 用，其余地方一律不碰。
     pub password: String,
     pub client_name: String,
@@ -317,6 +319,8 @@ impl Plan {
             &self.password,
             &self.client_name,
             self.caps.clone(),
+            // 重连保持同一条路：曾直连成功、重连却去拨中继，现场就是「第一次能连，断了就连不上」。
+            self.direct.as_deref(),
         )
         .await
     }

@@ -178,7 +178,9 @@ async fn clipboard_syncs_both_ways_without_echo() {
 
     let c = timeout(
         Duration::from_secs(20),
-        connect::connect(&addr, &device_id, &cfg.password, "剪贴板测试控制端", vec![]),
+        connect::connect(&addr, &device_id, &cfg.password, "剪贴板测试控制端", vec![],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("连接超时")
@@ -236,7 +238,9 @@ async fn session_start_does_not_push_pre_existing_clipboard() {
 
     let c = timeout(
         Duration::from_secs(20),
-        connect::connect(&addr, &device_id, &cfg.password, "剪贴板测试控制端", vec![]),
+        connect::connect(&addr, &device_id, &cfg.password, "剪贴板测试控制端", vec![],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("连接超时")

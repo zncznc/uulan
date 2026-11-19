@@ -27,6 +27,8 @@ use uulan_protocol::rvclient::{RvConn, RvError};
 struct Args {
     server: String,
     device: String,
+    /// 直连地址（`IP:端口`）。给了它就**完全不碰中继**，`--device` 可省。
+    direct: Option<String>,
     /// 口令。**别从命令行传**：`--password` 会留在 `ps`、shell 历史、工单截图里。
     /// 推荐 `--password-file`（首行）或环境变量 `UULAN_PASSWORD`，见 `resolve_password`。
     password: String,
@@ -116,6 +118,7 @@ uulan-client —— uulan 内网远控的控制端
 
   --server <addr>     中继地址（默认 127.0.0.1:21116）
   --device <id>       被控端设备 ID（9 位数字）
+  --direct <IP:端口>  不经中继，直接连被控端的监听端口（默认 21117）；此时可省 --device
   --password <pwd>    访问密码或一次性临时验证码（会出现在 ps/历史里，能用别的就用别的）
   --password-file <f> 从文件首行读口令（推荐：不进进程表，也不进 shell 历史）
                       也可以设环境变量 UULAN_PASSWORD；优先级 --password > 文件 > 环境变量
@@ -208,6 +211,7 @@ fn parse_args() -> Result<Args> {
     let mut a = Args {
         server: format!("127.0.0.1:{}", uulan_protocol::DEFAULT_PORT),
         device: String::new(),
+        direct: None,
         password: String::new(),
         password_file: None,
         name: default_client_name(),
@@ -254,6 +258,7 @@ fn parse_args() -> Result<Args> {
                 a.server_explicit = true;
             }
             "--device" => a.device = it.next().unwrap_or_default(),
+            "--direct" => a.direct = Some(it.next().unwrap_or_default()),
             "--password" => a.password = it.next().unwrap_or_default(),
             "--password-file" => {
                 a.password_file = Some(PathBuf::from(
@@ -471,7 +476,7 @@ fn parse_args() -> Result<Args> {
             ),
         }
     }
-    if a.device.is_empty() {
+    if a.device.is_empty() && a.direct.is_none() {
         bail!(
             "必须给出 --device（被控端界面上显示的 9 位设备 ID），或者用 --last 连上次那台"
         );
@@ -680,8 +685,15 @@ async fn connect_with_retry(
 ) -> Result<connect::Connected, ClientError> {
     let mut attempt: u32 = 0;
     loop {
-        match connect::connect(&args.server, &args.device, &args.password, &args.name, caps.to_vec())
-            .await
+        match connect::connect(
+            &args.server,
+            &args.device,
+            &args.password,
+            &args.name,
+            caps.to_vec(),
+            args.direct.as_deref(),
+        )
+        .await
         {
             Ok(c) => return Ok(c),
             Err(e) => {
@@ -1057,6 +1069,8 @@ async fn main() -> Result<()> {
 
     // 会话配置：窗口模式与 headless 共用同一份 —— 重连就是「拿同一份参数再握一次手」。
     let plan = session::Plan {
+        // 直连模式要一路带到重连逻辑里，所以它进 Plan 而不是只留在 args。
+        direct: args.direct.clone(),
         server: args.server.clone(),
         device: args.device.clone(),
         password: args.password.clone(),
@@ -1394,6 +1408,9 @@ async fn run_headless(
                 &plan.password,
                 &plan.client_name,
                 plan.caps.clone(),
+                // 重连也必须直连：曾经直连成功、重连时却去拨中继，
+                // 现场表现是「第一次能连、断了就连不上」，最难归因。
+                plan.direct.as_deref(),
             )
             .await
             {

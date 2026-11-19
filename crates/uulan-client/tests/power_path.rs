@@ -119,7 +119,9 @@ async fn an_unlisted_power_action_is_denied_on_the_wire_with_the_fix() {
 
     let c = timeout(
         Duration::from_secs(15),
-        connect::connect(&srv, &device, PW, "power-cli", vec![]),
+        connect::connect(&srv, &device, PW, "power-cli", vec![],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("连接超时")
@@ -148,7 +150,9 @@ async fn an_allowed_power_action_really_executes_and_reports_the_child() {
 
     let c = timeout(
         Duration::from_secs(15),
-        connect::connect(&srv, &device, PW, "power-cli2", vec![]),
+        connect::connect(&srv, &device, PW, "power-cli2", vec![],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("二次连接超时")
@@ -169,7 +173,9 @@ async fn an_allowed_power_action_really_executes_and_reports_the_child() {
     // 2) 名单外（上面只放了 lock）：拒绝理由要带「当前放行名单」，照着就能改。
     let c2 = timeout(
         Duration::from_secs(15),
-        connect::connect(&srv, &device, PW, "power-cli3", vec![]),
+        connect::connect(&srv, &device, PW, "power-cli3", vec![],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("三次连接超时")
@@ -197,7 +203,9 @@ async fn power_needs_no_capability_claim_to_answer() {
     let device = spawn_host(&srv, test_config(&srv)).await;
     let c = timeout(
         Duration::from_secs(15),
-        connect::connect(&srv, &device, PW, "power-cli4", vec![Cap::Files]),
+        connect::connect(&srv, &device, PW, "power-cli4", vec![Cap::Files],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("四次连接超时")

@@ -112,7 +112,9 @@ async fn the_list_grows_when_a_session_opens_and_is_honest_when_empty() {
     // 第一步：还没人开过终端 —— `--terms` 必须明说「没有」，而不是空转超时。
     let c0 = timeout(
         Duration::from_secs(15),
-        connect::connect(&srv, &device, PW, "terms-cli", vec![Cap::Terminal]),
+        connect::connect(&srv, &device, PW, "terms-cli", vec![Cap::Terminal],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("连接超时")
@@ -134,7 +136,9 @@ async fn the_list_grows_when_a_session_opens_and_is_honest_when_empty() {
     // 第二步：真开一条终端会话（假 shell、真注册表）。
     let c1 = timeout(
         Duration::from_secs(15),
-        connect::connect(&srv, &device, PW, "terms-cli2", vec![Cap::Terminal]),
+        connect::connect(&srv, &device, PW, "terms-cli2", vec![Cap::Terminal],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("二次连接超时")
@@ -169,7 +173,9 @@ async fn the_list_grows_when_a_session_opens_and_is_honest_when_empty() {
     // 第三条**独立**控制连接的清单必须还是空 —— 作用域按控制连接算，不是按整机。
     let c2 = timeout(
         Duration::from_secs(15),
-        connect::connect(&srv, &device, PW, "terms-cli3", vec![Cap::Terminal]),
+        connect::connect(&srv, &device, PW, "terms-cli3", vec![Cap::Terminal],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("三次连接超时")

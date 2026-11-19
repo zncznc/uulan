@@ -67,17 +67,34 @@ impl Connected {
 }
 
 /// 连到一台被控端：会合 → 四条通道 → 端到端握手 → 握手鉴权。
+///
+/// `direct = Some("地址:端口")` 时**完全不经中继**：直接拨被控端的监听端口，
+/// 四条通道各由自己在开头声明。之后的端到端握手、PAKE（口令/临时码/每用户独立口令）、
+/// 加密、能力协商与中继模式**一字不差** —— 直连换掉的只是"谁在另一端"，
+/// 不是安全模型。没有中继参与的后果只有一个：拿不到"这台机器叫什么"这种
+/// 目录信息，于是 `session` 票据为空、设备名只能等被控端在 Hello 里自报。
 pub async fn connect(
     server: &str,
     device_id: &str,
     password: &str,
     client_name: &str,
     caps: Vec<Cap>,
+    direct: Option<&str>,
 ) -> Result<Connected, ClientError> {
-    let mut rv = RvConn::connect(server).await?;
-    let (session, back_id, device_name) = rv.client_connect(device_id, client_name).await?;
-
-    let relays = rv.relay_open_all(&session, Role::Client).await?;
+    // 两条路的差别只在这几行之内，后面全部汇合。
+    let (relays, session, back_id, device_name) = match direct {
+        Some(addr) => {
+            let relays = uulan_protocol::rvclient::direct_dial_all(addr).await?;
+            // 直连没有中继票据：留空字符串，日志里会显示成「直连」而不是一个假 session。
+            (relays, String::new(), device_id.to_string(), String::new())
+        }
+        None => {
+            let mut rv = RvConn::connect(server).await?;
+            let (session, back_id, device_name) = rv.client_connect(device_id, client_name).await?;
+            let relays = rv.relay_open_all(&session, Role::Client).await?;
+            (relays, session, back_id, device_name)
+        }
+    };
     let RelaySet { control, video, bulk, audio } = relays;
     let mut control = control;
 

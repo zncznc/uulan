@@ -131,6 +131,7 @@ fn plan_with(
     mic_watch: Arc<AudioWatch>,
 ) -> Plan {
     Plan {
+            direct: None,  // 测试都走中继
         server: addr.to_string(),
         device: device.to_string(),
         password: cfg.password.clone(),
@@ -177,7 +178,9 @@ async fn mic_uplink_flows_and_stops_by_eof() {
 
     let c = timeout(
         T,
-        connect::connect(&addr, &device, &cfg.password, "麦克风测试控制端", vec![]),
+        connect::connect(&addr, &device, &cfg.password, "麦克风测试控制端", vec![],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("连接超时")
@@ -273,7 +276,9 @@ async fn unparsable_mic_source_never_leaves_the_machine() {
 
     let c = timeout(
         T,
-        connect::connect(&addr, &device, &cfg.password, "麦克风测试控制端", vec![]),
+        connect::connect(&addr, &device, &cfg.password, "麦克风测试控制端", vec![],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("连接超时")

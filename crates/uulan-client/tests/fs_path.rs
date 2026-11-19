@@ -119,7 +119,9 @@ impl Cli {
     async fn connect(server: &str, device: &str) -> Cli {
         let c = timeout(
             Duration::from_secs(15),
-            connect::connect(server, device, "aB3dE5fG", "cli", vec![Cap::Files]),
+            connect::connect(server, device, "aB3dE5fG", "cli", vec![Cap::Files],
+            None,  // 集成测试都走中继
+),
         )
         .await
         .expect("连接超时")

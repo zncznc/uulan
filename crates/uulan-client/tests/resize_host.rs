@@ -175,7 +175,9 @@ async fn host_resolution_change_rebuilds_client_decoder() {
 
     let c = timeout(
         Duration::from_secs(30),
-        connect::connect(&addr, &device_id, &cfg.password, "分辨率测试控制端", vec![]),
+        connect::connect(&addr, &device_id, &cfg.password, "分辨率测试控制端", vec![],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("连接超时")
@@ -297,7 +299,9 @@ async fn source_eof_on_screen_shrink_restarts_encoder() {
 
     let c = timeout(
         Duration::from_secs(30),
-        connect::connect(&addr, &device_id, &cfg.password, "EOF 测试控制端", vec![]),
+        connect::connect(&addr, &device_id, &cfg.password, "EOF 测试控制端", vec![],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("连接超时")
@@ -376,7 +380,9 @@ async fn region_origin_follows_the_probe() {
 
     let c = timeout(
         Duration::from_secs(30),
-        connect::connect(&addr, &device_id, &cfg.password, "原点跟随测试控制端", vec![]),
+        connect::connect(&addr, &device_id, &cfg.password, "原点跟随测试控制端", vec![],
+            None,  // 集成测试都走中继
+),
     )
     .await
     .expect("连接超时")
