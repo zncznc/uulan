@@ -169,6 +169,34 @@ pub async fn connect(
                 ctl.rd.rekey(fin.receiving(Role::Client));
                 ctl.wr.rekey(fin.sending(Role::Client));
                 matched_idx = Some(idx as usize);
+
+                // 第二因素。位置很要紧：上面两行刚把控制通道换成含 PAKE 的密钥，
+                // 于是这一步送出去的系统登录密码是中继解不开的 —— 这正是它存在的理由。
+                if host.pam_required {
+                    let prompt = match read_h2c(&mut ctl.rd).await? {
+                        Some(H2C::PamRequired { prompt }) => prompt,
+                        Some(other) => {
+                            return Err(ClientError::Unexpected(format!(
+                                "第二因素想要 pam_required，收到 {other:?}"
+                            )))
+                        }
+                        None => {
+                            return Err(ClientError::Unexpected("被控端在第二因素前断开".into()))
+                        }
+                    };
+                    // 凭据只从环境取（`--os-user` / `--os-password-file` 是它的设值入口）：
+                    // argv 会进进程表与 shell 历史，密码不该在那里出现。
+                    let user = std::env::var("UULAN_OS_USER").unwrap_or_default();
+                    let pw = std::env::var("UULAN_OS_PASSWORD").unwrap_or_default();
+                    if user.is_empty() || pw.is_empty() {
+                        return Err(ClientError::Rejected(format!(
+                            "这台被控端要求第二因素（{prompt}）：用 --os-user 与 --os-password-file 给出系统账户和登录密码"
+                        )));
+                    }
+                    send_c2h(&mut ctl.wr, &C2H::PamAuth { user, password: pw }).await?;
+                    // 通过时**没有回帧**（被控端直接开始推流），所以这里不能干等一帧；
+                    // 不通过时收到的 AuthFail 由主循环报出来。
+                }
             }
             H2C::AuthFail { reason, retry_after_ms } => {
                 return Err(ClientError::Rejected(match reason {

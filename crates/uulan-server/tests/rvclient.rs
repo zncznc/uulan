@@ -244,6 +244,7 @@ async fn two_endpoints_pair_all_channels_and_exchange_application_frames() -> Re
 
     // 被控端回 HelloOk
     let hello = uulan_protocol::msg::H2C::HelloOk(HostHelloOk {
+        pam_required: false,
         device_id: device_id.clone(),
         os: "kylin".into(),
         version: "0.1.0".into(),

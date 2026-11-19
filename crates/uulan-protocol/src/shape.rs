@@ -34,6 +34,9 @@ impl Shape for H2C {
             Self::HelloOk(..) => "HelloOk",
             Self::AuthOk { .. } => "AuthOk",
             Self::AuthFail { .. } => "AuthFail",
+            // 第二因素的两个新消息也要有类名：类名是 `'static` 字面量，
+            // 拿它写日志永远不会把载荷（可能含密码）带出去。
+            Self::PamRequired { .. } => "PamRequired",
             Self::VideoCfg(..) => "VideoCfg",
             Self::VideoError { .. } => "VideoError",
             Self::Metrics(..) => "Metrics",

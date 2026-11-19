@@ -91,6 +91,7 @@ async fn spawn_host(server: &str, cfg: HostConfig, ff: PathBuf, sink: MicSink) -
             };
             if let ToEndpoint::Incoming { session: sid, client_addr, .. } = msg {
                 let params = SessionParams {
+                    pam_check: None,
                     mic_sink: sink,
                     state: state.clone(),
                     ffmpeg: ff.clone(),

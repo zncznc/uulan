@@ -466,6 +466,9 @@ pub struct SessionParams {
     ///
     /// 本机（Windows）没有 `/proc`，所以「差分 / 第一拍不编数」这些规则只能靠
     /// 注入一份假数据来验 —— 同 `screen_probe` 的思路。
+    /// PAM 校验器注入点（与 `sys_source`/`lock_probe` 同一套规矩）：
+    /// `None` = 用真 `su` 走系统 PAM；测试注入假表，免得单测要碰真账户。
+    pub pam_check: Option<crate::pam::Checker>,
     pub sys_source: Option<Arc<dyn SysSource>>,
     /// 锁屏 / 桌面状态探针。`None` = 按采集源自动决定（X11 采集 → 读焦点窗口名）。
     ///
@@ -619,6 +622,25 @@ pub async fn run_with_sink(
     let final_ctl = keys.channel(Channel::Control);
     control_rd.rekey(final_ctl.receiving(Role::Host));
     control_wr.rekey(final_ctl.sending(Role::Host));
+
+    // —— 第二因素（默认关闭）——
+    // 位置是这段代码里最要紧的一件事：上面两行刚把控制通道换成**混入 PAKE 共享点**
+    // 的密钥，而下面还没起视频任务。早一步 = 密码跑在中继能解的密钥下；
+    // 晚一步 = 画面已经推出去了，闸门变成装饰。两个都不能要。
+    if cfg.pam.enabled {
+        if let Err(e) = pam_gate(
+            &mut control_rd,
+            &mut control_wr,
+            &cfg.pam,
+            params.pam_check.clone(),
+            &peer,
+        )
+        .await
+        {
+            info!(%peer, reason = %e, "会话在第二因素处收摊");
+            return SessionOutcome::Unauthenticated(peer);
+        }
+    }
     let video = SecConn::new(video, &keys.channel(Channel::Video), Role::Host, Channel::Video);
     let bulk = SecConn::new(bulk, &keys.channel(Channel::Bulk), Role::Host, Channel::Bulk);
     // 音频（M7）：通道一直开着，但**只有控制端发过 AudioStart / MicStart 之后才会有字节**。
@@ -864,6 +886,79 @@ enum Closed {
 ///
 /// 一条 `term_out` 最多约 22 KiB，所以 64 条 ≈ 1.4 MiB 在飞 —— 慢链路上够撑，又不至于吃内存。
 const TERM_OUT_HIGH_WATER: usize = 64;
+/// 第二因素闸门：在**已经换成含 PAKE 共享点的密钥之后**才允许被调用。
+///
+/// 为什么强调这句：`run_with_sink` 里 `rekey` 就在 `handshake()` 返回之后
+/// （不是之前），所以把这段放在 handshake 内部 = 把系统登录密码送在中继能解的
+/// 那把密钥下 —— 整个功能的意义就没了。调用点必须守住这个顺序。
+///
+/// 三条硬规矩（与 `pam.rs` 一致）：名单先过、不在名单的**不去校验**；只给一次机会；
+/// 校验器输出与密码本身一律不进日志。
+async fn pam_gate<R, W>(
+    rd: &mut R,
+    wr: &mut W,
+    policy: &crate::config::PamPolicy,
+    checker: Option<crate::pam::Checker>,
+    peer: &str,
+) -> Result<(), String>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    send_h2c(wr, &H2C::PamRequired { prompt: "需要本机系统账户的登录密码".to_string() }).await?;
+
+    // 有期限：等人打字不能把会话无限挂着 —— 画面、输入、文件都还没放行，
+    // 挂着不放只会让被控端占着一个会话槽。
+    const PAM_WAIT: Duration = Duration::from_secs(60);
+    let (user, password) = match tokio::time::timeout(PAM_WAIT, read_c2h(rd)).await {
+        Err(_) => return Err("等第二因素超时".into()),
+        Ok(Ok(Some(C2H::PamAuth { user, password }))) => (user, password),
+        Ok(Ok(Some(_))) => {
+            // 刻意**不打这条消息的内容**：`C2H` 的变体里带着密码（`PamAuth`），
+            // 而 `Shape` 只给 `H2C` 实现过 —— 用 Debug 就等于把登录密码写进日志。
+            return Err("第二因素收到的是别的消息，按拒绝处理".into());
+        }
+        Ok(Ok(None)) => return Err("对端在第二因素完成前断开".into()),
+        Ok(Err(e)) => return Err(e),
+    };
+
+    if !crate::pam::in_allow_list(&policy.allow_users, &user) {
+        // 注意：这里**没有**调用校验器 —— 不在名单的名字连一次 PAM 都不该碰到。
+        // 否则任何拿到连接口令的人都能反复用 root 去触发系统账户锁定。
+        warn!(%peer, user = %user, "第二因素拒绝：该账户不在允许名单（未做任何校验尝试）");
+        return Err(format!("{user} 不在远端允许名单里"));
+    }
+
+    let chk = checker.unwrap_or_else(|| crate::pam::system_checker(Duration::from_secs(10)));
+    let u = user.clone();
+    // 校验器是同步的（开伪终端 + 等 su），放阻塞线程池，别占着 tokio worker。
+    let verdict = tokio::task::spawn_blocking(move || chk(&u, &password))
+        .await
+        .map_err(|e| format!("PAM 校验任务崩了：{e}"))?;
+
+    match verdict {
+        Ok(true) => {
+            // 只记"谁过了"，绝不记密码；`user` 也只在内存里活着。
+            info!(%peer, pam_user = %user, "第二因素通过");
+            Ok(())
+        }
+        Ok(false) => {
+            warn!(%peer, pam_user = %user, "第二因素失败：系统登录密码不对");
+            // 线上一律沿用 AuthFail(BadPassword)：老控制端也认这个形状。
+            // 精确原因由控制端自己按上下文说清（它知道刚发的是 PamAuth）。
+            send_h2c(wr, &H2C::AuthFail { reason: AuthFailReason::BadPassword, retry_after_ms: 0 }).await?;
+            Err("第二因素未通过".into())
+        }
+        Err(e) => {
+            // 判定不了 = 拒绝。闸门不许在糊涂时放行。
+            warn!(%peer, pam_user = %user, error = %e, "第二因素无法判定，按拒绝处理");
+            send_h2c(wr, &H2C::AuthFail { reason: AuthFailReason::BadPassword, retry_after_ms: 0 }).await?;
+            Err(e)
+        }
+    }
+}
+
+
 
 async fn handshake<R, W>(
     rd: &mut R,
@@ -917,6 +1012,9 @@ where
             screen,
             caps,
             has_desktop: true,
+            // 提前告知：这台机器还要第二因素。控制端据此决定**要不要读那一帧**，
+            // 不抢先读，免得把后面正常的推送当 PAM 消息吃掉。
+            pam_required: cfg.pam.enabled,
         }),
     )
     .await?;

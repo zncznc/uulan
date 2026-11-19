@@ -29,6 +29,9 @@ struct Args {
     device: String,
     /// 直连地址（`IP:端口`）。给了它就**完全不碰中继**，`--device` 可省。
     direct: Option<String>,
+    /// 第二因素用的系统账户名与登录密码。**只进环境变量**（argv 会进进程表与 shell 历史）。
+    os_user: Option<String>,
+    os_password_file: Option<PathBuf>,
     /// 口令。**别从命令行传**：`--password` 会留在 `ps`、shell 历史、工单截图里。
     /// 推荐 `--password-file`（首行）或环境变量 `UULAN_PASSWORD`，见 `resolve_password`。
     password: String,
@@ -119,6 +122,9 @@ uulan-client —— uulan 内网远控的控制端
   --server <addr>     中继地址（默认 127.0.0.1:21116）
   --device <id>       被控端设备 ID（9 位数字）
   --direct <IP:端口>  不经中继，直接连被控端的监听端口（默认 21117）；此时可省 --device
+  --os-user <名字>    第二因素：被控端要求的系统账户名
+  --os-password-file <f> 第二因素：从文件首行读该账户的登录密码（不进命令行）
+                      也可以设 UULAN_OS_USER / UULAN_OS_PASSWORD 两个环境变量
   --password <pwd>    访问密码或一次性临时验证码（会出现在 ps/历史里，能用别的就用别的）
   --password-file <f> 从文件首行读口令（推荐：不进进程表，也不进 shell 历史）
                       也可以设环境变量 UULAN_PASSWORD；优先级 --password > 文件 > 环境变量
@@ -212,6 +218,8 @@ fn parse_args() -> Result<Args> {
         server: format!("127.0.0.1:{}", uulan_protocol::DEFAULT_PORT),
         device: String::new(),
         direct: None,
+        os_user: None,
+        os_password_file: None,
         password: String::new(),
         password_file: None,
         name: default_client_name(),
@@ -259,6 +267,8 @@ fn parse_args() -> Result<Args> {
             }
             "--device" => a.device = it.next().unwrap_or_default(),
             "--direct" => a.direct = Some(it.next().unwrap_or_default()),
+            "--os-user" => a.os_user = Some(it.next().unwrap_or_default()),
+            "--os-password-file" => a.os_password_file = Some(PathBuf::from(it.next().unwrap_or_default())),
             "--password" => a.password = it.next().unwrap_or_default(),
             "--password-file" => {
                 a.password_file = Some(PathBuf::from(
@@ -833,6 +843,21 @@ async fn main() -> Result<()> {
     // 这里这个后端只用来**探一下能不能用**（比如没有 DISPLAY 的 X11 就不可用），
     // 探完就丢：真正的后端每条会话各建一个（见 `session::open`）。跨会话复用会把
     // 「上一次会话还是剪贴板所有者」的状态带进新会话。
+    // 第二因素的凭据：CLI 参数只是环境变量的设值入口，connect() 统一从环境读。
+    // 这样命令行、进程表、shell 历史里都不会出现那个登录密码。
+    if let Some(u) = args.os_user.as_deref() {
+        std::env::set_var("UULAN_OS_USER", u);
+    }
+    if let Some(f) = args.os_password_file.as_ref() {
+        let raw = std::fs::read_to_string(f)
+            .with_context(|| format!("读不了 --os-password-file：{}", f.display()))?;
+        let line = raw.lines().next().unwrap_or_default();
+        if line.is_empty() {
+            anyhow::bail!("--os-password-file 是空的：{}（首行就是密码）", f.display());
+        }
+        std::env::set_var("UULAN_OS_PASSWORD", line);
+    }
+
     let clip_ok = if args.no_clipboard || args.no_input {
         if args.no_clipboard {
             println!("剪贴板同步已按 --no-clipboard 关闭");

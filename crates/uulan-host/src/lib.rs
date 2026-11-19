@@ -16,6 +16,7 @@ pub mod config;
 pub mod diagnose;
 pub mod input;
 pub mod mic;
+pub mod pam;
 pub mod portmap;
 pub mod power;
 pub mod probe;

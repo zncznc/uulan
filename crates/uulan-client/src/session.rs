@@ -870,6 +870,7 @@ mod tests {
         assert!(live.input().is_none());
 
         let host = HostInfo {
+            pam_required: false,
             device_id: "123456789".into(),
             os: "kylin".into(),
             version: "0.1.0".into(),

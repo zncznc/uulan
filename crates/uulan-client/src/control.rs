@@ -411,6 +411,17 @@ impl ControlLink {
                                     info!(reason = %reason, "被控端道别");
                                     break;
                                 }
+                                Ok(H2C::AuthFail { reason, retry_after_ms }) => {
+                                    // 会话中途才收到 AuthFail 只有一种来源：第二因素没过
+                                    // （口令那一步在 connect 里就走完了）。
+                                    // 说清楚是哪一种，否则现场会去翻"我口令打错了？"。
+                                    warn!(
+                                        ?reason,
+                                        retry_after_ms,
+                                        "被控端在第二因素处拒绝：系统登录密码不对（不是远控口令）"
+                                    );
+                                    break;
+                                }
                                 Ok(H2C::Clip { text }) => {
                                     // 写进本机剪贴板。写入失败不算致命：对面内容不会丢，
                                     // 只是这台机器粘不出来 —— 所以计数后继续。

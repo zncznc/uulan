@@ -56,6 +56,9 @@ struct Args {
     listen: Option<String>,
     /// 关掉直连监听（敏感现场、或不想多开一个入站端口时用）。
     no_listen: bool,
+    /// 打开 PAM 第二因素，并把名单写进配置（这样 systemd 单元不必带参数）。
+    pam: bool,
+    pam_allow: Option<String>,
 }
 
 const HELP: &str = "\
@@ -63,6 +66,8 @@ uulan-host —— uulan 内网远控的被控端
 
   --listen <地址:端口> 直连监听地址（默认 0.0.0.0:21117；控制端用 --direct 直连它）
   --no-listen         不监听任何端口（只走中继）
+  --pam               打开第二因素：口令过了之后还要输对**系统登录密码**
+  --pam-allow <名单>  允许从远端登录的系统账户，逗号分隔（空名单 = 谁都不许）
   --users             列出本机额外登录身份（口令一律不打印）
   --user-add <名字>   加一个人并现场生成一份独立口令（只打印一次）
   --user-del <名字>   吊销一个人的口令（常驻服务当场生效）
@@ -106,6 +111,8 @@ fn parse_args() -> Result<Args> {
         diagnose: false,
         listen: None,
         no_listen: false,
+        pam: false,
+        pam_allow: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -134,6 +141,8 @@ fn parse_args() -> Result<Args> {
             "--users" => a.list_users = true,
             "--listen" => a.listen = Some(it.next().unwrap_or_default()),
             "--no-listen" => a.no_listen = true,
+            "--pam" => a.pam = true,
+            "--pam-allow" => a.pam_allow = Some(it.next().unwrap_or_default()),
             "--once" => a.once = true,
             "-h" | "--help" => {
                 println!("{HELP}");
@@ -220,6 +229,23 @@ async fn main() -> Result<()> {
         print!("{}", report.render());
         // 退出码就是结论：脚本和现场都能直接判。
         std::process::exit(if report.all_ok() { 0 } else { 1 });
+    }
+
+    // PAM 开关落盘：这样 systemd 单元里不用带参数，重启也还在。
+    // 只给 --pam 没给名单时**保持现有名单不变**（可能已经配过）；开了却没名单会当场说清楚，
+    // 而不是让人以为开了、实际谁都被拒。
+    if args.pam {
+        cfg.pam.enabled = true;
+    }
+    if let Some(list) = &args.pam_allow {
+        cfg.pam.allow_users = list.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    }
+    if cfg.pam.enabled {
+        if cfg.pam.allow_users.is_empty() {
+            anyhow::bail!("--pam 已打开，但允许名单是空的（空名单 = 谁都不许登录）。加 --pam-allow 用户名1,用户名2");
+        }
+        cfg.save(&cfg_path)?;
+        info!(allow = ?cfg.pam.allow_users, "PAM 第二因素已开启并写入配置（口令本身仍先过 PAKE，密码只在加密通道里传）");
     }
 
     // 用户表管理：改完就存盘退出，常驻服务会通过 adopt_external_config 立刻看见。
@@ -542,7 +568,8 @@ async fn serve_relay(
                     // None = 生产用的 portable-pty。
                     pty: None,
                     // None = 读 /proc（生产）；测试可注入假来源。
-                    sys_source: None,
+                    pam_check: None,
+            sys_source: None,
                     // None = 按采集源自动决定（X11 → 读焦点窗口名）。
                     lock_probe: None,
                 };
@@ -615,6 +642,7 @@ async fn serve_direct(
             screen_probe: None,
             fs_roots: None,
             pty: None,
+            pam_check: None,
             sys_source: None,
             lock_probe: None,
         };

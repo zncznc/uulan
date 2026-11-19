@@ -63,6 +63,12 @@ pub struct App {
     /// 直连地址（`IP:端口`）。填了就绕过中继 —— 与命令行的 `--direct` 等价。
     direct: String,
     password: String,
+    /// 第二因素：系统账户名 + 该账户的登录密码。
+    ///
+    /// 面板**不新增任何语义**：它就是 `uulan-client --os-user/--os-password-file` 的
+    /// 按钮版（那两个参数已在真机验收里出现）。密码同样走 0600 文件，不进命令行。
+    os_user: String,
+    os_password: String,
     // 选项（每一项都对应控制端一个已验过的开关）
     audio: bool,
     mic: bool,
@@ -104,6 +110,8 @@ impl App {
             device: cfg.device,
             direct: cfg.direct,
             password: String::new(),
+            os_user: String::new(),
+            os_password: String::new(),
             audio: false,
             mic: false,
             capture: false,
@@ -188,12 +196,35 @@ impl App {
         Ok(p)
     }
 
+    /// 第二因素的登录密码：另一个 0600 文件，绝不进 argv。
+    fn write_os_pw_file(&self) -> anyhow::Result<PathBuf> {
+        std::fs::create_dir_all(Self::cfg_dir())?;
+        let p = Self::cfg_dir().join("gui-os.pw");
+        let mut f = std::fs::File::create(&p)?;
+        f.write_all(self.os_password.as_bytes())?;
+        f.write_all(b"\n")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(p)
+    }
+
     /// 组命令行。**这里出现过的每个参数都必须已经在真机验收里出现过**，
     /// GUI 不发明新语义。
     fn build_args(&self, pw_file: &Path, mode: Mode) -> Vec<String> {
         // 直连与经中继是两条互斥的路：填了直连地址就**只发 --direct**，
         // 绝不同时带 --server/--device —— 那会让控制端自己猜哪条算，行为不可复现。
         let mut a = route_args(self.direct.trim(), self.relay.trim(), self.device.trim(), pw_file);
+        if !self.os_user.trim().is_empty() {
+            // 路径不是秘密；秘密在那个 0600 文件里。
+            let f = Self::cfg_dir().join("gui-os.pw");
+            a.push("--os-user".into());
+            a.push(self.os_user.trim().to_string());
+            a.push("--os-password-file".into());
+            a.push(f.to_string_lossy().into_owned());
+        }
         match mode {
             Mode::Desktop => {}
             Mode::Term => a.push("--term".into()),
@@ -275,6 +306,17 @@ impl App {
             self.alert = "需要访问口令（在「访问口令」框里填）。\n\
                 忘了口令：在被控端上跑 `uulan-host --show`，或直接看被控端配置文件里 password 字段。".into();
             return;
+        }
+        if !self.os_user.trim().is_empty() && self.os_password.trim().is_empty() {
+            self.alert = "填了系统账户名，但没给它的登录密码（第二因素要用）。".into();
+            return;
+        }
+        if !self.os_password.trim().is_empty() {
+            // 只在真要带第二因素时写这个文件：不留多余的明文副本在盘上。
+            if let Err(e) = self.write_os_pw_file() {
+                self.alert = format!("第二因素的密码文件写不了：{e}");
+                return;
+            }
         }
         let pw = match self.write_pw_file() {
             Ok(p) => p,
@@ -567,6 +609,18 @@ impl eframe::App for App {
                     );
                     // 少一次「自己去开文件复制粘贴」的折腾：同目录有 host.pw 就直接读进来。
                     // 注意这是**填进输入框**，不是记进配置 —— gui.json 永不存口令。
+                    ui.label("系统账户(可选)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.os_user)
+                            .hint_text("被控端开了第二因素才填")
+                            .desired_width(110.0),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.os_password)
+                            .password(true)
+                            .hint_text("该账户的登录密码")
+                            .desired_width(110.0),
+                    );
                     if ui.button("从 host.pw 读取").clicked() {
                         match sibling_pwfile() {
                             Some(p) => match std::fs::read_to_string(&p) {

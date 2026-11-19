@@ -122,6 +122,7 @@ async fn spawn_host_with(
             if let ToEndpoint::Incoming { session: sid, client_addr, .. } = msg {
                 let probe = probes();
                 let params = SessionParams {
+                    pam_check: None,
                     mic_sink: uulan_host::mic::MicSink::Speaker,
                     state: state.clone(),
                     ffmpeg: ffmpeg.clone(),

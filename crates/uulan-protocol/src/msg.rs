@@ -49,6 +49,13 @@ pub struct HostHelloOk {
     pub caps: Vec<Cap>,
     /// 被控端是否有图形会话。无头机器（`UU_DESKTOP_BACKEND=none` 那种）只有终端/文件/端口映射。
     pub has_desktop: bool,
+    /// 这台被控端开了 PAM 第二因素。
+    ///
+    /// `#[serde(default)]`：老被控端不发这个字段 → 控制端按 false 处理，行为与今天一致；
+    /// 反过来老控制端遇到新被控端时，它在 `AuthOk` 之后会收到一条认不出的消息而报错断开 ——
+    /// **这是故意的**：认不出第二因素的客户端不该被当成"通过了"。
+    #[serde(default)]
+    pub pam_required: bool,
 }
 
 // ───────────────────────────── 控制端 → 被控端 ─────────────────────────────
@@ -56,6 +63,11 @@ pub struct HostHelloOk {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum C2H {
+    /// `PamRequired` 的应答：系统账户名 + 该账户的登录密码。
+    ///
+    /// 密码**不走命令行**（argv 进进程表与 shell 历史），控制端从 `--os-password-file`
+    /// 或环境变量读；被控端只做校验、绝不落盘、绝不打进日志。
+    PamAuth { user: String, password: String },
     Hello(ClientHello),
 
     /// 口令证明，**一组**：被控端可能有几个候选凭据（永久口令 + 临时码），
@@ -332,6 +344,16 @@ pub enum H2C {
     /// 控制端**必须**校验它：不校验的话，中继可以冒充被控端，把用户的键盘与文件收走。
     AuthOk { idx: u32, proof: String },
     AuthFail { reason: AuthFailReason, retry_after_ms: u64 },
+
+    /// 第二因素：口令/临时码过了 PAKE 之后，还要**这个人的系统登录密码**（PAM）。
+    ///
+    /// 为什么必须排在 `AuthOk` 之后发：鉴权一通过，两边就换成**混入 PAKE 共享点**
+    /// 的那把会话密钥（见 `session.rs`），于是这条消息与它的应答都落在中继解不开的
+    /// 加密里。若排在之前，等于让中继旁听到系统登录密码 —— 那是本功能唯一要避免的事。
+    ///
+    /// 兼容性要说清楚（不假装）：这是**新增消息变体**，旧控制端解析不了。所以只有
+    /// 被控端显式开了 `--pam` 才会发出它；没开就与从前完全一致，两端不必同批升级。
+    PamRequired { prompt: String },
 
     /// 编码器已（重）启动，参数以此为准。
     VideoCfg(HostVideoCfg),
@@ -730,6 +752,7 @@ let f = H2C::AuthFail { reason: AuthFailReason::BadPassword, retry_after_ms: 100
             screen: Screen { w: 1920, h: 1080 },
             caps: vec![Cap::Clipboard, Cap::Metrics],
             has_desktop: true,
+            pam_required: false,
         }));
         rt_h2c(H2C::AuthOk { idx: 1, proof: "cd34".into() });
         rt_h2c(H2C::AuthFail { reason: AuthFailReason::Busy, retry_after_ms: 60000 });

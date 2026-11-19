@@ -15,6 +15,16 @@ use crate::capture::CaptureInput;
 /// 默认中继端口，与 `uulan-protocol::DEFAULT_PORT` 保持一致。
 pub use uulan_protocol::DEFAULT_PORT;
 
+/// PAM 第二因素：过了 PAKE 之后，还要再验一次系统登录密码。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PamPolicy {
+    pub enabled: bool,
+    /// 允许从远端登录的系统账户名单。**名单为空 = 谁都不许**（见 `pam.rs`：
+    /// 没配好不等于开放；否则任何人都能拿 root 来试探着锁别人账户）。
+    #[serde(default)]
+    pub allow_users: Vec<String>,
+}
+
 /// 一个可单独吊销的登录身份（用户名 → 该用户的访问口令）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserCred {
@@ -59,6 +69,10 @@ pub struct HostConfig {
     /// 凭据 —— "是谁"是从密码学结果推出来的，不是客户端自报的，冒充不了。
     #[serde(default)]
     pub users: Vec<UserCred>,
+
+    /// PAM 第二因素。**默认关闭**：不开就与今天的实现一模一样，两端也不必同批升级。
+    #[serde(default)]
+    pub pam: PamPolicy,
 
     /// 注册令牌：证明「我是这台机器」，好在中继重启/网络抖动后拿回同一个设备 ID。
     ///
@@ -198,6 +212,7 @@ impl Default for HostConfig {
             password: gen_password(),
             temp_code: None,
             users: Vec::new(),
+            pam: PamPolicy::default(),
             reg_token: gen_password(),
             assist_enabled: false,
             capture: CaptureInput::default(),
