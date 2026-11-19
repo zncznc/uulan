@@ -74,6 +74,14 @@ pub struct HostConfig {
     #[serde(default)]
     pub pam: PamPolicy,
 
+    /// OS 认证模式：只认「系统账户名 + 该账户登录密码」，**跳过 PAKE**。
+    ///
+    /// 代价写在代码里而不只写在文档里：PAKE 退出后会话密钥只剩 DH，于是
+    /// **中继在理论上能中间人并看到系统登录密码**；直连模式没有中继，不受影响。
+    /// 必须与 `pam.enabled` 同时开，否则启动即报错（见 main.rs）。
+    #[serde(default)]
+    pub auth_os: bool,
+
     /// 注册令牌：证明「我是这台机器」，好在中继重启/网络抖动后拿回同一个设备 ID。
     ///
     /// **它不是访问口令**：与口令无关的独立随机值，中继只存它的 SHA-256。泄漏只意味着
@@ -213,6 +221,7 @@ impl Default for HostConfig {
             temp_code: None,
             users: Vec::new(),
             pam: PamPolicy::default(),
+            auth_os: false,
             reg_token: gen_password(),
             assist_enabled: false,
             capture: CaptureInput::default(),

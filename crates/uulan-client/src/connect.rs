@@ -16,7 +16,7 @@ use tokio::time::timeout;
 use uulan_protocol::crypto::{self, CryptoError, SecConn, SecControl, SessionKeys};
 use uulan_protocol::pake::PakeClient;
 use uulan_protocol::frame::{read_frame, write_frame, FrameKind};
-use uulan_protocol::msg::{AuthFailReason, C2H, Cap, ClientHello, H2C, HostHelloOk};
+use uulan_protocol::msg::{AuthFailReason, AuthMode, C2H, Cap, ClientHello, H2C, HostHelloOk};
 use uulan_protocol::rv::{Channel, Role};
 use uulan_protocol::rvclient::{RelaySet, RvConn, RvError};
 
@@ -107,11 +107,26 @@ pub async fn connect(
         // 0b) PAKE：把自己的点发过去，换回「被控端每个候选凭据各一个点」。
         //     只有「我们的口令恰好是它某个凭据」的那一个点，才能和它算出同一个共享点 ——
         //     我们不知道是哪个，所以每个都算一把密钥，等 AuthOk 告诉我们序号。
-        let (pake, pake_init) = PakeClient::start(keys0.transcript(), password);
-        crypto::send_pake_init(&mut control, &pake_init).await?;
-        let pake_resp = crypto::recv_pake_resp(&mut control).await?;
-        let pake_keys = pake.finish(&pake_resp)?;
-        let cands: Vec<SessionKeys> = pake_keys.iter().map(|k| keys0.with_pake(k)).collect();
+        // 认证方式先声明：**明文一帧、只含布尔**，不含任何秘密。
+        // OS 模式（用户名+系统密码）压根不跑 PAKE —— 被控端只能"验证"系统密码、
+        // 不能"复述"它，而 PAKE 要求双方都知道那个秘密。
+        let os_mode = !std::env::var("UULAN_OS_USER").unwrap_or_default().is_empty();
+        let am = serde_json::to_vec(&AuthMode { os: os_mode })
+            .map_err(|e| ClientError::Unexpected(format!("编码认证方式失败：{e}")))?;
+        write_frame(&mut control, FrameKind::Json, &am)
+            .await
+            .map_err(|e| ClientError::Unexpected(format!("发认证方式失败：{e}")))?;
+
+        let cands: Vec<SessionKeys> = if os_mode {
+            // OS 模式没有 PAKE：会话密钥就是 DH 那一把（也不是"候选"之一，就这一个）。
+            vec![keys0.clone()]
+        } else {
+            let (pake, pake_init) = PakeClient::start(keys0.transcript(), password);
+            crypto::send_pake_init(&mut control, &pake_init).await?;
+            let pake_resp = crypto::recv_pake_resp(&mut control).await?;
+            let pake_keys = pake.finish(&pake_resp)?;
+            pake_keys.iter().map(|k| keys0.with_pake(k)).collect()
+        };
 
         // 鉴权这一段用只由 DH 派生的那一把（此时还不知道会命中哪个候选）：
         // Hello/Auth 也必须是密文，而且这两半之后要一直用到会话结束（计数器不能归零重来）。
@@ -142,8 +157,22 @@ pub async fn connect(
 
         // 3) Auth：一组口令证明，口令本身从不上线。
         //    每个候选次序各给一份 —— 被控端看哪份对得上它自己的共享点，就知道我们用的是哪个凭据。
-        let proofs: Vec<String> = cands.iter().map(|k| k.client_proof()).collect();
-        send_c2h(&mut ctl.wr, &C2H::Auth { proofs }).await?;
+        // 备路（临时码/口令）送证明，口令本身从不上线；
+        // OS 模式送「系统账户名 + 登录密码」—— 此处通道已是密文，但**没有 PAKE**，
+        // 中继在理论上能中间人看到这个密码（这是换掉 PAKE 的已知代价）。
+        if os_mode {
+            let user = std::env::var("UULAN_OS_USER").unwrap_or_default();
+            let password = std::env::var("UULAN_OS_PASSWORD").unwrap_or_default();
+            if user.is_empty() {
+                return Err(ClientError::Unexpected(
+                    "要用用户名密码认证，必须给 --os-user".into(),
+                ));
+            }
+            send_c2h(&mut ctl.wr, &C2H::PamAuth { user, password }).await?;
+        } else {
+            let proofs: Vec<String> = cands.iter().map(|k| k.client_proof()).collect();
+            send_c2h(&mut ctl.wr, &C2H::Auth { proofs }).await?;
+        }
 
         let resp: H2C = match read_h2c(&mut ctl.rd).await? {
             Some(m) => m,
@@ -158,21 +187,25 @@ pub async fn connect(
                 let keys = cands.get(idx as usize).ok_or_else(|| {
                     ClientError::Unexpected(format!("AuthOk 给了越界的候选序号 {idx}"))
                 })?;
-                if !keys.matches_host_proof(&proof) {
+                // OS 模式没有 PAKE 共享密钥，被控端给不出证明（proof 为空）：
+                // 这一步无从校验，正是"用户口令换掉 PAKE"的代价。
+                if !os_mode && !keys.matches_host_proof(&proof) {
                     return Err(ClientError::Rejected(
                         "被控端没能证明它知道口令（可能是中继在冒充）".to_string(),
                     ));
                 }
                 // 鉴权通过 → 控制通道换成「含 PAKE」的会话密钥。
                 // 必须原地换：重建会把计数器归零，那就是 nonce 重用。
-                let fin = keys.channel(Channel::Control);
-                ctl.rd.rekey(fin.receiving(Role::Client));
-                ctl.wr.rekey(fin.sending(Role::Client));
+                if !os_mode {
+                    let fin = keys.channel(Channel::Control);
+                    ctl.rd.rekey(fin.receiving(Role::Client));
+                    ctl.wr.rekey(fin.sending(Role::Client));
+                }
                 matched_idx = Some(idx as usize);
 
                 // 第二因素。位置很要紧：上面两行刚把控制通道换成含 PAKE 的密钥，
                 // 于是这一步送出去的系统登录密码是中继解不开的 —— 这正是它存在的理由。
-                if host.pam_required {
+                if host.pam_required && !os_mode {
                     let prompt = match read_h2c(&mut ctl.rd).await? {
                         Some(H2C::PamRequired { prompt }) => prompt,
                         Some(other) => {

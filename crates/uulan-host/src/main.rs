@@ -61,6 +61,7 @@ struct Args {
     /// 关掉第二因素（现场要收回这个权限时不用去手改 JSON）。
     no_pam: bool,
     pam_allow: Option<String>,
+    auth: Option<String>,
 }
 
 const HELP: &str = "\
@@ -117,6 +118,7 @@ fn parse_args() -> Result<Args> {
         pam: false,
         no_pam: false,
         pam_allow: None,
+        auth: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -148,6 +150,8 @@ fn parse_args() -> Result<Args> {
             "--pam" => a.pam = true,
             "--no-pam" => a.no_pam = true,
             "--pam-allow" => a.pam_allow = Some(it.next().unwrap_or_default()),
+            // 认证模式：pake（默认，临时码/口令）| os（用户 + 系统登录密码）
+            "--auth" => a.auth = Some(it.next().unwrap_or_default()),
             "--once" => a.once = true,
             "-h" | "--help" => {
                 println!("{HELP}");
@@ -250,7 +254,22 @@ async fn main() -> Result<()> {
     }
     // 管理参数一律"改完就退出"：`--pam` 若继续往下走，就会把这条命令变成
     // 一个前台被控端（我第一次实测就把自己的 ssh 挂到超时，见里程碑文档）。
-    if args.pam || args.no_pam || args.pam_allow.is_some() {
+    if let Some(mode) = &args.auth {
+        // 认证模式：os = 用户名 + 系统登录密码（跳过 PAKE）；pake = 临时码/口令（默认）。
+        match mode.as_str() {
+            "os" => {
+                if !cfg.pam.enabled {
+                    // 没有 PAM 就没有校验手段，宁可当场拒绝也不留一个"看起来开了"的空壳。
+                    anyhow::bail!("--auth os 要求同时开第二因素（--pam），否则没有校验手段");
+                }
+                cfg.auth_os = true;
+            }
+            "pake" => cfg.auth_os = false,
+            other => anyhow::bail!("--auth 只认 os / pake，收到 {other}"),
+        }
+        println!("认证模式：{}", if cfg.auth_os { "os（用户名+系统登录密码，PAKE 退出）" } else { "pake（临时码/口令）" });
+    }
+    if args.pam || args.no_pam || args.pam_allow.is_some() || args.auth.is_some() {
         if cfg.pam.enabled && cfg.pam.allow_users.is_empty() {
             anyhow::bail!("--pam 已打开，但允许名单是空的（空名单 = 谁都不许登录）。加 --pam-allow 用户名1,用户名2");
         }

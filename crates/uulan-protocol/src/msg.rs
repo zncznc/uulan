@@ -60,6 +60,20 @@ pub struct HostHelloOk {
 
 // ───────────────────────────── 控制端 → 被控端 ─────────────────────────────
 
+/// 认证方式声明：**明文一帧、只含一个布尔**，不含任何秘密。
+///
+/// 存在的理由：OS 模式（用户名 + 系统登录密码）根本不走 PAKE，而 PAKE 的收发发生在
+/// 控制通道被加密之前。没有这一帧，被控端只能干等 `PakeInit`，而 OS 模式的客户端
+/// 永远不会发它 —— 两边各自等到超时，症状是"连不上但谁都说不清为什么"。
+///
+/// 它也确实不泄露什么：任何人都可以声称自己要用哪种认证方式，真正的凭据在后面的
+/// 加密通道（PamAuth）或 PAKE 里。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthMode {
+    /// true = 用系统账户口令（跳过 PAKE）；false = 走 PAKE（临时码/口令）。
+    pub os: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum C2H {

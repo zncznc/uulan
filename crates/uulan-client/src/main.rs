@@ -543,10 +543,12 @@ fn parse_args() -> Result<Args> {
     }
     let env_pw = std::env::var("UULAN_PASSWORD").ok();
     a.password = resolve_password(&a.password, a.password_file.as_deref(), env_pw.as_deref())?;
-    if a.password.is_empty() {
-        bail!(
-            "没有口令：用 --password、--password-file <文件>、或环境变量 UULAN_PASSWORD \
-             （被控端的访问密码或一次性临时码）"
+    // 口令必填**只在备路（PAKE）成立**：OS 模式（用户名 + 系统登录密码）不需要
+    // 访问口令/临时码 —— 被控端根本不会去比对某个共享秘密，它直接拿 PAM 验人。
+    if a.password.is_empty() && a.os_user.as_deref().unwrap_or("").is_empty() {
+        anyhow::bail!(
+            "没有凭据：要么给访问口令/临时码（--password / --password-file / UULAN_PASSWORD），\
+             要么给系统账户（--os-user + --os-password-file）"
         );
     }
     Ok(a)

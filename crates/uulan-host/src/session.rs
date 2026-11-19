@@ -529,8 +529,46 @@ pub async fn run_with_sink(
         }
     };
 
+    // 认证方式：控制端在**明文**里先声明一次（只含一个布尔，不是凭据）。
+    // OS 模式（用户名+系统密码）不跑 PAKE —— PAKE 要求双方都知道那个秘密，
+    // 而被控端只能"验证"系统密码、不能"复述"它，所以这条路天然用不了 PAKE。
+    let snap0 = params.state.snapshot();
+    let want_os = match tokio::time::timeout(
+        CRYPTO_HANDSHAKE_TIMEOUT,
+        read_frame(&mut control),
+    )
+    .await
+    {
+        Ok(Ok(f)) => f
+            .decode_json::<uulan_protocol::msg::AuthMode>()
+            .map(|a| a.os)
+            .unwrap_or(false),
+        _ => {
+            warn!(%peer, "等认证方式超时或对端断开");
+            return SessionOutcome::Error("等认证方式超时".into());
+        }
+    };
+    let os_mode = want_os && snap0.auth_os && snap0.pam.enabled;
+    if want_os && !os_mode {
+        // 客户端明确要求用户名密码，但这台没开（或 pam 没开）。宁可当场拒绝，
+        // 也不能悄悄回落成 PAKE —— 客户端手里没有临时码，回落只会变成"连不上"。
+        warn!(
+            %peer,
+            auth_os = snap0.auth_os,
+            pam = snap0.pam.enabled,
+            "控制端要求系统账户口令认证，但这台未启用（--auth os 需要同时开 --pam）"
+        );
+        return SessionOutcome::Unauthenticated(peer);
+    }
+
     // PAKE：控制端先出自己的点，我们按**每个候选凭据**各算一个点回过去。
     // 注意顺序是「先收后发」—— 与 hello 一样，卡住时我们先能超时收尾。
+    let keys = if os_mode {
+        // OS 模式：会话密钥就是 DH 那一把（clone 是因为 keys0 后面还要用来包通道）。**绝不能把它再 rekey 一遍** ——
+        // 同一把密钥把计数器归零就是 nonce 重用（下面 rekey 处也据此跳过）。
+        info!(%peer, "认证方式：系统账户口令（OS 模式，中继不再受 PAKE 保护）");
+        keys0.clone()
+    } else {
     let pake_init = match tokio::time::timeout(
         CRYPTO_HANDSHAKE_TIMEOUT,
         crypto::recv_pake_init(&mut control),
@@ -569,7 +607,8 @@ pub async fn run_with_sink(
     };
     // 会话密钥 = DH **再混上** PAKE 共享点。中继能算出前者、算不出后者，
     // 于是它连「读」这件事都做不到（以前的方案里它能解密，只是不敢改）。
-    let keys = keys0.with_pake(&pake_k);
+    keys0.with_pake(&pake_k)
+    };
 
     // 鉴权阶段仍用只由 DH 派生出来的那一把（此时还不知道对面用的是哪个候选）；
     // 鉴权一通过就换成上面那把（控制通道两半 + 视频 + bulk 一起换，见下面的 rekey）。
@@ -599,6 +638,8 @@ pub async fn run_with_sink(
         &peer,
         clip_available,
         audio_ok,
+        os_mode,
+        params.pam_check.clone(),
     )
     .await
     {
@@ -619,15 +660,22 @@ pub async fn run_with_sink(
     // 鉴权通过 → 三通道全部换成「含 PAKE」的会话密钥。
     // 控制通道这里必须原地换（不能重建：重建会让计数器归零，那是 nonce 重用）；
     // 视频与 bulk 还没开始用，直接用最终密钥建就行。
-    let final_ctl = keys.channel(Channel::Control);
-    control_rd.rekey(final_ctl.receiving(Role::Host));
-    control_wr.rekey(final_ctl.sending(Role::Host));
+    // OS 模式下 keys 就是 keys0，控制通道本来就是用它包的 —— 再 rekey 一遍
+    // 等于同一把密钥计数器归零（nonce 重用），所以这里必须跳过。
+    if !os_mode {
+        let final_ctl = keys.channel(Channel::Control);
+        control_rd.rekey(final_ctl.receiving(Role::Host));
+        control_wr.rekey(final_ctl.sending(Role::Host));
+    }
 
     // —— 第二因素（默认关闭）——
     // 位置是这段代码里最要紧的一件事：上面两行刚把控制通道换成**混入 PAKE 共享点**
     // 的密钥，而下面还没起视频任务。早一步 = 密码跑在中继能解的密钥下；
     // 晚一步 = 画面已经推出去了，闸门变成装饰。两个都不能要。
-    if cfg.pam.enabled {
+    // 第二因素（P2）只在 PAKE 路径上需要：OS 模式已经在登入那一刻验的就是系统密码。
+    // 注意 !cfg.auth_os：开了 OS 模式的主机，P2 第二因素必须整套退场——
+    // 否则"临时码备路"还要再输一次系统密码，那它就不是备用入口而是同一个门。
+    if cfg.pam.enabled && !os_mode && !cfg.auth_os {
         if let Err(e) = pam_gate(
             &mut control_rd,
             &mut control_wr,
@@ -976,6 +1024,9 @@ async fn handshake<R, W>(
     peer: &str,
     clip_available: bool,
     audio_available: bool,
+    // OS 模式：不做 PAKE/user 证明，改成在这里收 PamAuth 并现场用 PAM 验。
+    os_mode: bool,
+    pam_check: Option<crate::pam::Checker>,
 ) -> Result<Option<uulan_protocol::msg::ClientHello>, String>
 where
     R: AsyncRead + Unpin,
@@ -1021,12 +1072,98 @@ where
             has_desktop: true,
             // 提前告知：这台机器还要第二因素。控制端据此决定**要不要读那一帧**，
             // 不抢先读，免得把后面正常的推送当 PAM 消息吃掉。
-            pam_required: cfg.pam.enabled,
+            pam_required: cfg.pam.enabled && !cfg.auth_os,
         }),
     )
     .await?;
 
     // 3) 等 Auth（一组口令证明；口令本身从不上线）
+    // ── OS 模式：没有 PAKE、没有 user 证明。凭据就是「系统账户名 + 登录密码」，
+    // 在**已经加密**的控制通道里送过来，被控端用 PAM 现场验。
+    if os_mode {
+        let (user, password) = match read_c2h(rd).await? {
+            Some(C2H::PamAuth { user, password }) => (user, password),
+            other => {
+                // 走到这里说明客户端自称 OS 模式却没送凭据（或送了别的）：
+                // 明确拒绝并说清楚，别让两边各自等。密码绝不进日志。
+                warn!(%peer, "OS 模式期望 PamAuth，却收到别的消息（凭据不会进日志）");
+                let _ = other;
+                send_h2c(
+                    wr,
+                    &H2C::AuthFail {
+                        reason: AuthFailReason::NotAllowed,
+                        retry_after_ms: 0,
+                    },
+                )
+                .await?;
+                return Ok(None);
+            }
+        };
+        let snap = state.snapshot();
+        if !crate::pam::in_allow_list(&snap.pam.allow_users, &user) {
+            // 名单外**绝不调用 PAM**：避免拿别人的 account 去试探导致系统账户被锁。
+            warn!(%peer, user = %user, "OS 认证拒绝：该账户不在允许名单（未做任何校验尝试）");
+            send_h2c(
+                wr,
+                &H2C::AuthFail {
+                    reason: AuthFailReason::NotAllowed,
+                    retry_after_ms: 0,
+                },
+            )
+            .await?;
+            return Ok(None);
+        }
+        // 与 pam_gate 保持同一口径：没注入 checker 就用系统 PAM 校验器。
+        // （第一次实测就栽在这：主线传进来的是 None，我把它当致命错误回了 NotAllowed，
+        //   表现为"账户明明在名单里却被拒绝"，日志里却看不出原因。）
+        let checker = pam_check
+            .unwrap_or_else(|| crate::pam::system_checker(std::time::Duration::from_secs(10)));
+        // 校验器是同步的（开伪终端 + 等 su），放阻塞线程池，别占着 tokio worker。
+        let u = user.clone();
+        let verdict = tokio::task::spawn_blocking(move || checker(&u, &password))
+            .await
+            .map_err(|e| format!("PAM 校验任务崩了：{e}"));
+        // 摊平成 Result<bool, String>：任务崩了与密码不对必须分开处理。
+        let verdict = match verdict {
+            Ok(v) => v,
+            Err(e) => Err(e),
+        };
+        match verdict {
+            Ok(true) => {
+                info!(%peer, user = %user, "OS 认证通过（系统账户口令）");
+                // proof 为空：OS 模式没有 PAKE 共享密钥，证明无从谈起 ——
+                // 这正是不用 PAKE 的代价（中继可中间人），已在 design 里写明。
+                send_h2c(wr, &H2C::AuthOk { idx: 0, proof: String::new() }).await?;
+                Ok(Some(client))
+            }
+            Ok(false) => {
+                let (n, lock) = state.auth.record_failure(std::time::Instant::now());
+                warn!(%peer, failures = n, locked_ms = lock.as_millis() as u64, "OS 认证失败：系统口令不对");
+                send_h2c(
+                    wr,
+                    &H2C::AuthFail {
+                        reason: AuthFailReason::BadPassword,
+                        retry_after_ms: if lock.is_zero() { 0 } else { lock.as_millis() as u64 },
+                    },
+                )
+                .await?;
+                Ok(None)
+            }
+            Err(e) => {
+                // 无法判定（超时/PAM 不可用）：同样回 AuthFail，否则客户端干等。
+                warn!(%peer, error = %e, "OS 认证无法判定");
+                send_h2c(
+                    wr,
+                    &H2C::AuthFail {
+                        reason: AuthFailReason::NotAllowed,
+                        retry_after_ms: 0,
+                    },
+                )
+                .await?;
+                Ok(None)
+            }
+        }
+    } else {
     let proofs = match read_c2h(rd).await? {
         Some(C2H::Auth { proofs }) => proofs,
         Some(other) => return Err(format!("握手时期望 Auth，收到 {other:?}")),
@@ -1078,6 +1215,7 @@ where
             .await?;
             Ok(None)
         }
+    }
     }
 }
 
