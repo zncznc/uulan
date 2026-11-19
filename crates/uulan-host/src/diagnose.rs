@@ -138,6 +138,7 @@ pub async fn run(
 ) -> Report {
     let mut r = Report::new();
     check_identity(&mut r, cfg, cfg_path);
+    check_auth(&mut r, cfg);
     check_writable(&mut r, cfg_path);
     let display = cfg.capture.display();
     check_display(&mut r, &cfg.capture, display.as_deref()).await;
@@ -191,6 +192,45 @@ fn check_identity(r: &mut Report, cfg: &HostConfig, cfg_path: &Path) {
     } else {
         r.ok("配置", format!("采集源 {}；中继 {}", cfg.capture.describe(), cfg.server));
     }
+}
+
+/// 认证方式：现场「连不上」时，第一件要分清的事是「这台机器认什么」。
+///
+/// 只报模式与名单条数，不报任何秘密。**配错要在这里看得见**：`auth_os=true` 但
+/// `pam.enabled=false` 时服务照常起来、PAKE 备路照常能用，只有 OS 登录会被一律拒绝
+/// （`os_mode_enabled` 三条缺一不可），日志里看不出原因 —— 这正是自检该抓的那类静默降级。
+fn check_auth(r: &mut Report, cfg: &HostConfig) {
+    let (level, detail, hint) = auth_line(cfg.auth_os, cfg.pam.enabled, cfg.pam.allow_users.len());
+    match (level, hint) {
+        (Level::Ok, _) => r.ok("认证", detail),
+        (_, Some(h)) => r.warn("认证", detail, h),
+        (_, None) => r.warn("认证", detail, "检查 host.json 的 auth_os / pam 配置。"),
+    }
+}
+
+/// 纯函数：认证方式那一行怎么判。抽出来是为了本机就能钉住四种组合。
+fn auth_line(auth_os: bool, pam_enabled: bool, users: usize) -> (Level, String, Option<&'static str>) {
+    if auth_os {
+        if !pam_enabled {
+            return (
+                Level::Warn,
+                "认证方式 os（用户名+系统登录密码），但 PAM 没开 —— OS 登录会被一律拒绝".into(),
+                Some("OS 模式要求 pam.enabled=true：改 host.json 后重启被控端，否则客户端只会看到「密码不正确」。"),
+            );
+        }
+        if users == 0 {
+            return (
+                Level::Warn,
+                "认证方式 os，但允许名单为空 —— 谁都不许登录".into(),
+                Some("在 pam.allow_users 里写上允许远程登录的系统账户名。"),
+            );
+        }
+        return (Level::Ok, format!("认证方式 os（用户名+系统登录密码）；允许名单 {users} 个账户"), None);
+    }
+    if pam_enabled {
+        return (Level::Ok, format!("认证方式 pake（口令/临时码）+ PAM 第二因素；允许名单 {users} 个账户"), None);
+    }
+    (Level::Ok, "认证方式 pake（口令/临时码）".into(), None)
 }
 
 /// 配置目录能不能写。
@@ -605,6 +645,22 @@ mod tests {
         assert_eq!(pad_to("键鼠注入", 10).chars().filter(|c| *c == ' ').count(), 2);
         // 已经超宽就不截断
         assert_eq!(pad_to("a-very-long-name", 4), "a-very-long-name");
+    }
+
+    #[test]
+    fn auth_line_flags_the_two_silent_misconfigurations() {
+        // 三种正常形态
+        assert_eq!(auth_line(false, false, 0).0, Level::Ok);
+        assert_eq!(auth_line(false, true, 1).0, Level::Ok);
+        assert_eq!(auth_line(true, true, 1).0, Level::Ok);
+        // 两种「服务起得来、OS 登录必被拒」的静默配错
+        let (lv, d, h) = auth_line(true, false, 1);
+        assert_eq!(lv, Level::Warn);
+        assert!(d.contains("PAM 没开"), "{d}");
+        assert!(h.unwrap().contains("pam.enabled"));
+        let (lv, d, _) = auth_line(true, true, 0);
+        assert_eq!(lv, Level::Warn);
+        assert!(d.contains("名单为空"), "{d}");
     }
 
     #[test]
