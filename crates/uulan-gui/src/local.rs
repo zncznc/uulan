@@ -72,6 +72,102 @@ pub struct Info {
     pub temp: String,
     /// (用户名, 口令位数)。**口令值绝不在这里** —— 这个结构每帧都被 clone。
     pub users: Vec<(String, usize)>,
+    /// 这台机器认哪种凭据（`host.json` 的 `auth_os`）。
+    /// **面板必须显示它**：否则坐在这儿的人会照着屏幕念临时码，而对面走的是「系统账户」那条路。
+    pub auth_os: bool,
+    /// PAM 第二因素是否开着（OS 模式必需；没开 = 系统账户一律登不进来）。
+    pub pam_on: bool,
+    /// OS 模式允许登录的系统账户名。空 = 谁都不许（PAM 那套纪律：没配好不等于开放）。
+    pub pam_users: Vec<String>,
+}
+
+/// 「对方该拿什么连我」—— 坐在这台机器前的人要念出去的，就是这几行。
+///
+/// 为什么抽成纯函数：这段文字是**现场唯一的说明书**（当面协助时对面看不到这台机器的屏幕）。
+/// 它错一个词，人就照错的念。所以它不吃任何 IO，判据在本机就能钉死。
+#[derive(Debug, PartialEq, Eq)]
+pub struct HowTo {
+    /// 「系统账户（用户名 + 该账户的登录密码）」/「访问口令 / 一次性临时码」
+    pub mode: String,
+    /// 要念出去的行（按重要性排）。
+    pub lines: Vec<String>,
+    /// 配错了就明说（两种静默配错：OS 模式没开 PAM、OS 模式名单为空）。
+    pub warn: Option<String>,
+}
+
+/// 由「配置 + 直连端口探活结果 + 本机 IP」算出该念的话。**没有 IO、没有全局状态。**
+pub fn connect_hint(info: &Info, listen_open: Option<bool>, ips: &[String]) -> HowTo {
+    let host_part = if ips.is_empty() {
+        "本机 IP".to_string()
+    } else {
+        ips.join(" / ")
+    };
+    let direct = match listen_open {
+        Some(true) => format!("直连：{host_part}:21117（对方用 --direct 或面板「直连地址」填这个）"),
+        Some(false) => "直连端口没在听（这台是以 --no-listen 起的）—— 只能经中继连".to_string(),
+        None => format!("直连：{host_part}:21117（还没探过端口）"),
+    };
+
+    if info.auth_os {
+        let mode = "系统账户（用户名 + 该账户在本机的登录密码）".to_string();
+        let mut lines = vec![direct];
+        if info.pam_users.is_empty() {
+            lines.push("系统账户：（名单为空 —— 没有账户能登录）".to_string());
+        } else {
+            lines.push(format!(
+                "系统账户：{}（密码就是各账户在本机的登录密码，不用另记口令）",
+                info.pam_users.join(" / ")
+            ));
+        }
+        let warn = if !info.pam_on {
+            Some("这台配了 OS 模式但 PAM 没开：系统账户一律登不进来（临时码还能当备路用）。".to_string())
+        } else if info.pam_users.is_empty() {
+            Some("这台配了 OS 模式但允许名单为空：谁都不许登录。".to_string())
+        } else {
+            None
+        };
+        HowTo { mode, lines, warn }
+    } else {
+        let mode = "访问口令 / 一次性临时码（PAKE 口令通道）".to_string();
+        let lines = vec![
+            direct,
+            "访问口令：见下面「永久口令」那一块；临时码：见上面那张一次性码。".to_string(),
+        ];
+        HowTo { mode, lines, warn: None }
+    }
+}
+
+/// 直连端口到底在不在听 —— **探一次比猜一次强**。面板不读别处的配置（服务怎么起的它不知道），
+/// 只信「127.0.0.1:21117 连得上」这个事实。默认监听就是这个端口（`--listen` 的默认值）。
+fn probe_direct_port() -> Option<bool> {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 21117));
+    match TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)) {
+        Ok(_) => Some(true),
+        // 拒绝与超时都意味着「本机这个端口没有人在听」——对面板来说这两个是一回事。
+        Err(_) => Some(false),
+    }
+}
+
+/// 本机对外地址（给对面填 IP 用）。Windows 上返回空 —— 那一屏只在麒麟上有人看。
+#[cfg(not(windows))]
+fn local_ips() -> Vec<String> {
+    std::process::Command::new("hostname")
+        .arg("-I")
+        .output()
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .filter(|s| !s.starts_with("127.") && !s.contains(':'))
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(windows)]
+fn local_ips() -> Vec<String> {
+    Vec::new()
 }
 
 pub struct LocalPanel {
@@ -85,6 +181,8 @@ pub struct LocalPanel {
     pub host_child: Option<std::process::Child>,
     /// 上线的时刻，用来区分"正在向中继注册"和"注册失败"。
     host_since: Option<std::time::Instant>,
+    /// 直连端口探活结果（`reload()` 时探一次；每帧探等于每秒一次无谓连接）。
+    listen_open: Option<bool>,
 }
 
 
@@ -217,6 +315,7 @@ impl LocalPanel {
             new_user: String::new(),
             host_child: None,
             host_since: None,
+            listen_open: None,
         };
         p.reload();
         p
@@ -280,7 +379,19 @@ impl LocalPanel {
                                 .collect()
                         })
                         .unwrap_or_default();
+                    let auth_os = v.get("auth_os").and_then(|x| x.as_bool()).unwrap_or(false);
+                    let pam = v.get("pam");
+                    let pam_on = pam
+                        .and_then(|p| p.get("enabled"))
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(false);
+                    let pam_users: Vec<String> = pam
+                        .and_then(|p| p.get("allow_users"))
+                        .and_then(|x| x.as_array())
+                        .map(|a| a.iter().filter_map(|u| u.as_str().map(|s| s.to_string())).collect())
+                        .unwrap_or_default();
                     self.status.clear();
+                    self.listen_open = probe_direct_port();
                     Some(Info {
                         path: path.clone(),
                         id: g("device_id"),
@@ -289,6 +400,9 @@ impl LocalPanel {
                         password: g("password"),
                         temp,
                         users,
+                        auth_os,
+                        pam_on,
+                        pam_users,
                     })
                 }
                 Err(e) => {
@@ -483,6 +597,25 @@ impl LocalPanel {
 
             root.add_space(6.0);
             root.group(|ui| {
+                ui.label(egui::RichText::new("对方怎么连我（当面念这几行）").strong());
+                ui.separator();
+                let how = connect_hint(&info, self.listen_open, &local_ips());
+                ui.label(egui::RichText::new(format!("认证方式：{}", how.mode)).strong());
+                for l in &how.lines {
+                    ui.label(egui::RichText::new(l.clone()).monospace());
+                }
+                if let Some(w) = &how.warn {
+                    // 配错必须是红的，不能和说明文字一个颜色 —— 现场一眼要能分出「配置错了」。
+                    ui.label(
+                        egui::RichText::new(w.clone())
+                            .color(egui::Color32::from_rgb(220, 120, 40))
+                            .strong(),
+                    );
+                }
+            });
+
+            root.add_space(6.0);
+            root.group(|ui| {
                 ui.label(egui::RichText::new("给对方念这个：一次性临时验证码").strong());
                 ui.separator();
                 if info.temp.is_empty() {
@@ -608,6 +741,84 @@ impl LocalPanel {
             root.add_space(6.0);
             root.label(egui::RichText::new(self.status.clone()).color(egui::Color32::from_rgb(60, 140, 220)));
         }
+    }
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::*;
+
+    fn ips() -> Vec<String> {
+        vec!["192.168.223.15".to_string()]
+    }
+
+    fn base() -> Info {
+        Info {
+            id: "805747189".into(),
+            name: "麒麟真机".into(),
+            server: "192.168.223.15:21116".into(),
+            password: "a".repeat(12),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pake_mode_points_at_the_password_and_the_temp_code() {
+        let mut i = base();
+        i.temp = "123456".into();
+        let h = connect_hint(&i, Some(true), &ips());
+        assert!(h.mode.contains("访问口令"), "{}", h.mode);
+        assert!(h.lines.iter().any(|l| l.contains("192.168.223.15:21117")), "{:?}", h.lines);
+        assert!(h.lines.iter().any(|l| l.contains("访问口令")), "{:?}", h.lines);
+        assert_eq!(h.warn, None, "正常形态不许有告警");
+    }
+
+    #[test]
+    fn os_mode_names_the_accounts_and_says_the_password_is_the_login_one() {
+        let mut i = base();
+        i.auth_os = true;
+        i.pam_on = true;
+        i.pam_users = vec!["mis".into(), "ops".into()];
+        let h = connect_hint(&i, Some(true), &ips());
+        assert!(h.mode.contains("系统账户"), "{}", h.mode);
+        let accounts = h.lines.iter().find(|l| l.contains("系统账户")).expect("要列出账户");
+        assert!(accounts.contains("mis") && accounts.contains("ops"), "{accounts}");
+        assert!(accounts.contains("登录密码"), "要说明密码就是系统登录密码：{accounts}");
+        assert_eq!(h.warn, None);
+    }
+
+    #[test]
+    fn os_mode_without_pam_warns_that_nothing_can_log_in() {
+        let mut i = base();
+        i.auth_os = true;
+        i.pam_on = false;
+        i.pam_users = vec!["mis".into()];
+        let h = connect_hint(&i, Some(true), &ips());
+        let w = h.warn.expect("必须告警");
+        assert!(w.contains("PAM 没开"), "{w}");
+    }
+
+    #[test]
+    fn os_mode_with_an_empty_allow_list_warns_that_nobody_may_log_in() {
+        let mut i = base();
+        i.auth_os = true;
+        i.pam_on = true;
+        let h = connect_hint(&i, Some(true), &ips());
+        let w = h.warn.expect("必须告警");
+        assert!(w.contains("名单为空"), "{w}");
+        assert!(h.lines.iter().any(|l| l.contains("名单为空")), "{:?}", h.lines);
+    }
+
+    #[test]
+    fn a_closed_direct_port_is_never_sold_as_available() {
+        let i = base();
+        let h = connect_hint(&i, Some(false), &ips());
+        let direct = h.lines.first().expect("第一行就是直连");
+        assert!(direct.contains("没在听"), "{direct}");
+        assert!(!direct.contains("21117"), "没在听就不该给出一个像个能用的地址：{direct}");
+        // 还没有 IP 时也不能编一个地址出来。
+        let h2 = connect_hint(&i, Some(true), &[]);
+        assert!(h2.lines[0].contains("本机 IP"), "{:?}", h2.lines);
     }
 }
 

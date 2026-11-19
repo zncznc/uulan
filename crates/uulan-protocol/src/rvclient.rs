@@ -389,20 +389,40 @@ pub async fn direct_dial_all(addr: &str) -> Result<RelaySet, RvError> {
 /// 那条流我们后面再没碰过，所以 EOF 不会自己找上门（这是我一开始写注释时想当然的地方，
 /// 被自己的测试当场打回）。因此这里的真实防线就是这一条超时。
 ///
+/// **期限从「第一条通道到达」开始算，而不是从「回到 accept()」开始算。** 这个区别是
+/// 三条硬理由，不是口味：
+///   · 没人来连是常态（机器闲着、或已经有一条会话在跑）。期限从 accept 起算的话，
+///     每 5 秒就报一轮超时 —— 现场日志把"没人来"写成"来了又走"，真事件反而被噪声埋掉；
+///   · 恰好在窗口末尾连进来的控制端只剩零点几秒去拨齐另外三条，那是**真丢连接**
+///     （真机日志里就是这么刷的：一次会话进行中，每 5 秒一条「直连半途而废」）；
+///   · 空闲端口不该每 5 秒被自己唤醒一次。
+/// 于是第一条通道无限等，收齐四条才回去接下一轮；期限只用来管「来了一条、另三条迟迟不到」。
+///
 /// 为什么是 5 秒：真客户端在毫秒级拨齐四条，5 秒已经很宽；而对想占端口的人来说，
 /// 他必须每 5 秒重投一次才能持续占位 —— 代价从"永久"降到"每轮 5 秒"。
 /// 要更严可以再缩，但再小就要开始怀疑慢速内网了。
 pub async fn direct_accept_all(listener: &TcpListener) -> Result<(RelaySet, SocketAddr), RvError> {
     const GATHER_TIMEOUT: Duration = Duration::from_secs(5);
-    tokio::time::timeout(GATHER_TIMEOUT, gather_channels(listener)).await
+    let (first, addr) = listener.accept().await?;
+    tokio::time::timeout(GATHER_TIMEOUT, gather_channels(listener, first, addr))
+        .await
         .map_err(|_| RvError::Timeout(GATHER_TIMEOUT))?
 }
 
-async fn gather_channels(listener: &TcpListener) -> Result<(RelaySet, SocketAddr), RvError> {
+async fn gather_channels(
+    listener: &TcpListener,
+    first: TcpStream,
+    first_addr: SocketAddr,
+) -> Result<(RelaySet, SocketAddr), RvError> {
     let mut got: HashMap<Channel, TcpStream> = HashMap::new();
-    let mut peer: Option<SocketAddr> = None;
+    let mut peer: Option<SocketAddr> = Some(first_addr);
+    // 第一条已经在 accept() 那边收下了，这里先把它当"待处理"用掉，避免多一条分支。
+    let mut pending: Option<(TcpStream, SocketAddr)> = Some((first, first_addr));
     while got.len() < 4 {
-        let (mut s, addr) = listener.accept().await?;
+        let (mut s, addr) = match pending.take() {
+            Some(x) => x,
+            None => listener.accept().await?,
+        };
         s.set_nodelay(true).ok();
         let f = read_frame(&mut s).await?;
         let intro: ToServer = serde_json::from_slice(&f.payload)?;

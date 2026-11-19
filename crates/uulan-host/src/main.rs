@@ -604,7 +604,7 @@ async fn serve_relay(
                     pty: None,
                     // None = 读 /proc（生产）；测试可注入假来源。
                     pam_check: None,
-            sys_source: None,
+                    sys_source: None,
                     // None = 按采集源自动决定（X11 → 读焦点窗口名）。
                     lock_probe: None,
                 };
@@ -657,8 +657,10 @@ async fn serve_direct(
         let (relays, peer) = match uulan_protocol::rvclient::direct_accept_all(&listener).await {
             Ok(x) => x,
             Err(e) => {
-                // 端口扫描、只拨了两条就断、20 秒没拨齐 —— 都落到这里。
-                // 必须记一笔（debug 级别），否则现场分不清「没人来连」和「来了但没连上」。
+                // 只可能有两种来路：端口扫描（第一帧就不是 direct_open），或者
+                // 「拨了第一条、另外三条迟迟不到」（5 秒期限）。**没人来连不会走到这里** ——
+                // 第一条通道是无限等的（见 rvclient::direct_accept_all 的注释），
+                // 所以这条日志出现就意味着「真有人来了但没拨齐」，值得记。
                 tracing::debug!(error = %e, "直连半途而废");
                 continue;
             }

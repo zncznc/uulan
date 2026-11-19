@@ -4,6 +4,8 @@
 //! 四条 TCP 连接靠各自开头的声明归位，一旦哪天声明与装配对不上，症状是
 //! "画面黑屏/文件传坏"，现场极难归因到这里。这里用真 TCP 回环把映射钉死。
 
+use std::time::Duration;
+
 use tokio::net::TcpListener;
 use uulan_protocol::frame::{read_frame, write_frame, FrameKind};
 use uulan_protocol::rv::{Channel, Role};
@@ -85,4 +87,30 @@ async fn a_non_uulan_peer_is_rejected_at_the_first_frame() {
         .expect("不该永久卡住")
         .unwrap();
     assert!(r.is_err(), "非 uulan 的第一帧必须被拒");
+}
+
+#[tokio::test]
+async fn an_idle_port_is_not_a_half_dialed_visitor() {
+    // 两件事一起钉住，因为它们是同一个实现选择的两个后果：
+    // ① 没人来连时**不许**判「半途而废」——旧实现每 5 秒编一条假事件，
+    //    真机日志里就是这么刷的（会话进行中每 5 秒一条），真事件反而被埋掉；
+    // ② 晚来的控制端必须拿到**完整的**收齐窗口 —— 旧实现的期限从 accept() 起算，
+    //    恰好在窗口末尾连进来只剩零点几秒，那是真丢连接。
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    let host = tokio::spawn(async move { direct_accept_all(&l).await });
+
+    // 空闲 6 秒：旧实现在第 5 秒就已经超时返回了（这条断言就是回归判据）。
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert!(
+        !host.is_finished(),
+        "没人来连却判成「半途而废」：把「没人来」说成了「有人来又走」"
+    );
+
+    // 等到这一刻才拨号（已经过了 5 秒）：期限必须从这一条起算，四条照常收齐。
+    let mut dial = direct_dial_all(&addr).await.expect("晚来的控制端必须连得上");
+    let (mut got, _peer) = host.await.unwrap().expect("四条到齐就该成一次会话");
+    write_frame(&mut dial.control, FrameKind::Json, b"late").await.unwrap();
+    let f = read_frame(&mut got.control).await.unwrap();
+    assert_eq!(&f.payload[..], &b"late"[..], "晚来的会话通道映射也必须准");
 }
