@@ -548,7 +548,7 @@ pub async fn run_with_sink(
             return SessionOutcome::Error("等认证方式超时".into());
         }
     };
-    let os_mode = want_os && snap0.auth_os && snap0.pam.enabled;
+    let os_mode = os_mode_enabled(want_os, snap0.auth_os, snap0.pam.enabled);
     if want_os && !os_mode {
         // 客户端明确要求用户名密码，但这台没开（或 pam 没开）。宁可当场拒绝，
         // 也不能悄悄回落成 PAKE —— 客户端手里没有临时码，回落只会变成"连不上"。
@@ -1113,11 +1113,7 @@ where
             .await?;
             return Ok(None);
         }
-        // 与 pam_gate 保持同一口径：没注入 checker 就用系统 PAM 校验器。
-        // （第一次实测就栽在这：主线传进来的是 None，我把它当致命错误回了 NotAllowed，
-        //   表现为"账户明明在名单里却被拒绝"，日志里却看不出原因。）
-        let checker = pam_check
-            .unwrap_or_else(|| crate::pam::system_checker(std::time::Duration::from_secs(10)));
+        let checker = os_checker(pam_check);
         // 校验器是同步的（开伪终端 + 等 su），放阻塞线程池，别占着 tokio worker。
         let u = user.clone();
         let verdict = tokio::task::spawn_blocking(move || checker(&u, &password))
@@ -1217,6 +1213,25 @@ where
         }
     }
     }
+}
+
+/// OS 认证模式是否真正启用。
+///
+/// 三条缺一不可，而且**不能悄悄降级**：客户端要求 OS 模式、但被控端没配好时，
+/// 必须走"拒绝"分支，不能回落成 PAKE —— 客户端手里没有临时码，回落只会变成
+/// "连不上"且谁也说不清原因。
+fn os_mode_enabled(want_os: bool, auth_os: bool, pam_enabled: bool) -> bool {
+    want_os && auth_os && pam_enabled
+}
+
+/// OS 模式下拿到校验器：没注入就用系统 PAM。
+///
+/// 抽成函数是因为这里踩过一个真坑：主线传进来的 `pam_check` 是 `None`，
+/// 而 `pam_gate` 遇 `None` 会回落到 `system_checker`，我新写的 OS 分支却把
+/// `None` 当致命错误直接回 `AuthFail(NotAllowed)` —— 症状是"账户明明在允许名单里
+/// 却被拒绝，日志还看不出原因"。两条路必须同一口径。
+fn os_checker(pam_check: Option<crate::pam::Checker>) -> crate::pam::Checker {
+    pam_check.unwrap_or_else(|| crate::pam::system_checker(std::time::Duration::from_secs(10)))
 }
 
 /// 注入错误最多多久上报一次。注入不了的时候（比如被控端跑的不是 X11 桌面），
@@ -2524,6 +2539,47 @@ mod tests {
         assert!(rec.lock().unwrap().is_empty(), "锁/解锁本身不产生注入指令");
         // 解锁后照常注入（门禁只看当前状态，不记仇）
         assert!(il.mapper.mouse_abs(0.5, 0.5).is_some(), "解锁后位置注入照常");
+    }
+
+
+    #[test]
+    fn os_mode_requires_all_three_switches() {
+        // 全开才成立
+        assert!(os_mode_enabled(true, true, true));
+        // 客户端没要求 → 走 PAKE（备路）
+        assert!(!os_mode_enabled(false, true, true));
+        // 被控端没开 auth_os → 不能悄悄用 OS 模式
+        assert!(!os_mode_enabled(true, false, true));
+        // 开了 auth_os 却没有 PAM → **没有校验手段**，必须拒绝而不是放行
+        assert!(!os_mode_enabled(true, true, false));
+    }
+
+    #[test]
+    fn os_checker_uses_the_injected_one_port_not_none() {
+        // 注入的校验器必须被原样用上：这条钉住"账户在名单里却被拒绝"的故障。
+        let fake = crate::pam::fake_checker(&[("mis", "right-password")]);
+        let chk = os_checker(Some(fake));
+        assert_eq!(chk("mis", "right-password"), Ok(true));
+        assert_eq!(chk("mis", "wrong"), Ok(false));
+        // OS 模式不做"合并两个校验器"这种事：注入了就只用注入的。
+        assert_eq!(chk("someone-else", "right-password"), Ok(false));
+    }
+
+    #[test]
+    fn os_checker_falls_back_to_system_pam_when_none() {
+        // 不调用它（那会真的碰系统账户），只确认"拿得到东西"这件事不会 panic：
+        // 曾经的实现是在 None 处直接拒绝，这里的关键是**不返回 None**。
+        let chk = os_checker(None);
+        // 用一个必然不存在的账户验证"确实调到了校验器"，不触碰任何真实账户的失败计数。
+        // 平台差异要写明：麒麟/Linux 上 su 会因为账户不存在而干净失败（Ok(false)）；
+        // Windows 上根本没有 su，校验器只能报错（Err）。两者都不是"跳过校验"——
+        // 这条测试守的是"回落到系统 PAM 这一步不再被跳过"，而不是某个具体返回值。
+        let v = chk("zzz-not-a-real-user", "x");
+        if cfg!(unix) {
+            assert_eq!(v, Ok(false), "Linux 上应当干净地判定为失败");
+        } else {
+            assert!(v.is_err(), "非 unix 平台没有 su，应当报错而不是给出结论：{v:?}");
+        }
     }
 
     #[test]

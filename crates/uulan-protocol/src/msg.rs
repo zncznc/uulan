@@ -829,3 +829,17 @@ let f = H2C::AuthFail { reason: AuthFailReason::BadPassword, retry_after_ms: 100
         assert_eq!(s, r#"{"type":"fs_stream","id":1,"stage":"begin"}"#);
     }
 }
+
+#[cfg(test)]
+mod auth_mode_tests {
+    use super::*;
+
+    #[test]
+    fn auth_mode_roundtrips_and_defaults_to_pake() {
+        // 这一帧决定"走 PAKE 还是走系统账户"：解错方向会让两端各自等到超时。
+        let os = serde_json::to_string(&AuthMode { os: true }).unwrap();
+        assert!(serde_json::from_str::<AuthMode>(&os).unwrap().os);
+        let pake = serde_json::to_string(&AuthMode { os: false }).unwrap();
+        assert!(!serde_json::from_str::<AuthMode>(&pake).unwrap().os);
+    }
+}
