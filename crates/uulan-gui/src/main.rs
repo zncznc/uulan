@@ -26,6 +26,7 @@
 mod local;
 use local::LocalPanel;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 
 use std::io::Write;
@@ -104,6 +105,10 @@ pub struct App {
     relaunch: Arc<AtomicBool>,
     /// 最近一次启动的子进程：秒退就必须当场说出口（并把它的输出留在盘上）。
     child: Option<(std::process::Child, std::time::Instant, PathBuf)>,
+    /// 正在跑的「刷新设备」后台任务。**它必须异步**：那是连中继的外部进程，
+    /// 连不上时最长等 10 秒 —— UI 线程卡 10 秒，桌面就会判窗口「无响应」，
+    /// 而按这个按钮的时刻恰恰是「地址可能还没填对」的时候。
+    refresh: Option<RefreshJob>,
 }
 
 impl App {
@@ -140,6 +145,7 @@ impl App {
             local_next: std::time::Instant::now(),
             relaunch,
             child: None,
+            refresh: None,
         }
     }
 
@@ -279,37 +285,84 @@ impl App {
         a
     }
 
-    fn refresh_devices(&mut self) {
+    /// 开始一次「刷新设备」。**立刻返回**：真正连中继的那条外部进程在后台线程里跑。
+    ///
+    /// 为什么非改不可（2026-11-21 夜批）：`uulan-client --devices` 要连中继，
+    /// `RvConn::connect` 的超时是 **10 秒**。以前它在 UI 线程里 `Command::output()` 等，
+    /// 于是「中继地址填错 → 点刷新 → 整个窗口冻 10 秒」，桌面甚至弹「应用程序无响应」；
+    /// 而按这个按钮的时刻，恰恰是地址还没填对的时候 —— 反馈越该来的时候越不来。
+    fn start_refresh(&mut self) {
+        if self.refresh.is_some() {
+            // 已经在跑：重复点不排第二次（每次都要等满超时，排队只会更慢）。
+            return;
+        }
         let Some(client) = self.client_exe() else {
-            self.status = "找不到 uulan-client —— 请把它和面板放在同一目录。".into();
+            self.alert = "找不到 uulan-client —— 请把它和面板放在同一目录。".into();
             return;
         };
-        let mut cmd = Command::new(&client);
-        cmd.args(["--server", self.relay.trim(), "--devices"]);
-        hide_console(&mut cmd);
-        match cmd.output() {
-            Ok(out) => {
-                let text = String::from_utf8_lossy(&out.stdout);
-                let err = String::from_utf8_lossy(&out.stderr);
-                self.devices.clear();
-                let (rows, unparsed) = parse_devices(&text);
-                self.devices = rows;
-                if unparsed > 0 {
-                    // 认不出来的行必须说出来，而不是悄悄当成「离线」——
-                    // 「列表里全是灰点」和「解析器读不懂这个格式」是两回事。
-                    self.push_log(format!("有 {unparsed} 行没能解析成设备（格式变了？）"));
+        let relay = self.relay.trim().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut cmd = Command::new(&client);
+            cmd.args(["--server", &relay, "--devices"]);
+            hide_console(&mut cmd);
+            let done = match cmd.output() {
+                Ok(out) => {
+                    let text = String::from_utf8_lossy(&out.stdout).to_string();
+                    let err = String::from_utf8_lossy(&out.stderr).to_string();
+                    let (rows, unparsed) = parse_devices(&text);
+                    let head = text
+                        .lines()
+                        .find(|l| l.contains("台设备"))
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    RefreshDone::Ran { rows, unparsed, head, err, ok: out.status.success() }
                 }
-                let head = text.lines().find(|l| l.contains("台设备")).unwrap_or("").trim().to_string();
-                self.status = if self.devices.is_empty() {
-                    format!("没解析到设备。{} {}", head, err.trim()).trim().to_string()
-                } else {
-                    format!("{}（共 {} 行）", head, self.devices.len())
-                };
-                self.push_log(format!("刷新设备：{}", self.status));
+                Err(e) => RefreshDone::SpawnFailed(format!("控制端跑不起来：{e}")),
+            };
+            // 接收端没了（面板关掉）就算了：发不出去不是错误。
+            let _ = tx.send(done);
+        });
+        self.alert.clear();
+        self.status = "正在刷新设备…（连不上中继时最多等 10 秒）".to_string();
+        self.refresh = Some(RefreshJob { started: std::time::Instant::now(), rx });
+    }
+
+    /// 主线程每帧调一次：结果到了就落地，没到就把「已 N 秒」写进状态栏。
+    ///
+    /// 「已 N 秒」不是装饰：这条按钮过去的故障形态就是「点了没反应」，
+    /// 一个在走的秒数能让人分清「在等」和「死掉了」。
+    fn poll_refresh(&mut self) {
+        let (got, elapsed) = {
+            let Some(job) = self.refresh.as_ref() else { return };
+            (job.rx.try_recv(), job.started.elapsed().as_secs_f32())
+        };
+        match got {
+            Ok(RefreshDone::Ran { rows, unparsed, head, err, ok }) => {
+                self.refresh = None;
+                let o = refresh_outcome(&rows, unparsed, &head, &err, ok);
+                self.devices = rows;
+                self.status = o.status;
+                if let Some(l) = o.log {
+                    self.push_log(l);
+                }
+                if let Some(a) = o.alert {
+                    self.alert = a;
+                }
             }
-            Err(e) => {
-                self.status = format!("控制端跑不起来：{e}");
-                self.push_log(self.status.clone());
+            Ok(RefreshDone::SpawnFailed(msg)) => {
+                self.refresh = None;
+                self.alert = msg.clone();
+                self.push_log(msg);
+                self.status = "刷新失败：控制端没能启动。".to_string();
+            }
+            Err(TryRecvError::Empty) => {
+                self.status = format!("正在刷新设备… 已 {elapsed:.1} 秒（连不上中继时最多等 10 秒）");
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.refresh = None;
+                self.alert = "刷新线程没有回报结果就退出了（面板内部错误，请重开面板）。".into();
             }
         }
     }
@@ -405,6 +458,80 @@ impl App {
                 self.push_log(self.alert.clone());
             }
         }
+    }
+}
+
+/// 一次「刷新设备」的后台任务：一进来就带时间戳，状态栏靠它算「已 N 秒」。
+struct RefreshJob {
+    started: std::time::Instant,
+    rx: Receiver<RefreshDone>,
+}
+
+/// 后台线程回报的东西。控制端跑完了就连退出码一起带回来 ——
+/// 「一个设备都没有」和「控制端自己报错退出」必须由 [`refresh_outcome`] 分开说。
+enum RefreshDone {
+    Ran { rows: Vec<DeviceRow>, unparsed: usize, head: String, err: String, ok: bool },
+    SpawnFailed(String),
+}
+
+/// 刷新结果要怎么讲给人听（纯函数：不碰 IO，本机单测就能钉住措辞）。
+#[derive(Debug, PartialEq, Eq)]
+struct RefreshOutcome {
+    /// 顶到眼前的那行红字（失败时要显眼 —— 这是这条按钮的老教训）。
+    alert: Option<String>,
+    /// 底部状态栏那一句。
+    status: String,
+    /// 写进「最近的动作」的补充行（没有就不写）。
+    log: Option<String>,
+}
+
+/// 三种结果是三句不同的话：**控制端说连不上**、**连上了但一台都没有**、**读到了设备**。
+/// 把它们糊成一句「没解析到设备」正是过去那种「查不出原因」的形态。
+fn refresh_outcome(
+    rows: &[DeviceRow],
+    unparsed: usize,
+    head: &str,
+    err: &str,
+    ok: bool,
+) -> RefreshOutcome {
+    let err = err.trim();
+    let head = head.trim();
+    if !ok && !err.is_empty() {
+        // 控制端自己的原话最准（`连不上中继 10.255.255.1:21116：连接超时（10s）`），
+        // 面板只负责把它原样顶到眼前，不替它编一句好话。
+        let first = err.lines().next().unwrap_or(err).trim().to_string();
+        return RefreshOutcome {
+            alert: Some(first),
+            status: "刷新失败 —— 原因见上面那行红字。".to_string(),
+            log: Some(format!("刷新设备失败：{err}")),
+        };
+    }
+    if rows.is_empty() {
+        let why = if head.is_empty() {
+            "中继连上了，但设备目录是空的（被控端还没上线？）".to_string()
+        } else {
+            head.to_string()
+        };
+        return RefreshOutcome {
+            alert: Some(format!("没解析到设备。{why}")),
+            status: "刷新失败 —— 一个设备都没读到。".to_string(),
+            log: Some(format!("刷新设备：没解析到设备（{why}）")),
+        };
+    }
+    RefreshOutcome {
+        alert: None,
+        status: if head.is_empty() {
+            format!("共 {} 台设备", rows.len())
+        } else {
+            format!("{head}（共 {} 行）", rows.len())
+        },
+        log: if unparsed > 0 {
+            // 认不出来的行必须说出来，而不是悄悄当成「离线」——
+            // 「列表里全是灰点」和「解析器读不懂这个格式」是两回事。
+            Some(format!("有 {unparsed} 行没能解析成设备（格式变了？）"))
+        } else {
+            None
+        },
     }
 }
 
@@ -539,6 +666,11 @@ impl eframe::App for App {
 
         // 每秒醒一次去看旗子（第二个实例被双击起来、或用户又点了一次图标）。
         root.ctx().request_repaint_after(std::time::Duration::from_millis(1000));
+        // 刷新任务的结果在这一帧落地；在跑的时候 100 ms 醒一次，让「已 N 秒」真的在走。
+        self.poll_refresh();
+        if self.refresh.is_some() {
+            root.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        }
         if self.relaunch.swap(false, Ordering::Relaxed) && self.alert.is_empty() {
             self.alert = "又有人双击了一次图标 —— 已经有一个面板在跑了，就是这个窗口。\n                两个窗口会各自显示不同的验证码，所以第二个被拒绝启动。".into();
         }
@@ -609,8 +741,11 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     ui.label("中继地址");
                     ui.add(egui::TextEdit::singleline(&mut self.relay).desired_width(240.0));
-                    if ui.button("刷新设备").clicked() {
-                        self.refresh_devices();
+                    // 刷新在后台线程里跑：这里只负责「按下」和「显示在跑」。
+                    let busy = self.refresh.is_some();
+                    let label = if busy { "刷新中…" } else { "刷新设备" };
+                    if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
+                        self.start_refresh();
                     }
                 });
                 // 直连：填了就绕开中继。放这一行而不是新开一页，是因为它只是"换地址写法"，
@@ -936,6 +1071,49 @@ mod tests {
         assert_eq!(a[0], "--direct");
         // 直连不需要设备 ID（这条以前被表单拦在前面，和它自己的提示自相矛盾）。
         assert!(!a.contains(&"--device".to_string()), "直连还带了 --device：{a:?}");
+    }
+
+    fn row(id: &str, online: bool) -> DeviceRow {
+        DeviceRow { id: id.into(), name: "麒麟真机".into(), online, last: false }
+    }
+
+    #[test]
+    fn refresh_success_reports_the_head_line_not_a_guess() {
+        let rows = vec![row("805747189", true)];
+        let o = refresh_outcome(&rows, 0, "中继 192.168.223.15:21116：1 台设备（在线 1）", "", true);
+        assert!(o.alert.is_none(), "正常刷新不该弹红字：{o:?}");
+        assert!(o.status.contains("1 台设备"), "状态栏要带控制端自己那句：{o:?}");
+        assert_eq!(o.log, None);
+    }
+
+    #[test]
+    fn refresh_failure_shows_the_client_own_words() {
+        // 这条钉的是「查不出原因」的老形态：连不上中继时，面板必须把控制端的原话
+        // （连不上中继 …：连接超时（10s））顶到眼前，而不是笼统的「没解析到设备」。
+        let o = refresh_outcome(&[], 0, "", "连不上中继 10.255.255.1:21116：连接超时（10s）", false);
+        let a = o.alert.as_ref().expect("失败必须显眼");
+        assert!(a.contains("连不上中继"), "{a}");
+        assert!(a.contains("10.255.255.1:21116"), "地址要原样带出来，现场才知道改哪儿：{a}");
+        assert!(o.status.contains("刷新失败"), "{o:?}");
+    }
+
+    #[test]
+    fn refresh_with_zero_devices_says_which_kind_of_empty_it_is() {
+        // 中继连上了、目录是空的：这不是「解析器读不懂」，是这台中继上现在没有机器。
+        let o = refresh_outcome(&[], 0, "中继 10.0.0.9:21116：0 台设备（在线 0）", "", true);
+        assert!(o.alert.is_some());
+        let a = o.alert.unwrap();
+        assert!(a.contains("0 台设备"), "要把控制端那句带出来：{a}");
+        assert!(!a.contains("连不上"), "别把「空的」说成「连不上」：{a}");
+    }
+
+    #[test]
+    fn unparsable_lines_are_counted_in_the_log_not_silently_dropped() {
+        let rows = vec![row("805747189", true)];
+        let o = refresh_outcome(&rows, 2, "中继 x：1 台设备（在线 1）", "", true);
+        assert!(o.alert.is_none());
+        let l = o.log.expect("认不出来的行必须记账");
+        assert!(l.contains('2'), "{l}");
     }
 
     #[test]
