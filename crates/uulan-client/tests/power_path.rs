@@ -26,9 +26,14 @@ use uulan_protocol::rvclient::RvConn;
 const PW: &str = "aB3dE5fG";
 
 /// 无害的「必然非零退出」子进程：证执行机制，不证成功路径。
+///
+/// Windows 上**别用 `where.exe`**：它会扫整条 PATH，机器被 `cargo test --workspace`
+/// 压满时启动能超过被控端 3 秒宽限期，于是回话变成「命令仍在执行」—— 判据假红
+/// （2026-11-20 夜批实测：单独跑 0.28 s 全绿，整仓并发跑时这条红）。
+/// `whoami.exe <动作名>` 不扫 PATH、46 ms 退 1，语义一样（真 spawn、真退出码）。
 fn failing_program() -> String {
     if cfg!(windows) {
-        "C:/Windows/System32/where.exe".to_string()
+        "C:/Windows/System32/whoami.exe".to_string()
     } else {
         "/bin/false".to_string()
     }

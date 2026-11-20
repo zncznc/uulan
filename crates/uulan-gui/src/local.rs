@@ -97,15 +97,13 @@ pub struct HowTo {
 
 /// 由「配置 + 直连端口探活结果 + 本机 IP」算出该念的话。**没有 IO、没有全局状态。**
 pub fn connect_hint(info: &Info, listen_open: Option<bool>, ips: &[String]) -> HowTo {
-    let host_part = if ips.is_empty() {
-        "本机 IP".to_string()
-    } else {
-        ips.join(" / ")
-    };
     let direct = match listen_open {
-        Some(true) => format!("直连：{host_part}:21117（对方用 --direct 或面板「直连地址」填这个）"),
+        Some(true) => format!(
+            "直连：{}（对方用 --direct 或面板「直连地址」填这个）",
+            direct_addrs(ips)
+        ),
         Some(false) => "直连端口没在听（这台是以 --no-listen 起的）—— 只能经中继连".to_string(),
-        None => format!("直连：{host_part}:21117（还没探过端口）"),
+        None => format!("直连：{}（还没探过端口）", direct_addrs(ips)),
     };
 
     if info.auth_os {
@@ -148,9 +146,79 @@ fn probe_direct_port() -> Option<bool> {
     }
 }
 
+/// 每个地址都带端口。
+///
+/// 只给最后一个加端口是**真机面板上抓到的错**（2026-11-20）：那台机器有三块网卡，
+/// 屏幕上是 `192.168.223.15 / 192.168.231.1 / 172.16.96.1:21117` —— 照着念的人
+/// 会把第一个（唯一能用的那个）念成没有端口的地址，对面填进去连不上。
+fn direct_addrs(ips: &[String]) -> String {
+    if ips.is_empty() {
+        return "本机 IP:21117".to_string();
+    }
+    ips.iter()
+        .map(|ip| format!("{ip}:21117"))
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+/// 虚拟网卡上的地址**对面连不到**，念出去只会让人白试一次。
+///
+/// 真机实测（2026-11-20）：`hostname -I` 给出 `192.168.223.15 192.168.231.1 172.16.96.1`，
+/// 后两个是 VMware 的 vmnet1/vmnet8 —— 只有第一个是对方能路由到的。
+/// 按接口名过滤比按网段猜可靠（网段是现场自己定的，名字是软件定的）。
+///
+/// Windows 上 `local_ips()` 恒为空（那一屏只在麒麟上有人看），所以这两个函数
+/// 在 Windows 构建里只有测试用得到 —— 别让 dead_code 警告把零警告基线弄红。
+#[cfg_attr(windows, allow(dead_code))]
+fn is_virtual_iface(name: &str) -> bool {
+    const PREFIXES: [&str; 8] = ["vmnet", "docker", "virbr", "br-", "veth", "tun", "tap", "lo"];
+    PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// 从「(接口名, 地址)」里挑出该念出去的地址。纯函数，判据在本机就能钉死。
+#[cfg_attr(windows, allow(dead_code))]
+pub fn lan_ips_from(entries: &[(String, String)]) -> Vec<String> {
+    let kept: Vec<String> = entries
+        .iter()
+        .filter(|(iface, _)| !is_virtual_iface(iface))
+        .map(|(_, ip)| ip.clone())
+        .collect();
+    if kept.is_empty() {
+        // 全被滤掉时宁可原样给出来：一块地址都不给，现场连试都没得试。
+        return entries.iter().map(|(_, ip)| ip.clone()).collect();
+    }
+    kept
+}
+
 /// 本机对外地址（给对面填 IP 用）。Windows 上返回空 —— 那一屏只在麒麟上有人看。
 #[cfg(not(windows))]
 fn local_ips() -> Vec<String> {
+    // `ip -4 -o addr show scope global` 带接口名，才能把 vmnet/docker 这类滤掉；
+    // `hostname -I` 只有地址，滤不了（真机上就是这么把两块 VMware 网卡念出去的）。
+    if let Ok(o) = std::process::Command::new("ip")
+        .args(["-4", "-o", "addr", "show", "scope", "global"])
+        .output()
+    {
+        if o.status.success() {
+            let text = String::from_utf8_lossy(&o.stdout);
+            let entries: Vec<(String, String)> = text
+                .lines()
+                .filter_map(|l| {
+                    let mut it = l.split_whitespace();
+                    let _idx = it.next()?; // "2:"
+                    let iface = it.next()?.to_string();
+                    let cidr = it.find(|t| t.contains('/'))?;
+                    let ip = cidr.split('/').next()?.to_string();
+                    Some((iface, ip))
+                })
+                .collect();
+            let ips = lan_ips_from(&entries);
+            if !ips.is_empty() {
+                return ips;
+            }
+        }
+    }
+    // 没有 `ip` 命令（或它失败）时退回老路：至少给点东西。
     std::process::Command::new("hostname")
         .arg("-I")
         .output()
@@ -820,5 +888,43 @@ mod hint_tests {
         let h2 = connect_hint(&i, Some(true), &[]);
         assert!(h2.lines[0].contains("本机 IP"), "{:?}", h2.lines);
     }
-}
 
+    /// 真机面板上抓到的错（2026-11-20）：三个地址只有最后一个带端口，
+    /// 照着念的人会把第一个（唯一能用的那个）念成没有端口的地址。
+    #[test]
+    fn every_direct_address_carries_the_port() {
+        let i = base();
+        let three = vec![
+            "192.168.223.15".to_string(),
+            "192.168.231.1".to_string(),
+            "172.16.96.1".to_string(),
+        ];
+        let h = connect_hint(&i, Some(true), &three);
+        let direct = h.lines.first().expect("第一行就是直连");
+        for ip in &three {
+            assert!(
+                direct.contains(&format!("{ip}:21117")),
+                "每个地址都要带端口，缺 {ip}:21117 —— {direct}"
+            );
+        }
+    }
+
+    /// 虚拟网卡（VMware / docker / libvirt）上的地址对面连不到，不许念出去。
+    #[test]
+    fn virtual_interfaces_are_not_read_out() {
+        let entries = vec![
+            ("eno1".to_string(), "192.168.223.15".to_string()),
+            ("vmnet1".to_string(), "192.168.231.1".to_string()),
+            ("vmnet8".to_string(), "172.16.96.1".to_string()),
+            ("docker0".to_string(), "172.17.0.1".to_string()),
+        ];
+        assert_eq!(lan_ips_from(&entries), vec!["192.168.223.15".to_string()]);
+    }
+
+    /// 全被滤掉时宁可原样给出来 —— 一块地址都不给，现场连试都没得试。
+    #[test]
+    fn all_virtual_falls_back_to_what_we_have() {
+        let entries = vec![("vmnet8".to_string(), "172.16.96.1".to_string())];
+        assert_eq!(lan_ips_from(&entries), vec!["172.16.96.1".to_string()]);
+    }
+}
