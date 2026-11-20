@@ -765,7 +765,10 @@ impl eframe::App for App {
                         ui.label(egui::RichText::new("不经中继，被控端需开着监听（默认 21117）").weak().small());
                     }
                 });
-                ui.horizontal(|ui| {
+                // 这一行控件最多（设备 ID / 临时码 / 记住口令 / 系统账户 + 密码）。用
+                // horizontal_wrapped：窗口压到最小 560x420 时（真机实测）不换行会把
+                // 「记住这…」截断、系统账户框整个看不见 —— 那不是「挤」，是功能消失。
+                ui.horizontal_wrapped(|ui| {
                     ui.label("设备 ID");
                     ui.add(egui::TextEdit::singleline(&mut self.device).desired_width(140.0));
                     // 措辞对齐现场说法：对方念给你的是**临时码**（一次性），
