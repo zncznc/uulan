@@ -202,10 +202,29 @@ impl App {
         if line.trim().is_empty() {
             return;
         }
+        // 面板是 GUI 子系统，没有控制台：写进屏幕的日志会随着关窗一起消失。
+        // 会话结束/子进程秒退这类结论**必须能够事后 grep**，否则现场报修时只能凭记忆。
+        self.note_file(&line);
         self.log.push(line);
         if self.log.len() > 60 {
             let n = self.log.len() - 60;
             self.log.drain(..n);
+        }
+    }
+
+    /// 把一条动作记进 `gui-actions.log`（>64 KiB 时轮转一次，防止无限长）。
+    fn note_file(&self, line: &str) {
+        use std::io::Write as _;
+        let dir = Self::cfg_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("gui-actions.log");
+        if let Ok(m) = std::fs::metadata(&p) {
+            if m.len() > 64 * 1024 {
+                let _ = std::fs::rename(&p, dir.join("gui-actions.log.1"));
+            }
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+            let _ = writeln!(f, "{}  {line}", chrono_free_stamp());
         }
     }
 
@@ -658,9 +677,22 @@ impl eframe::App for App {
             ui.add_space(4.0);
         });
 
+        // 会话在跑的时候，状态栏要能看出「还在跑、跑了多久」——
+        // 以前的 footer 只在启动那一刻写过一句 PID，之后整场都是死的。
+        let running_for = self
+            .child
+            .as_ref()
+            .map(|(_, born, _)| born.elapsed().as_secs());
         egui::Panel::bottom("foot").show(root, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(&self.status);
+                if let Some(secs) = running_for {
+                    ui.label(
+                        egui::RichText::new(format!("· 会话进行中（已 {}）", fmt_dur(secs)))
+                            .weak()
+                            .small(),
+                    );
+                }
             });
         });
 
@@ -680,14 +712,30 @@ impl eframe::App for App {
         if let Some((mut child, born, lp)) = self.child.take() {
             match child.try_wait() {
                 Ok(Some(st)) => {
+                    let secs = born.elapsed().as_secs();
+                    let code = st.code();
                     let raw = std::fs::read_to_string(&lp).unwrap_or_default();
                     let tail: String = raw.lines().rev().take(3).collect::<Vec<_>>().join(" ← ");
-                    if born.elapsed().as_secs() < 10 {
+                    if secs < 10 {
                         self.alert = format!(
                             "远程进程 {st} 就退了（不到 10 秒），所以你没看到窗口。\n最后三行输出：{}\n全文在 {}",
                             tail.trim().replace('\n', " / "),
                             lp.display()
                         );
+                    } else {
+                        // **正常关窗也是「会话结束」**：面板以前只在「不到 10 秒秒退」时说话，
+                        // 于是长会话结束时一声不吭 —— 现场分不清「我自己关的」「对面断了」还是「崩溃了」。
+                        // 退出码的含义（尤其 4 = 放弃重连）由 session_end_note 负责说人话。
+                        let note = session_end_note(code, secs);
+                        self.push_log(note.clone());
+                        self.status = note.clone();
+                        if code.unwrap_or(-1) != 0 {
+                            self.alert = format!(
+                                "{note}\n最后三行输出：{}\n全文在 {}",
+                                tail.trim().replace('\n', " / "),
+                                lp.display()
+                            );
+                        }
                     }
                 }
                 // 还活着就放回原位，下一帧继续看。
@@ -865,6 +913,35 @@ impl eframe::App for App {
                 });
             }
         });
+    }
+}
+
+/// 会话结束时给现场看的一句话。
+///
+/// 退出码不是内部细节：控制端用 **4 = 放弃重连**（`session::drive` 的约定）、**3 = 被控端
+/// 拒绝键鼠注入**（`--inject` 的约定）。窗口自己消失时，现场最需要的正是这一句 ——
+/// 以前面板对正常结束完全沉默，用户只能猜「是断线还是我关的」。
+fn session_end_note(code: Option<i32>, secs: u64) -> String {
+    let d = fmt_dur(secs);
+    match code {
+        Some(0) => format!("远程会话已结束（正常收工，用时 {d}）"),
+        Some(4) => format!(
+            "远程会话已断开：控制端放弃了重连（退出码 4，用时 {d}）—— 被控端可能关机/断网，可再点一次「开始远程控制」"
+        ),
+        Some(3) => format!("远程会话结束：被控端没接受键鼠注入（退出码 3，用时 {d}）"),
+        Some(n) => format!("远程会话异常结束（退出码 {n}，用时 {d}）—— 最后三行输出见下方提示"),
+        None => format!("远程会话被强制结束（拿不到退出码，用时 {d}）"),
+    }
+}
+
+/// 时长写成现场能念的样子。不引时间库：这里只做整除，任何依赖都是多余。
+fn fmt_dur(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs} 秒")
+    } else if secs < 3600 {
+        format!("{} 分 {} 秒", secs / 60, secs % 60)
+    } else {
+        format!("{} 小时 {} 分", secs / 3600, (secs % 3600) / 60)
     }
 }
 
@@ -1121,6 +1198,43 @@ mod tests {
         assert!(o.alert.is_none());
         let l = o.log.expect("认不出来的行必须记账");
         assert!(l.contains('2'), "{l}");
+    }
+
+    #[test]
+    fn a_normal_end_is_reported_with_its_duration() {
+        let n = session_end_note(Some(0), 605);
+        assert!(n.contains("正常收工"), "{n}");
+        assert!(n.contains("10 分 5 秒"), "{n}");
+    }
+
+    #[test]
+    fn give_up_on_reconnect_says_exit_code_4_out_loud() {
+        let n = session_end_note(Some(4), 30);
+        assert!(n.contains("放弃"), "{n}");
+        assert!(n.contains("退出码 4"), "{n}");
+    }
+
+    #[test]
+    fn unknown_exit_code_is_not_dressed_up_as_normal() {
+        let n = session_end_note(Some(1), 61);
+        assert!(n.contains("异常结束"), "{n}");
+        assert!(n.contains("退出码 1"), "{n}");
+        assert!(!n.contains("正常"), "{n}");
+    }
+
+    #[test]
+    fn killed_without_a_code_is_still_reported() {
+        let n = session_end_note(None, 5);
+        assert!(n.contains("强制结束"), "{n}");
+    }
+
+    #[test]
+    fn durations_read_like_a_person_would_say_them() {
+        assert_eq!(fmt_dur(0), "0 秒");
+        assert_eq!(fmt_dur(59), "59 秒");
+        assert_eq!(fmt_dur(65), "1 分 5 秒");
+        assert_eq!(fmt_dur(7200), "2 小时 0 分");
+        assert_eq!(fmt_dur(3661), "1 小时 1 分");
     }
 
     #[test]
