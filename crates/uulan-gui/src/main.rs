@@ -744,182 +744,189 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(root, |ui| {
-            // 两页：这台机器去连别人 / 别人来连这台机器。UU 也是这么分的。
-            ui.horizontal(|ui| {
-                // 切页签**不清 alert**：刷新失败的红字是在这一页发起的，切过去看就该还在
-                // （真机踩过：清了以后状态栏那句「原因见上面那行红字」指向一行不存在的字）。
-                // 提示由「我知道了」显式关掉。
-                if ui.selectable_label(self.tab == 0, "远程控制").clicked() {
-                    self.tab = 0;
-                }
-                if ui.selectable_label(self.tab == 1, "本机（被控端）信息").clicked() {
-                    self.tab = 1;
-                    self.local.reload();
-                }
-            });
-            ui.separator();
-            // 失败提示**两页都渲染**：刷新是在这一页按的，结果不该因为切了页就不见。
-            if !self.alert.is_empty() {
-                // 提示可能很长（带日志尾部的退出码说明，真机实测 6~8 行）：**给它自己的、
-                // 封顶高度的滚动区**。否则 720x520 的窗口里「开始远程控制」会被顶到窗口外，
-                // 用户连再试一次都点不到 —— 真机上就是一行 panic 尾巴把按钮挤出可视区的。
-                egui::ScrollArea::vertical()
-                    .id_salt("alert-scroll")
-                    .max_height(110.0)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        ui.colored_label(egui::Color32::from_rgb(200, 40, 40), &self.alert);
-                    });
-                // 「我知道了」留在滚动区外面：关掉提示的办法不能被提示自己挤走。
-                if ui.button("我知道了").clicked() {
-                    self.alert.clear();
-                }
+            // 整页可滚动：内容（很长的失败提示 + 全部表单）在 720x520 的默认窗口里
+            // 会超过可视高度 —— 真机实测「开始远程控制」会被切在窗口外，点不到。
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                // 两页：这台机器去连别人 / 别人来连这台机器。UU 也是这么分的。
+                ui.horizontal(|ui| {
+                    // 切页签**不清 alert**：刷新失败的红字是在这一页发起的，切过去看就该还在
+                    // （真机踩过：清了以后状态栏那句「原因见上面那行红字」指向一行不存在的字）。
+                    // 提示由「我知道了」显式关掉。
+                    if ui.selectable_label(self.tab == 0, "远程控制").clicked() {
+                        self.tab = 0;
+                    }
+                    if ui.selectable_label(self.tab == 1, "本机（被控端）信息").clicked() {
+                        self.tab = 1;
+                        self.local.reload();
+                    }
+                });
                 ui.separator();
-            }
-            if self.tab == 1 {
-                // eframe 默认只在有输入时重绘，所以必须显式约醒，否则这一屏永远停在旧值。
-                // 用 repaint_after 而不是 repaint：后者等于连续重绘，空转把 CPU 拉满。
-                ui.ctx().request_repaint_after(std::time::Duration::from_millis(600));
-                if std::time::Instant::now() >= self.local_next {
-                    self.local.reload();
-                    self.local_next = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                // 失败提示**两页都渲染**：刷新是在这一页按的，结果不该因为切了页就不见。
+                if !self.alert.is_empty() {
+                    // 提示可能很长（带日志尾部的退出码说明，真机实测 6~8 行）：**给它自己的、
+                    // 封顶高度的滚动区**。否则 720x520 的窗口里「开始远程控制」会被顶到窗口外，
+                    // 用户连再试一次都点不到 —— 真机上就是一行 panic 尾巴把按钮挤出可视区的。
+                    egui::ScrollArea::vertical()
+                        .id_salt("alert-scroll")
+                        .max_height(110.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.colored_label(egui::Color32::from_rgb(200, 40, 40), &self.alert);
+                        });
+                    // 「我知道了」留在滚动区外面：关掉提示的办法不能被提示自己挤走。
+                    if ui.button("我知道了").clicked() {
+                        self.alert.clear();
+                    }
+                    ui.separator();
                 }
-                if !self.local.info.as_ref().map(|i| i.temp.clone()).unwrap_or_default().is_empty() {
-                    ui.label(egui::RichText::new(
-                        "↑ 这一屏每两秒自动重读配置；临时码用一次即失效，念出去的那张用完就作废。",
-                    )
-                    .weak()
-                    .small());
+                if self.tab == 1 {
+                    // eframe 默认只在有输入时重绘，所以必须显式约醒，否则这一屏永远停在旧值。
+                    // 用 repaint_after 而不是 repaint：后者等于连续重绘，空转把 CPU 拉满。
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(600));
+                    if std::time::Instant::now() >= self.local_next {
+                        self.local.reload();
+                        self.local_next = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    }
+                    if !self.local.info.as_ref().map(|i| i.temp.clone()).unwrap_or_default().is_empty() {
+                        ui.label(egui::RichText::new(
+                            "↑ 这一屏每两秒自动重读配置；临时码用一次即失效，念出去的那张用完就作废。",
+                        )
+                        .weak()
+                        .small());
+                    }
+                    // 先 clone 再传：&self.relay 与 self.local.ui(..) 会同时借 self，直接传过不了借用检查。
+                    let relay = self.relay.clone();
+                    self.local.ui(ui, &relay);
+                    return;
                 }
-                // 先 clone 再传：&self.relay 与 self.local.ui(..) 会同时借 self，直接传过不了借用检查。
-                let relay = self.relay.clone();
-                self.local.ui(ui, &relay);
-                return;
-            }
 
-            ui.group(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label("中继地址");
-                    ui.add(egui::TextEdit::singleline(&mut self.relay).desired_width(240.0));
-                    // 刷新在后台线程里跑：这里只负责「按下」和「显示在跑」。
-                    let busy = self.refresh.is_some();
-                    let label = if busy { "刷新中…" } else { "刷新设备" };
-                    if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
-                        self.start_refresh();
-                    }
-                });
-                // 直连：填了就绕开中继。放这一行而不是新开一页，是因为它只是"换地址写法"，
-                // 下面的选项、口令、按钮全部照用。
-                ui.horizontal(|ui| {
-                    ui.label("直连地址");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.direct)
-                            .hint_text("留空 = 经中继；例 192.168.1.20:21117")
-                            .desired_width(240.0),
-                    );
-                    if !self.direct.trim().is_empty() {
-                        ui.label(egui::RichText::new("不经中继，被控端需开着监听（默认 21117）").weak().small());
-                    }
-                });
-                // 这一行控件最多（设备 ID / 临时码 / 记住口令 / 系统账户 + 密码）。用
-                // horizontal_wrapped：窗口压到最小 560x420 时（真机实测）不换行会把
-                // 「记住这…」截断、系统账户框整个看不见 —— 那不是「挤」，是功能消失。
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("设备 ID");
-                    ui.add(egui::TextEdit::singleline(&mut self.device).desired_width(140.0));
-                    // 措辞对齐现场说法：对方念给你的是**临时码**（一次性），
-                    // 永久口令只是备选。写"访问口令"会让人以为必须去翻口令文件。
-                    ui.label("临时码/口令");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.password)
-                            .password(true)
-                            .desired_width(200.0),
-                    );
-                    ui.checkbox(&mut self.remember_pw, "记住这条口令");
-                    ui.label("系统账户(可选)");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.os_user)
-                            .hint_text("用户名：被控端用「系统账户」认证时填这里")
-                            .desired_width(150.0),
-                    );
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.os_password)
-                            .password(true)
-                            .hint_text("该账户的登录密码")
-                            .desired_width(110.0),
-                    );
-                    if !self.os_user.trim().is_empty() && self.password.trim().is_empty() {
-                        // 这一句是给现场的人看的：填了系统账户就可以不填临时码。
-                        ui.label(egui::RichText::new("只用系统账户认证（临时码可留空）").weak().small());
-                    }
-                });
-            });
-
-            ui.add_space(6.0);
-            ui.group(|ui| {
-                ui.label("找到的设备（点一行就填进上面）");
-                if self.devices.is_empty() {
-                    ui.label("（还没有 —— 点「刷新设备」）");
-                }
-                let mut picked: Option<String> = None;
-                for d in &self.devices {
+                ui.group(|ui| {
                     ui.horizontal(|ui| {
-                        let dot = if d.online { "●" } else { "○" };
-                        let color = if d.online { egui::Color32::from_rgb(60, 200, 120) } else { egui::Color32::GRAY };
-                        ui.colored_label(color, dot);
-                        if ui.selectable_label(false, format!("{}  {}{}", d.id, d.name, if d.last { "  ← 上次" } else { "" })).clicked() {
-                            picked = Some(d.id.clone());
+                        ui.label("中继地址");
+                        ui.add(egui::TextEdit::singleline(&mut self.relay).desired_width(240.0));
+                        // 刷新在后台线程里跑：这里只负责「按下」和「显示在跑」。
+                        let busy = self.refresh.is_some();
+                        let label = if busy { "刷新中…" } else { "刷新设备" };
+                        if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
+                            self.start_refresh();
+                        }
+                    });
+                    // 直连：填了就绕开中继。放这一行而不是新开一页，是因为它只是"换地址写法"，
+                    // 下面的选项、口令、按钮全部照用。
+                    ui.horizontal(|ui| {
+                        ui.label("直连地址");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.direct)
+                                .hint_text("留空 = 经中继；例 192.168.1.20:21117")
+                                .desired_width(240.0),
+                        );
+                        if !self.direct.trim().is_empty() {
+                            ui.label(egui::RichText::new("不经中继，被控端需开着监听（默认 21117）").weak().small());
+                        }
+                    });
+                    // 这一行控件最多（设备 ID / 临时码 / 记住口令 / 系统账户 + 密码）。用
+                    // horizontal_wrapped：窗口压到最小 560x420 时（真机实测）不换行会把
+                    // 「记住这…」截断、系统账户框整个看不见 —— 那不是「挤」，是功能消失。
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("设备 ID");
+                        ui.add(egui::TextEdit::singleline(&mut self.device).desired_width(140.0));
+                        // 措辞对齐现场说法：对方念给你的是**临时码**（一次性），
+                        // 永久口令只是备选。写"访问口令"会让人以为必须去翻口令文件。
+                        ui.label("临时码/口令");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.password)
+                                .password(true)
+                                .desired_width(200.0),
+                        );
+                        ui.checkbox(&mut self.remember_pw, "记住这条口令");
+                        ui.label("系统账户(可选)");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.os_user)
+                                .hint_text("用户名：被控端用「系统账户」认证时填这里")
+                                .desired_width(150.0),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.os_password)
+                                .password(true)
+                                .hint_text("该账户的登录密码")
+                                .desired_width(110.0),
+                        );
+                        if !self.os_user.trim().is_empty() && self.password.trim().is_empty() {
+                            // 这一句是给现场的人看的：填了系统账户就可以不填临时码。
+                            ui.label(egui::RichText::new("只用系统账户认证（临时码可留空）").weak().small());
+                        }
+                    });
+                });
+
+                ui.add_space(6.0);
+                ui.group(|ui| {
+                    ui.label("找到的设备（点一行就填进上面）");
+                    if self.devices.is_empty() {
+                        ui.label("（还没有 —— 点「刷新设备」）");
+                    }
+                    let mut picked: Option<String> = None;
+                    for d in &self.devices {
+                        ui.horizontal(|ui| {
+                            let dot = if d.online { "●" } else { "○" };
+                            let color = if d.online { egui::Color32::from_rgb(60, 200, 120) } else { egui::Color32::GRAY };
+                            ui.colored_label(color, dot);
+                            if ui.selectable_label(false, format!("{}  {}{}", d.id, d.name, if d.last { "  ← 上次" } else { "" })).clicked() {
+                                picked = Some(d.id.clone());
+                            }
+                        });
+                    }
+                    if let Some(id) = picked {
+                        self.device = id;
+                        self.save_cfg();
+                    }
+                });
+
+                ui.add_space(6.0);
+                ui.group(|ui| {
+                    ui.label("会话选项");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.checkbox(&mut self.clipboard, "同步剪贴板");
+                        ui.checkbox(&mut self.audio, "听对面的声音");
+                        ui.checkbox(&mut self.mic, "把本机麦克风送过去");
+                        ui.checkbox(&mut self.capture, "捕获指针（F8 开关）");
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("画质");
+                        ui.radio_value(&mut self.quality, 0, "默认");
+                        ui.radio_value(&mut self.quality, 1, "流畅优先");
+                        ui.radio_value(&mut self.quality, 2, "清晰优先");
+                        ui.separator();
+                        ui.label("帧率");
+                        ui.add(egui::TextEdit::singleline(&mut self.fps).desired_width(50.0));
+                        ui.label("缩放");
+                        ui.add(egui::TextEdit::singleline(&mut self.scale).desired_width(60.0));
+                    });
+                });
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let b1 = ui.add_sized([190.0, 40.0], egui::Button::new(egui::RichText::new("开始远程控制").strong().size(16.0)));
+                    if b1.clicked() {
+                        self.launch(Mode::Desktop);
+                    }
+                    let b2 = ui.add_sized([150.0, 40.0], egui::Button::new("开一个远端终端"));
+                    if b2.clicked() {
+                        self.launch(Mode::Term);
+                    }
+                });
+
+                ui.add_space(8.0);
+                if !self.log.is_empty() {
+                    ui.collapsing("最近的动作", |ui| {
+                        for l in self.log.iter().rev().take(12) {
+                            ui.label(egui::RichText::new(l.clone()).small());
                         }
                     });
                 }
-                if let Some(id) = picked {
-                    self.device = id;
-                    self.save_cfg();
-                }
             });
 
-            ui.add_space(6.0);
-            ui.group(|ui| {
-                ui.label("会话选项");
-                ui.horizontal_wrapped(|ui| {
-                    ui.checkbox(&mut self.clipboard, "同步剪贴板");
-                    ui.checkbox(&mut self.audio, "听对面的声音");
-                    ui.checkbox(&mut self.mic, "把本机麦克风送过去");
-                    ui.checkbox(&mut self.capture, "捕获指针（F8 开关）");
-                });
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("画质");
-                    ui.radio_value(&mut self.quality, 0, "默认");
-                    ui.radio_value(&mut self.quality, 1, "流畅优先");
-                    ui.radio_value(&mut self.quality, 2, "清晰优先");
-                    ui.separator();
-                    ui.label("帧率");
-                    ui.add(egui::TextEdit::singleline(&mut self.fps).desired_width(50.0));
-                    ui.label("缩放");
-                    ui.add(egui::TextEdit::singleline(&mut self.scale).desired_width(60.0));
-                });
-            });
-
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                let b1 = ui.add_sized([190.0, 40.0], egui::Button::new(egui::RichText::new("开始远程控制").strong().size(16.0)));
-                if b1.clicked() {
-                    self.launch(Mode::Desktop);
-                }
-                let b2 = ui.add_sized([150.0, 40.0], egui::Button::new("开一个远端终端"));
-                if b2.clicked() {
-                    self.launch(Mode::Term);
-                }
-            });
-
-            ui.add_space(8.0);
-            if !self.log.is_empty() {
-                ui.collapsing("最近的动作", |ui| {
-                    for l in self.log.iter().rev().take(12) {
-                        ui.label(egui::RichText::new(l.clone()).small());
-                    }
-                });
-            }
         });
     }
 }
