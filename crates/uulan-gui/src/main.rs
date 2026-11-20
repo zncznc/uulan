@@ -698,17 +698,28 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(root, |ui| {
             // 两页：这台机器去连别人 / 别人来连这台机器。UU 也是这么分的。
             ui.horizontal(|ui| {
+                // 切页签**不清 alert**：刷新失败的红字是在这一页发起的，切过去看就该还在
+                // （真机踩过：清了以后状态栏那句「原因见上面那行红字」指向一行不存在的字）。
+                // 提示由「我知道了」显式关掉。
                 if ui.selectable_label(self.tab == 0, "远程控制").clicked() {
                     self.tab = 0;
-                    self.alert.clear();
                 }
                 if ui.selectable_label(self.tab == 1, "本机（被控端）信息").clicked() {
                     self.tab = 1;
-                    self.alert.clear();
                     self.local.reload();
                 }
             });
             ui.separator();
+            // 失败提示**两页都渲染**：刷新是在这一页按的，结果不该因为切了页就不见。
+            if !self.alert.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(egui::Color32::from_rgb(200, 40, 40), &self.alert);
+                    if ui.button("我知道了").clicked() {
+                        self.alert.clear();
+                    }
+                });
+                ui.separator();
+            }
             if self.tab == 1 {
                 // eframe 默认只在有输入时重绘，所以必须显式约醒，否则这一屏永远停在旧值。
                 // 用 repaint_after 而不是 repaint：后者等于连续重绘，空转把 CPU 拉满。
@@ -730,13 +741,6 @@ impl eframe::App for App {
                 return;
             }
 
-            if !self.alert.is_empty() {
-                ui.colored_label(egui::Color32::from_rgb(200, 40, 40), &self.alert);
-                if ui.button("我知道了").clicked() {
-                    self.alert.clear();
-                }
-                ui.separator();
-            }
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     ui.label("中继地址");
