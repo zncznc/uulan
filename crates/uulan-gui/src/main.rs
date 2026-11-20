@@ -760,12 +760,20 @@ impl eframe::App for App {
             ui.separator();
             // 失败提示**两页都渲染**：刷新是在这一页按的，结果不该因为切了页就不见。
             if !self.alert.is_empty() {
-                ui.horizontal_wrapped(|ui| {
-                    ui.colored_label(egui::Color32::from_rgb(200, 40, 40), &self.alert);
-                    if ui.button("我知道了").clicked() {
-                        self.alert.clear();
-                    }
-                });
+                // 提示可能很长（带日志尾部的退出码说明，真机实测 6~8 行）：**给它自己的、
+                // 封顶高度的滚动区**。否则 720x520 的窗口里「开始远程控制」会被顶到窗口外，
+                // 用户连再试一次都点不到 —— 真机上就是一行 panic 尾巴把按钮挤出可视区的。
+                egui::ScrollArea::vertical()
+                    .id_salt("alert-scroll")
+                    .max_height(110.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.colored_label(egui::Color32::from_rgb(200, 40, 40), &self.alert);
+                    });
+                // 「我知道了」留在滚动区外面：关掉提示的办法不能被提示自己挤走。
+                if ui.button("我知道了").clicked() {
+                    self.alert.clear();
+                }
                 ui.separator();
             }
             if self.tab == 1 {
