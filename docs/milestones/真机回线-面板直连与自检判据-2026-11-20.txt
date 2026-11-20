@@ -13,6 +13,15 @@
   `src.old.20261120_220415`。`cargo build --release -p uulan-server -p uulan-host -p uulan-client`
   **46.42 s、零警告、RC=0**；`uulan-gui` 增量 20.34 s。
   正式服务未动（中继=系统单元 active、被控端=用户单元 active，`host.json` 一字未改）。
+  **正式被控端二进制随后换成了 HEAD**（它原来停在 11-19 16:10 的构建，缺 11-20 的
+  「拒绝 OS 模式要说清为什么」与直连收齐窗口两处）：`cp -a` 备份成 `uulan-host.bak-2234` →
+  `cp` 到 `.uulan-host.new` 再 `mv -f`（直接覆盖正在跑的 = ETXTBSY）→ `systemctl --user kill -s KILL`
+  → `MainPID` 变了、`NRestarts=1`、`is-active=active`、`/proc/<pid>/exe` 的 sha256 与
+  `target/release/uulan-host` 一致（`706517db…`）、journal「已用原有设备 ID 上线 device_id=805747189」。
+  换完复跑一次正式会话：295 帧 / 丢帧 0 / 首帧 214 ms / 29.4 fps / 被控端自报 30.00 fps /
+  与当场截图相关 **0.9986** / MAE 0.70% —— 无回归。
+  ⚠ 截图必须**当场**抓：本轮先拿 22:21 的旧截图比 22:35 的会话，相关只有 0.7840（面板被点过、
+  窗口挪了位），重抓后 0.9986。判据的时间基对不上，结论就是错的。
 
 三、真机验收（三条路，全部真链路）
   ① 独立测试台（`/tmp/uulan-auth-test`：独立中继 0.0.0.0:21997 + 独立被控端，`auth_os=false`，
@@ -54,6 +63,9 @@
   · 3 条新单测钉住：每个地址都带端口 / 虚拟网卡不念 / 全虚拟时回退。
   另：面板是从 ssh 会话起的，Glenfly 驱动打了 5 行 `Failed to open device` 后仍正常起窗并渲染
   （截图为准）—— 记为观察，不当缺陷。
+  **修完在真机上复验**（同一台机器、同一块屏，重新构建 gui 后重启面板再截图）：
+  `直连: 192.168.223.15:21117（对方用 --direct 或面板「直连地址」填这个）` ——
+  只剩真实 LAN 地址、端口在，`192.168.231.1` / `172.16.96.1` 不再出现。
 
 六、自检判据自身的 bug（`scripts/verify-diagnose-e2e.sh`）
   真机解锁态跑自检 e2e，**17 条里红 1 条**：`✗ 显示 FAIL 了（）`，而自检原文是
@@ -83,6 +95,8 @@
 
 十、撤法
   · 代码：`git revert` 本提交即可（协议零变化；只动面板文字、一个测试的假执行器、一条脚本正则）。
-  · 真机：源码树 `src.old.20261120_220415` 可回滚；正式服务与 `host.json` 本轮**未改**；
+  · 真机：源码树 `src.old.20261120_220415` 可回滚；`host.json` 本轮**未改**；
+    正式被控端二进制回滚 = `mv -f ~/.local/uulan/bin/uulan-host.bak-2234 ~/.local/uulan/bin/uulan-host`
+    + `systemctl --user kill -s KILL uulan-host`（备份是 11-19 16:10 那份）；
     测试台 `/tmp/uulan-auth-test` 用 `bash ~/auth-testbed.sh down` 收掉（本轮已收）。
   · 面板：本轮把 11-19 的旧面板换成了 HEAD 构建（旧进程已退出），新面板留在桌面上运行。
