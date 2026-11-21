@@ -105,6 +105,9 @@ pub struct App {
     relaunch: Arc<AtomicBool>,
     /// 最近一次启动的子进程：秒退就必须当场说出口（并把它的输出留在盘上）。
     child: Option<(std::process::Child, std::time::Instant, PathBuf)>,
+    /// 这条子进程是「独立终端窗口」还是一条桌面会话。**收尾的话不一样**：终端模式下
+    /// 面板手里的退出码是**终端模拟器**的，不是远端 shell 的，不能混着说。
+    child_term: bool,
     /// 正在跑的「刷新设备」后台任务。**它必须异步**：那是连中继的外部进程，
     /// 连不上时最长等 10 秒 —— UI 线程卡 10 秒，桌面就会判窗口「无响应」，
     /// 而按这个按钮的时刻恰恰是「地址可能还没填对」的时候。
@@ -145,6 +148,7 @@ impl App {
             local_next: std::time::Instant::now(),
             relaunch,
             child: None,
+            child_term: false,
             refresh: None,
         }
     }
@@ -324,7 +328,8 @@ impl App {
         std::thread::spawn(move || {
             let mut cmd = Command::new(&client);
             cmd.args(["--server", &relay, "--devices"]);
-            hide_console(&mut cmd);
+            // 设备清单是纯后台查询：不要控制台壳（与桌面会话同一套标志）。
+            apply_creation_flags(&mut cmd, &Mode::Desktop);
             let done = match cmd.output() {
                 Ok(out) => {
                     let text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -437,15 +442,31 @@ impl App {
         let shown = sanitize(&args);
         // 子进程的输出**必须留盘**：改成 GUI 子系统后它没有控制台，
         // 不接住就永远看不到它为什么没起窗。
+        //
+        // **终端模式例外**（2026-11-22 真机坐实的 bug）：终端要的是一个用户能看见、
+        // 能打字的窗口。把 stdout/stderr 接进日志文件、stdin 还是面板的 `/dev/null`，
+        // 结果就是「点一下 → 远端 shell 连上了 → 输入立刻 EOF → 进程退出」，
+        // 全程一声不响，用户只看到桌面什么都没发生。现在改为：
+        // Windows 让控制端自己开一个新控制台，unix 借系统终端模拟器来跑它。
         let log_path = App::cfg_dir().join("gui-session.log");
         let _ = std::fs::create_dir_all(App::cfg_dir());
-        let out = std::fs::File::create(&log_path);
-        let mut cmd = Command::new(&client);
-        cmd.args(&args);
-        hide_console(&mut cmd);
-        match out {
-            Ok(f) => {
-                match f.try_clone() {
+        let host = match mode {
+            Mode::Desktop => TermHost::Direct,
+            Mode::Term => match pick_term_host(&client, &args) {
+                Ok(h) => h,
+                Err(msg) => {
+                    // 找不到终端模拟器也要说清「手怎么动」，不许静默。
+                    self.alert = msg.clone();
+                    self.push_log(msg);
+                    return;
+                }
+            },
+        };
+        let mut cmd = spawn_command(&client, &args, &host);
+        apply_creation_flags(&mut cmd, &mode);
+        if redirects_stdout(&mode) {
+            match std::fs::File::create(&log_path) {
+                Ok(f) => match f.try_clone() {
                     Ok(f2) => {
                         cmd.stdout(Stdio::from(f2)).stderr(Stdio::from(f));
                     }
@@ -453,11 +474,11 @@ impl App {
                         self.alert = format!("会话日志句柄复制失败（{e}），无法诊断子进程。");
                         return;
                     }
+                },
+                Err(e) => {
+                    self.alert = format!("会话日志建不了（{e}），也就无法诊断子进程为什么不起窗。");
+                    return;
                 }
-            }
-            Err(e) => {
-                self.alert = format!("会话日志建不了（{e}），也就无法诊断子进程为什么不起窗。");
-                return;
             }
         }
         self.alert.clear();
@@ -465,12 +486,28 @@ impl App {
             Ok(child) => {
                 let pid = child.id();
                 self.save_cfg();
+                let program = match &host {
+                    TermHost::Direct => client
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string(),
+                    TermHost::Wrap { program, .. } => format!(
+                        "{} -e {}",
+                        program.file_name().unwrap_or_default().to_string_lossy(),
+                        client.file_name().unwrap_or_default().to_string_lossy()
+                    ),
+                };
                 self.status = format!(
                     "已启动（PID {pid}），窗口应该已经出现。{}  口令走的是文件，没进命令行。",
-                    match mode { Mode::Desktop => "远程控制窗口", Mode::Term => "终端会话" }
+                    match mode {
+                        Mode::Desktop => "远程控制窗口",
+                        Mode::Term => "终端窗口（独立窗口，直接在里面敲命令）",
+                    }
                 );
-                self.push_log(format!("执行：{} {}", client.file_name().unwrap_or_default().to_string_lossy(), shown));
+                self.push_log(format!("执行：{} {}", program, shown));
                 self.child = Some((child, std::time::Instant::now(), log_path));
+                self.child_term = mode == Mode::Term;
             }
             Err(e) => {
                 self.alert = format!("启动失败：{e}\n控制端路径：{}", client.display());
@@ -554,7 +591,7 @@ fn refresh_outcome(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode { Desktop, Term }
 
 /// 解析 `uulan-client --devices` 的文本输出。
@@ -652,15 +689,129 @@ fn load_cfg(p: &Path) -> GuiConfig {
         .unwrap_or_default()
 }
 
+/// 一条会话怎么起：直接跑控制端，还是让终端模拟器去跑它。
+///
+/// 抽成一个枚举（而不是两个分支里各写一遍 `Command`）是为了让「拼出来的命令行」
+/// 能在本机单测里钉住 —— 这一段在现场唯一的表现就是「窗口有没有出现」。
+// Windows 上只用得到 Direct（新控制台就是它的「终端宿主」），Wrap 只在 unix 构造；
+// 但这两个分支的单测必须在开发机（Windows）上跑，所以类型本身保持跨平台，只压死代码警告。
+#[cfg_attr(windows, allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TermHost {
+    /// 直接跑控制端：桌面模式，以及 Windows 上的终端模式（新控制台由它自己开）。
+    Direct,
+    /// 让终端模拟器跑控制端：`<终端> -e <控制端> <参数…>`（unix 终端模式）。
+    Wrap { program: PathBuf, argv: Vec<String> },
+}
+
+/// 桌面模式的输出落盘（GUI 子系统没有控制台）；终端模式**必须留在窗口里**。
+fn redirects_stdout(mode: &Mode) -> bool {
+    matches!(mode, Mode::Desktop)
+}
+
+/// 按宿主形态拼出真正要 spawn 的命令（纯函数：不碰 IO，本机单测能钉住 program/args）。
+fn spawn_command(client: &Path, args: &[String], host: &TermHost) -> Command {
+    match host {
+        TermHost::Direct => {
+            let mut c = Command::new(client);
+            c.args(args);
+            c
+        }
+        TermHost::Wrap { program, argv } => {
+            let mut c = Command::new(program);
+            c.args(argv);
+            c
+        }
+    }
+}
+
 #[cfg(windows)]
-fn hide_console(cmd: &mut Command) {
+fn apply_creation_flags(cmd: &mut Command, mode: &Mode) {
     use std::os::windows::process::CommandExt;
-    // CREATE_NO_WINDOW：控制端的**窗口**照旧显示，只是不要那个黑色控制台壳。
-    cmd.creation_flags(0x0800_0000);
+    cmd.creation_flags(creation_flags_for(mode));
+}
+
+#[cfg(windows)]
+fn creation_flags_for(mode: &Mode) -> u32 {
+    // CREATE_NEW_CONSOLE(0x10)：终端模式必须给用户一个**能看见、能打字**的控制台。
+    // CREATE_NO_WINDOW(0x0800_0000)：桌面模式只要窗口，不要那个黑色控制台壳。
+    // （以前两种模式都套 CREATE_NO_WINDOW，于是「开一个远端终端」在 Windows 上
+    // 同样是个死按钮 —— 结构上跟麒麟那次是同一个错。）
+    match mode {
+        Mode::Desktop => 0x0800_0000,
+        Mode::Term => 0x0000_0010,
+    }
 }
 
 #[cfg(not(windows))]
-fn hide_console(_cmd: &mut Command) {}
+fn apply_creation_flags(_cmd: &mut Command, _mode: &Mode) {}
+
+/// 终端模拟器的候选表，**顺序就是优先级**。麒麟 V10 上 `x-terminal-emulator` 与
+/// `mate-terminal` 实测都在；其余几种是别的发行版的常见项，排后面不吃亏。
+#[cfg(not(windows))]
+const TERM_CANDIDATES: &[&str] = &[
+    "x-terminal-emulator",
+    "ukui-terminal",
+    "mate-terminal",
+    "gnome-terminal",
+    "xfce4-terminal",
+    "konsole",
+    "lxterminal",
+    "xterm",
+];
+
+#[cfg(windows)]
+#[allow(dead_code)]
+const TERM_CANDIDATES: &[&str] = &[];
+
+/// 终端模拟器的调法：`-e` 后面跟完整命令行（x-terminal-emulator / mate-terminal 都认）。
+#[cfg_attr(windows, allow(dead_code))]
+fn term_wrap_argv(client: &Path, args: &[String]) -> Vec<String> {
+    let mut v = vec!["-e".to_string(), client.display().to_string()];
+    v.extend(args.iter().cloned());
+    v
+}
+
+/// 在若干目录里按名字优先级找第一个存在的程序（纯函数，`is_file` 由调用方给：
+/// 本机单测不碰盘，真调用给 `Path::is_file`）。
+#[cfg_attr(windows, allow(dead_code))]
+fn find_program_in(
+    dirs: &[PathBuf],
+    names: &[&str],
+    is_file: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    for n in names {
+        for d in dirs {
+            let p = d.join(n);
+            if is_file(&p) {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// 终端模式的外壳程序：unix 找一个终端模拟器；Windows 不需要（新控制台就够）。
+#[cfg(not(windows))]
+fn pick_term_host(client: &Path, args: &[String]) -> Result<TermHost, String> {
+    let dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    match find_program_in(&dirs, TERM_CANDIDATES, &|p| p.is_file()) {
+        Some(program) => Ok(TermHost::Wrap { program, argv: term_wrap_argv(client, args) }),
+        None => Err(format!(
+            "找不到可用的终端模拟器（试过：{}）。\n可以自己在终端里跑这一行：\n  {} {}",
+            TERM_CANDIDATES.join(" / "),
+            client.display(),
+            args.join(" ")
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn pick_term_host(_client: &Path, _args: &[String]) -> Result<TermHost, String> {
+    Ok(TermHost::Direct)
+}
 
 impl eframe::App for App {
     // eframe 0.37 起 App 交出的是**一棵 Ui 根**而不是 Context（旧写法 `update(ctx, frame)`
@@ -717,16 +868,28 @@ impl eframe::App for App {
                     let raw = std::fs::read_to_string(&lp).unwrap_or_default();
                     let tail: String = raw.lines().rev().take(3).collect::<Vec<_>>().join(" ← ");
                     if secs < 10 {
+                        let what = if self.child_term { "终端窗口" } else { "远程进程" };
+                        // 终端模式没有日志文件（输出留在那个窗口里），别再指向一个
+                        // 上一轮桌面会话留下的旧文件 —— 现场会照着它去读别人的历史。
+                        let where_to_look = if self.child_term {
+                            "（终端模式不落盘：那行原因在终端窗口里）".to_string()
+                        } else {
+                            format!("全文在 {}", lp.display())
+                        };
                         self.alert = format!(
-                            "远程进程 {st} 就退了（不到 10 秒），所以你没看到窗口。\n最后三行输出：{}\n全文在 {}",
+                            "{what} {st} 就退了（不到 10 秒），所以你没看到窗口。\n最后三行输出：{}\n{}",
                             tail.trim().replace('\n', " / "),
-                            lp.display()
+                            where_to_look
                         );
                     } else {
                         // **正常关窗也是「会话结束」**：面板以前只在「不到 10 秒秒退」时说话，
                         // 于是长会话结束时一声不吭 —— 现场分不清「我自己关的」「对面断了」还是「崩溃了」。
                         // 退出码的含义（尤其 4 = 放弃重连）由 session_end_note 负责说人话。
-                        let note = session_end_note(code, secs);
+                        let note = if self.child_term {
+                            term_end_note(code, secs)
+                        } else {
+                            session_end_note(code, secs)
+                        };
                         self.push_log(note.clone());
                         self.status = note.clone();
                         if code.unwrap_or(-1) != 0 {
@@ -946,6 +1109,22 @@ fn session_end_note(code: Option<i32>, secs: u64) -> String {
         Some(3) => format!("远程会话结束：被控端没接受键鼠注入（退出码 3，用时 {d}）"),
         Some(n) => format!("远程会话异常结束（退出码 {n}，用时 {d}）—— 最后三行输出见下方提示"),
         None => format!("远程会话被强制结束（拿不到退出码，用时 {d}）"),
+    }
+}
+
+/// 终端模式的收尾话术。
+///
+/// **退出码的归属必须说清**：unix 上这条进程是终端模拟器，它的退出码不是远端 shell 的；
+/// 远端 shell 的退出码只在那个窗口里看得到。混着说会让现场拿着一个 0 去怀疑「shell 明明
+/// 退 5 了」。
+fn term_end_note(code: Option<i32>, secs: u64) -> String {
+    let d = fmt_dur(secs);
+    match code {
+        Some(0) => format!("远端终端窗口已关闭（用时 {d}）"),
+        Some(n) => format!(
+            "远端终端窗口已关闭（终端程序退出码 {n}，用时 {d}）—— 远端 shell 自己的退出码在那个窗口里"
+        ),
+        None => format!("远端终端窗口已关闭（拿不到终端程序的退出码，用时 {d}）"),
     }
 }
 
@@ -1261,6 +1440,90 @@ mod tests {
         assert!(!a.contains(&"--password-file".to_string()));
         assert_eq!(a[0], "--server");
         assert_eq!(a[1], "10.0.0.9:21116");
+    }
+
+    // ---- 终端模式：窗口到底怎么起（2026-11-22） ----
+
+    #[test]
+    fn terminal_mode_hands_the_client_over_to_a_terminal_emulator() {
+        // 真机 bug 的形态：以前终端模式也把输出接进日志、stdin 是 /dev/null，
+        // 于是远端 shell 一连上就 EOF —— 用户只看到桌面什么都没发生。
+        // 修法就是这行 `-e`：让终端模拟器去跑控制端，输入输出都留在那个窗口里。
+        let args: Vec<String> = ["--server", "192.168.223.15:21116", "--device", "805747189", "--password-file", "/tmp/x.pw", "--term"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let argv = term_wrap_argv(Path::new("/opt/uulan/bin/uulan-client"), &args);
+        assert_eq!(argv[0], "-e", "终端模拟器只认 -e 后面那条完整命令");
+        assert_eq!(argv[1], "/opt/uulan/bin/uulan-client");
+        assert_eq!(&argv[2..], &args[..], "控制端的参数必须原样透传，一个都不许改");
+    }
+
+    #[test]
+    fn terminal_emulator_is_picked_by_candidate_order_then_path_order() {
+        // 名字顺序优先于目录顺序：x-terminal-emulator 在哪个目录里先找到就用它，
+        // 而不是「PATH 里第一个目录里碰巧存在的那个」。
+        let dirs = vec![PathBuf::from("/usr/local/bin"), PathBuf::from("/usr/bin")];
+        let have = ["/usr/local/bin/mate-terminal", "/usr/bin/x-terminal-emulator"];
+        let got = find_program_in(&dirs, &["x-terminal-emulator", "mate-terminal"], &|p| {
+            have.iter().any(|h| Path::new(h) == p)
+        });
+        assert_eq!(got, Some(PathBuf::from("/usr/bin/x-terminal-emulator")));
+
+        // 一个都没有 = None（调用方据此报「找不到终端模拟器」，而不是静默起个死进程）
+        assert_eq!(
+            find_program_in(&dirs, &["x-terminal-emulator", "mate-terminal"], &|_| false),
+            None
+        );
+    }
+
+    #[test]
+    fn wrap_host_runs_the_terminal_as_program_and_the_client_as_argument() {
+        // spawn 出去的到底是哪个程序，是本机唯一能钉住的部分（窗口长什么样钉不住）。
+        let host = TermHost::Wrap {
+            program: PathBuf::from("/usr/bin/mate-terminal"),
+            argv: vec!["-e".into(), "/opt/uulan/bin/uulan-client".into(), "--term".into()],
+        };
+        let cmd = spawn_command(Path::new("/opt/uulan/bin/uulan-client"), &["--term".to_string()], &host);
+        assert_eq!(cmd.get_program(), Path::new("/usr/bin/mate-terminal"));
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
+        assert_eq!(args, vec!["-e", "/opt/uulan/bin/uulan-client", "--term"]);
+    }
+
+    #[test]
+    fn direct_host_runs_the_client_itself() {
+        let cmd = spawn_command(
+            Path::new("C:/uulan/uulan-client.exe"),
+            &["--server".to_string(), "10.0.0.9:21116".into()],
+            &TermHost::Direct,
+        );
+        assert_eq!(cmd.get_program(), Path::new("C:/uulan/uulan-client.exe"));
+        assert_eq!(cmd.get_args().count(), 2);
+    }
+
+    #[test]
+    fn desktop_output_goes_to_the_log_but_a_terminal_keeps_it_in_its_window() {
+        assert!(redirects_stdout(&Mode::Desktop), "桌面模式必须留盘，否则排不了错");
+        assert!(!redirects_stdout(&Mode::Term), "终端模式接走输出 = 窗口里什么都没有");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_terminal_mode_gets_its_own_console() {
+        // CREATE_NO_WINDOW 对终端模式就是「没有控制台可打字」，与麒麟那次同族。
+        assert_eq!(creation_flags_for(&Mode::Desktop), 0x0800_0000);
+        assert_eq!(creation_flags_for(&Mode::Term), 0x0000_0010);
+    }
+
+    #[test]
+    fn terminal_conclusion_says_whose_exit_code_it_is() {
+        // 终端模式的退出码是**终端模拟器**的，不是远端 shell 的 —— 措辞里必须写清，
+        // 否则现场会拿着一个 0 去怀疑「shell 明明退 5 了」。
+        assert_eq!(term_end_note(Some(0), 12), "远端终端窗口已关闭（用时 12 秒）");
+        let n = term_end_note(Some(7), 65);
+        assert!(n.contains("退出码 7") && n.contains("1 分 5 秒"), "{n}");
+        assert!(n.contains("远端 shell 自己的退出码"), "{n}");
+        assert!(term_end_note(None, 3).contains("拿不到"));
     }
 
 }
