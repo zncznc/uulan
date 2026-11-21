@@ -2821,6 +2821,9 @@ DESIGN 一直写着「控制端同时支持麒麟和 Windows」，但 `uulan-gui
 - 真机复验：`mate-terminal -x … --term` 窗口里 `echo UULAN-GUI-TERM-OK; id -un; date` 打出
   `UULAN-GUI-TERM-OK` / `mis` / `2026年 11月 22日 星期日 01:14:47 CST`，`exit 5` 后面板记
   「远端终端窗口已关闭（终端程序退出码 255，用时 33 秒）—— 远端 shell 自己的退出码在那个窗口里」。
+- 这条验收已固化成 `scripts/verify-gui-term-e2e.sh`（真机跑，无参数）：11 条断言、两轮
+  **11/0/0**。判据不靠 OCR —— 在终端窗口里让远端 shell 写一个文件，再读回来；另外它把
+  「不到 10 秒秒退只弹红字不写动作日志」「红字会把按钮行顶下去」这些台架坑都写在注释里。
 - 本机 `cargo test --workspace` **608 passed / 0 failed / 1 ignored（零警告）**，
   `cargo test -p uulan-gui` 24 → 31。数字与撤法见
   `docs/milestones/麒麟面板驱动会话与终端窗口修复-真机-2026-11-22.txt`。
