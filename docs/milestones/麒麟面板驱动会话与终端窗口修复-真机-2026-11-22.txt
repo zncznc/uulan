@@ -1,0 +1,110 @@
+麒麟控制端面板：真的驱动一条会话 + 「开一个远端终端」死按钮修复 · 真机 · 2026-11-22 01:00 班
+==========================================================================================
+
+一、这一格补的是什么
+  DESIGN 一直写着「控制端同时支持麒麟和 Windows」，但面板（uulan-gui）在麒麟上只验到
+  「窗口能起来、本机信息页排版正确」（11-20 / 11-21）。**控制端那一页（第一个标签页）
+  从来没在麒麟上真正驱动过一条会话**，所以下面三件事都是空白：
+    ① 面板拼出的 argv 在麒麟上跑真控制端，能不能出画面；
+    ② 「开一个远端终端」在麒麟上是什么行为；
+    ③ 会话收尾时面板的结论（退出码 / 用时）在麒麟上对不对。
+  本轮把三格都做了，并且第 ② 格一验就是**真产品 bug**（见第三节）。
+
+二、麒麟上从面板到画面（实测数字）
+  · 面板：HEAD 构建，sha256 `55784f69…`，1100x780 窗口；麒麟 V10 SP1 / :0 / 1920x1080。
+  · 点「开始远程控制」→ 子进程 argv（`pgrep -a` 原样）：
+      uulan-client --server 192.168.223.15:21116 --device 805747189
+                    --password-file /home/mis/.config/uulan/gui-current.pw
+    口令不在 argv 里；口令文件 `-rw-------`（0600）。
+  · 会话统计（面板把子进程输出收到 `~/.config/uulan/gui-session.log`）：
+      收到 AU 499 / 关键帧 34 / 解出帧 497 / 丢帧 0 / 首帧 246 ms / 被控端实测 30 fps
+      （另一轮 599 / 40 / 597 / 0 / 269 ms）
+  · 窗口标题（截图逐字）：`uulan · 麒麟真机(linux) · 1920x1080 · 画面 1280x720 · 30 fps ·
+      5620 kbps · 首帧 246ms · 被控端 CPU 18% · 内存 3.0/31.3 GB · 延迟 2.2ms`
+  · 画面是真的：截图里是**递归镜像**（远程窗口里又出现远程窗口），不是占位图/黑屏。
+  · 收尾：`wmctrl -ic`（= 用户点标题栏 × 的 WM_DELETE_WINDOW）→ 进程退出 0，
+    面板记 `远程会话已结束（正常收工，用时 16 秒）`，`gui-actions.log` 可 grep。
+  · 顺带验：`刷新设备` 在麒麟上后台线程可用 —— 2 秒回来「中继 …：2 台设备（在线 1）」，
+    列表两行（`115509598 ZNC-7G4D 离线`、`805747189 麒麟真机 ← 上次`）。
+  · 「本机（被控端）信息」页在同一构建上正常显示：设备 ID 805747189 / 名称 麒麟真机 /
+    认证方式 系统账户 / 直连 192.168.223.15:21117 / 可用系统账户 mis。
+
+二·补、直连模式（不经中继）也从面板点通了
+  同一构建，把表单的「直连地址」填 `192.168.223.15:21117`（中继地址留空）→ 子进程 argv 是
+    `uulan-client --direct 192.168.223.15:21117 --password-file …/gui-current.pw`
+  （**只发 --direct，没有 --server/--device**，与 `route_args` 的互斥纪律一致）→ 会话
+  **收到 AU 438 / 关键帧 30 / 解出帧 437 / 丢帧 0 / 首帧 276 ms**，窗口标题
+  `uulan · 麒麟真机(linux) · 1920x1080 · 画面 1280x720 · 30 fps · 7880 kbps · 首帧 276ms …`；
+  关窗后 `远程会话已结束（正常收工，用时 14 秒）`。
+  说明：直连这条路本身 11-19/11-20 已在命令行上验过（见「直连模式」一节），
+  本轮补的是**从面板点下去**这一下（表单 → 互斥 argv → 真会话）。
+
+三、「开一个远端终端」是个死按钮（真产品 bug，两端同族）
+  症状：点一下，桌面什么都没发生。`gui-actions.log` 只有一行「执行：uulan-client … --term」，
+  `gui-session.log` 里留下 `mis@mis-pc:~$ ` 就再没有下文。
+  原因（终端模式和桌面模式走了同一条 spawn）：
+    · stdout/stderr 被接进 `gui-session.log`（GUI 子系统没有控制台，桌面模式需要它排错）；
+    · stdin 继承面板的 `/dev/null`（面板是 `setsid nohup … < /dev/null` 起的）；
+    · Windows 上还套了 `CREATE_NO_WINDOW`。
+  于是远端 shell 一拿到提示符，stdin 立刻 EOF → 控制端按「本机 stdin 结束」的既有纪律
+  发 EOT 收尾 → 进程秒退。**用户侧只看到什么都没发生**，日志里那句提示符是唯一痕迹。
+  修法（`crates/uulan-gui`，协议零变化）：
+    · unix：按候选表在 PATH 里找终端模拟器
+      （`x-terminal-emulator` / `ukui-terminal` / `mate-terminal` / `gnome-terminal` /
+      `xfce4-terminal` / `konsole` / `lxterminal` / `xterm`），用
+      `<终端> -e <控制端> <参数…>` 起它，输入输出都留在那个窗口里；
+      一个都没有 → 红字写清「试过哪些」+ 可照抄的手工命令，不静默。
+    · Windows：终端模式改用 `CREATE_NEW_CONSOLE`（桌面模式仍 `CREATE_NO_WINDOW`），
+      并且**不再重定向**子进程输出 —— 没有控制台可打字的终端等于没有终端。
+    · 收尾话术分家：终端模式下面板手里是**终端模拟器**的退出码，不是远端 shell 的
+      （`term_end_note`）；不到 10 秒秒退时不再指向上一轮桌面会话的旧日志。
+  真机复验（麒麟）：点按钮 →
+    `mate-terminal -x /home/mis/.local/uulan/bin/uulan-client … --term`（`pgrep -a` 原样）
+    → 终端窗口 652x440，标题 `mis@mis-pc: ~`；
+    `xdotool type 'echo UULAN-GUI-TERM-OK; id -un; date'` +
+    `xdotool key Return` → 窗口里出现
+      `UULAN-GUI-TERM-OK`
+      `mis`
+      `2026年 11月 22日 星期日 01:14:47 CST`
+    → `exit 5` 后窗口关闭，面板记
+      `远端终端窗口已关闭（终端程序退出码 255，用时 33 秒）—— 远端 shell 自己的退出码在那个窗口里`。
+    注意这个 255：mate-terminal 把子进程的非零退出压成 255，所以**面板拿到的退出码与
+    远端 shell 的退出码无关** —— 这正是收尾措辞必须写清归属的原因。
+
+四、本机数字
+  · 开工基线（本轮第一次 `cargo test --workspace`）= **601 passed / 0 failed / 1 ignored**（零警告）。
+  · 收工 `cargo test --workspace` = **608 passed / 0 failed / 1 ignored（零警告）**，
+    `cargo build --release` 零警告、RC=0。
+  · `cargo test -p uulan-gui` 24 → **31**（+7：`-e` 形状与参数原样透传、候选顺序先名字后目录、
+    `spawn_command` 的 program/args、桌面落盘 vs 终端不落盘、Windows 两套创建标志、
+    终端收尾措辞、以及 `Wrap` 宿主的拼装）。
+  · 真机 `cargo build --release -p uulan-gui -p uulan-client`：51~62 s、零警告、RC=0。
+
+五、机器状态与撤法
+  · 面板：`~/.local/uulan/bin/uulan-gui` 换成 HEAD 构建（sha `55784f69…`）；
+    备份 `uulan-gui.bak-0113` / `uulan-gui.bak-0114`（本轮两次装）；
+    撤法 = 停面板（按 PID kill）→ `cp` 备份回 `uulan-gui` → 重新 `setsid nohup … &`。
+  · 控制端二进制同步刷成 HEAD 构建（`uulan-client.bak-0103` 是旧的）。
+  · `~/.config/uulan/gui.json`：验收期间预填过「中继 + 设备 ID + 记住口令」，
+    收尾已还原成干净默认（relay 空 / device 空 / remember_pw=false / 无 password），
+    并用新构建重启面板截图确认（设备 ID 空、状态栏「就绪。填中继地址，点「刷新设备」。」）。
+    还原前的备份 `gui.json.bak-1104`（本轮开始时创建）。
+  · 正式单元**没动**：`uulan-host` MainPID 1708226 / sha `91ccb995…`（与 11-21 22:00 班一致），
+    中继系统单元 active、用户单元 inactive。
+  · 源码：真机 `~/.local/uulan/src` 换成 HEAD（`src.old.20261122_010236` 与
+    `src.old.20261122_011246` 两次留底），target 缓存保留。
+  · 没有留下任何口令文件：验收脚本里的口令只在远端进程内从 `host.json` 读，未上屏、未回传。
+
+六、仍未验
+  · **Windows 的终端窗口本身**：`CREATE_NEW_CONSOLE` 这条路只有单测钉住标志值；
+    夜批会话没有可用前台桌面，看不到、也点不了那个控制台窗口 —— 未验，别写成已验。
+  · 面板在麒麟上的**系统账户（PAM）认证**这条路没从面板上点过（argv 拼装与 `--print-args`
+    已验；直连模式本轮已点通，见第二·补节；OS 模式要点就得改正式被控端的 `auth_os` 配置，
+    属于会动生产状态的改动，留到有人的时候做）。
+  · 三台及以上并发、两条终端 / 两条端口映射这类同种工具并发：与 11-21 22:00 班留的一样，未做。
+
+七、下一步（建议）
+  1. 有人在 Windows 桌面前时，确认终端模式真的弹出可打字的控制台（一条命令即可，
+     也可以顺手看 `gui-session.log` 是否为空 —— 空了才对）。
+  2. 面板上的直连模式 + OS 模式各点一次真会话（argv 已验，差的是"点下去"这一下）。
+  3. 同种工具并发（两条终端 / 两条端口映射）—— 台架已有，加两条会话即可。
