@@ -46,6 +46,10 @@ use uulan_protocol::msg::{C2H, PortMapOp, H2C};
 /// 一次转发请求的读缓冲区。32 KiB 是「系统调用次数」与「单帧延迟」的折中。
 const BUF: usize = 32 * 1024;
 
+/// 下行队列深度（帧，每帧 ≤ 64 KiB）。本地应用读得慢时先攒在这里，
+/// 攒满就暂停收 bulk 帧（反压回被控端），而不是把读循环堵死。
+const DOWN_QUEUE: usize = 16;
+
 /// 等被控端回 `PortMapOk/Err` 的超时。被控端自己连目标最多等 5 秒，
 /// 这里留一倍余量：真的连不上时用户要尽快看到失败，而不是界面上一直转。
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -382,13 +386,34 @@ fn resolve(
 
 /// 本机 socket ↔ bulk 流 的对拷（与控制端相反的视角，规则一致）：
 /// 本地读到 EOF 就发 `END`；收到 `END` 就 `shutdown()` 本地写半边；两边都结束才退出。
-async fn bridge(id: u32, mut s: Stream, mut tcp: TcpStream, st: Arc<Counters>) {
+async fn bridge(id: u32, mut s: Stream, tcp: TcpStream, st: Arc<Counters>) {
+    let (mut rd, mut wr) = tokio::io::split(tcp);
+    let (dtx, mut drx) = mpsc::channel::<bytes::Bytes>(DOWN_QUEUE);
+    // 写本机连接的是**独立任务**：以前 `tcp.write_all(...).await` 写在 select 分支体里，
+    // 一旦本地应用「只发不收」（上传大文件、HTTP POST 这类太常见了），写就挡住整个循环，
+    // 连它发过来的数据也不再读 —— 全双工变成半双工，两端一起卡死；会话结束时
+    // 队列里的下行字节被直接丢掉（对端只看到 RST）。2026-11-21 真机台架抓到。
+    let down_st = st.clone();
+    let writer = tokio::spawn(async move {
+        while let Some(b) = drx.recv().await {
+            down_st.down.fetch_add(b.len() as u64, Ordering::Relaxed);
+            if wr.write_all(&b).await.is_err() {
+                break;
+            }
+        }
+        let _ = wr.shutdown().await;
+    });
+
     let mut buf = vec![0u8; BUF];
     let mut local_done = false;
     let mut remote_done = false;
+    let mut pending: Option<bytes::Bytes> = None;
     loop {
+        if local_done && remote_done && pending.is_none() {
+            break;
+        }
         tokio::select! {
-            n = tcp.read(&mut buf), if !local_done => match n {
+            n = rd.read(&mut buf), if !local_done => match n {
                 Ok(0) => {
                     local_done = true;
                     if s.send_end().await.is_err() { break }
@@ -400,33 +425,29 @@ async fn bridge(id: u32, mut s: Stream, mut tcp: TcpStream, st: Arc<Counters>) {
                 Err(e) => {
                     debug!(id, error = %e, "本机连接读失败，转发收尾");
                     let _ = s.send_end().await;
-                    break;
+                    local_done = true;
                 }
             },
-            f = s.recv(), if !remote_done => match f {
+            f = s.recv(), if !remote_done && pending.is_none() => match f {
                 Some(f) => match f.kind {
-                    BulkKind::Data => {
-                        st.down.fetch_add(f.data.len() as u64, Ordering::Relaxed);
-                        if tcp.write_all(&f.data).await.is_err() {
-                            debug!(id, "写本机连接失败，转发收尾");
-                            break;
-                        }
-                    }
-                    BulkKind::End => {
-                        remote_done = true;
-                        let _ = tcp.shutdown().await;
-                    }
+                    BulkKind::Data => { pending = Some(f.data); }
+                    BulkKind::End => { remote_done = true; }
                 },
                 None => break,
             },
-            else => break,
-        }
-        if local_done && remote_done {
-            break;
+            p = dtx.reserve(), if pending.is_some() => match p {
+                Ok(permit) => {
+                    if let Some(b) = pending.take() { permit.send(b); }
+                }
+                Err(_) => break,
+            },
         }
     }
+    drop(dtx);          // 写任务把队列里的字节写完，再关本地写半边
+    let _ = writer.await;
     debug!(id, "一条转发结束");
 }
+
 
 #[cfg(test)]
 mod tests {

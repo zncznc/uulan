@@ -21,11 +21,13 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -35,6 +37,10 @@ use uulan_protocol::bulk::BulkKind;
 /// 单次转发读缓冲区。和 bulk 的 `CHUNK`（64 KiB）不必一致：这里只决定
 /// 「一次 read 最多搬多少字节」，多出来的会被拆成多个 bulk 帧。
 const BUF: usize = 32 * 1024;
+
+/// 「控制端 → 目标」方向的排队深度（帧）。目标读得慢时先攒在这里，攒满就暂停收
+/// bulk 帧（反压回控制端），而不是把整条映射的读循环堵死。
+const DOWN_HIGH: usize = 16;
 
 /// 解析目标域名 / 建立 TCP 连接的超时。远控里用户点一下就要有反应，
 /// 宁可报「连不上」也不要让界面上转圈几十秒。
@@ -273,34 +279,46 @@ impl PortMap {
 /// 收尾规则（两端对称）：本地方向读到 EOF 就发 `END`；收到对端 `END` 就 `shutdown()`
 /// 本地的写半边。两边的 END 都到了才退出 —— 只关一半的话，
 /// 「对面还在发数据、我已经不听了」会把数据丢掉（SSH 里的交互式会话尤其明显）。
-async fn bridge(id: u32, mut s: Stream, mut tcp: TcpStream, target: String) {
+async fn bridge(id: u32, mut s: Stream, tcp: TcpStream, target: String) {
+    let (mut rd, mut wr) = tokio::io::split(tcp);
+    let (dtx, mut drx) = mpsc::channel::<bytes::Bytes>(DOWN_HIGH);
+    let down = Arc::new(AtomicU64::new(0));
+    // 写目标的是**独立任务**，理由同控制端 forward::bridge：把 `write_all` 放在
+    // select 分支体里会让「目标只收不发」变成整条映射的死锁，收尾时队列里的字节被丢掉。
+    let w_target = target.clone();
+    let w_down = down.clone();
+    let writer = tokio::spawn(async move {
+        while let Some(b) = drx.recv().await {
+            w_down.fetch_add(b.len() as u64, Ordering::Relaxed);
+            if wr.write_all(&b).await.is_err() {
+                debug!(id, target = %w_target, "写目标失败，映射收尾");
+                break;
+            }
+        }
+        let _ = wr.shutdown().await;
+    });
+
     let mut buf = vec![0u8; BUF];
     let mut to_target_sent_end = false; // 目标方向的 END 已经发过
     let mut from_target_closed = false; // 收到了控制端的 END
-    let (mut up, mut down) = (0u64, 0u64);
+    let mut up = 0u64;
+    let mut pending: Option<bytes::Bytes> = None;
 
     loop {
+        if to_target_sent_end && from_target_closed && pending.is_none() {
+            break;
+        }
         tokio::select! {
             // 控制端 → 目标
-            f = s.recv(), if !from_target_closed => match f {
+            f = s.recv(), if !from_target_closed && pending.is_none() => match f {
                 Some(f) => match f.kind {
-                    BulkKind::Data => {
-                        if tcp.write_all(&f.data).await.is_err() {
-                            debug!(id, target = %target, "写目标失败，映射收尾");
-                            break;
-                        }
-                        down += f.data.len() as u64;
-                    }
-                    BulkKind::End => {
-                        from_target_closed = true;
-                        // 半关闭：让目标看到 EOF，但它还能继续往回发。
-                        let _ = tcp.shutdown().await;
-                    }
+                    BulkKind::Data => { pending = Some(f.data); }
+                    BulkKind::End => { from_target_closed = true; }
                 },
                 None => break, // bulk 流没了（连接断了 / 会话收尾）
             },
             // 目标 → 控制端
-            n = tcp.read(&mut buf), if !to_target_sent_end => match n {
+            n = rd.read(&mut buf), if !to_target_sent_end => match n {
                 Ok(0) => {
                     to_target_sent_end = true;
                     if s.send_end().await.is_err() { break }
@@ -312,17 +330,22 @@ async fn bridge(id: u32, mut s: Stream, mut tcp: TcpStream, target: String) {
                 Err(e) => {
                     debug!(id, target = %target, error = %e, "读目标失败，映射收尾");
                     let _ = s.send_end().await;
-                    break;
+                    to_target_sent_end = true;
                 }
             },
-            else => break,
-        }
-        if to_target_sent_end && from_target_closed {
-            break;
+            p = dtx.reserve(), if pending.is_some() => match p {
+                Ok(permit) => {
+                    if let Some(b) = pending.take() { permit.send(b); }
+                }
+                Err(_) => break,
+            },
         }
     }
-    info!(id, target = %target, up, down, "端口映射结束");
+    drop(dtx);
+    let _ = writer.await;
+    info!(id, target = %target, up, down = down.load(Ordering::Relaxed), "端口映射结束");
 }
+
 
 #[cfg(test)]
 mod tests {

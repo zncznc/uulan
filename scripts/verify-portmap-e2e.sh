@@ -174,6 +174,37 @@ check $R3 "第 2 条并发流回显一致（192 KiB）"
 sed 's/^/    /' "$WORK/probe2.log"
 sed 's/^/    /' "$WORK/probe3.log"
 
+echo "──────── ④b 只发不收：4 MiB 写完再读（全双工不许被下行写堵死）────────"
+# 2026-11-21 真机台架抓到的真产品 bug：桥接循环里 `tcp.write_all(...).await` 写在 select
+# 分支体里，本地应用「只发不收」时写会挡住整个循环 —— 连它发来的字节也不再读，
+# 上行停在一帧，收尾时下行队列被丢掉（对端只看到 RST）。这里用最小形态钉住它。
+if python - "$LOCAL_PORT" >"$WORK/probe4.log" 2>&1 <<'PYEOF'
+import hashlib, socket, sys, time
+port = int(sys.argv[1])
+chunk = bytes(range(256)) * 4096          # 1 MiB
+h = hashlib.sha256()
+s = socket.create_connection(("127.0.0.1", port), timeout=60)
+for _ in range(4):                        # 4 MiB，全程不读
+    s.sendall(chunk)
+    h.update(chunk)
+    time.sleep(0.5)
+s.shutdown(socket.SHUT_WR)
+back = b""
+while True:
+    d = s.recv(65536)
+    if not d:
+        break
+    back += d
+print("sent", 4 * len(chunk), "got", len(back))
+sys.exit(0 if len(back) == 4 * len(chunk) and hashlib.sha256(back).hexdigest() == h.hexdigest() else 1)
+PYEOF
+then
+  check 0 "只发不收 4 MiB 也能完整回显（写不再堵死读循环）"
+else
+  check 1 "只发不收 4 MiB 回显不完整（见 probe4.log）"
+fi
+sed 's/^/    /' "$WORK/probe4.log"
+
 echo "──────── ⑤ 等控制端收尾并核对统计 ────────"
 for _ in $(seq 1 400); do
   grep -q "端口映射结束" "$WORK/client.log" 2>/dev/null && break
@@ -192,7 +223,7 @@ strip "$WORK/host.log" | grep -E " ERROR |panic" | head -5 | sed 's/^/    /'
 strip "$WORK/client.log" | grep -E " ERROR |panic|panic" | head -5 | sed 's/^/    /'
 
 if [ "$FAIL" = 0 ]; then
-  echo "OK：端口映射全链路通过（$BYTES 字节单流 + 两条并发流，回显逐字节一致）"
+  echo "OK：端口映射全链路通过（$BYTES 字节单流 + 两条并发流 + 只发不收 4 MiB，回显逐字节一致）"
   exit 0
 else
   echo "FAIL：见上面的 ✗ 行"
