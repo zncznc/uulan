@@ -70,6 +70,9 @@ restore() {
   if [ -n "${BK:-}" ] && [ -f "$BK" ]; then cp -a "$BK" "$CFG/gui.json"; fi
   # 备份用完就删：每跑一轮留一个 gui.json.bak-<RID> 会在配置目录里越堆越多。
   [ -n "${BK:-}" ] && python3 -c "import os,sys; p=sys.argv[1]; os.remove(p) if os.path.exists(p) else None" "$BK" 2>/dev/null
+  # 面板按设计会把口令写进 gui-current.pw（0600）。台架预置的是生产口令，收尾一并删掉：
+  # gui.json 已还原成不含口令的默认，面板下次真要口令时会自己重写。
+  python3 -c "import os;p=os.path.expanduser('~/.config/uulan/gui-current.pw');os.remove(p) if os.path.exists(p) else None" 2>/dev/null
   setsid nohup "$GUI" >/tmp/uulan-gui-after-$RID.log 2>&1 < /dev/null &
   rm -f "$MARK" 2>/dev/null
 }
