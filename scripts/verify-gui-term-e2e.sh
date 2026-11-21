@@ -68,6 +68,8 @@ restore() {
   for p in $(pgrep -x uulan-gui); do kill "$p" 2>/dev/null; done
   sleep 1
   if [ -n "${BK:-}" ] && [ -f "$BK" ]; then cp -a "$BK" "$CFG/gui.json"; fi
+  # 备份用完就删：每跑一轮留一个 gui.json.bak-<RID> 会在配置目录里越堆越多。
+  [ -n "${BK:-}" ] && python3 -c "import os,sys; p=sys.argv[1]; os.remove(p) if os.path.exists(p) else None" "$BK" 2>/dev/null
   setsid nohup "$GUI" >/tmp/uulan-gui-after-$RID.log 2>&1 < /dev/null &
   rm -f "$MARK" 2>/dev/null
 }
