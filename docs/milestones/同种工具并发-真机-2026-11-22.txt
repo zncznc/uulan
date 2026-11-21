@@ -55,8 +55,9 @@
   · 真机源码换成 HEAD（保留 target）：`~/.local/uulan/src.old.20261122_050314` 是换前的留底，
     撤法 = `mv src src.bak && mv src.old.20261122_050314 src`（target 缓存要一起搬回）。
     本轮编译产物：server `bdf581db…` / host `91ccb995…` / client `e6660ca1…`（46.6 s 零警告）。
-  · 台架只写 `/tmp/uulan-sk.<RID>`（含 host.json / 口令文件，0600），收尾按 RID 清理；
-    本机证据在 `D:/uulan-bin/sk.<RID>`，收尾删掉 pw 文件。
+  · 台架只写 `/tmp/uulan-sk.<RID>`；收尾**删掉 `pw` 与 `host.json`**（口令副本不在 /tmp 过夜），
+    本机证据在 `D:/uulan-bin/sk.<RID>`，收尾删掉 pw 文件；班末按口令 sha256 前 8 位复扫
+    D:/uulan-bin、scratch、Temp 一遍，**命中 0**（顺带清掉两个历史班遗留的 Temp 口令文件）。
   · 顺带清掉 11-21 22:00 班遗留的三个测试中继（:21990/:21991/:21992，6 小时没人收）。
   · 没有留下任何口令文件：口令只在远端进程内从 host.json 读，未上屏、未回传。
 

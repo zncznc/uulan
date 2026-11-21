@@ -129,6 +129,14 @@ if [ -f "$W/port" ]; then
   for pid in $(pgrep -f "uulan-server --bind 0.0.0.0:$P" 2>/dev/null); do kill "$pid" 2>/dev/null; done
 fi
 for pid in $(pgrep -f "uulan-client.*$RID" 2>/dev/null); do kill "$pid" 2>/dev/null; done
+# 口令落盘纪律：台架目录里的 pw / host.json 收尾就删，别在 /tmp 留现网口令副本
+python3 - "$W" <<'PY'
+import os, sys
+w = sys.argv[1]
+for n in ("pw", "host.json", "pw.raw"):
+    try: os.remove(os.path.join(w, n))
+    except OSError: pass
+PY
 python3 - "$RID" <<'PY'
 import glob, os, sys
 for p in glob.glob("/tmp/sk-%s-*" % sys.argv[1]):
