@@ -1,0 +1,63 @@
+bulk 按流滑动窗口（M8）— 真机验收
+2026-11-22 22:00 夜批（真麒麟 192.168.223.15 / mis@mis-pc，X11 1920x1080）
+
+一、这一轮修的是上一班量出来的真缺陷
+  2026-11-22 05:00 班的同种并发台架量到：A 流灌满后停读 10 s，同会话另一条
+  1 MiB 往返从 ~100 ms 被拖到 6892 ms。原因是 bulk 读任务单线程分派 + 每流 8 帧
+  队列 —— 一条流卡住，整条连接上所有流一起停。
+
+二、做法（协议 + 两端 + 两条桥）
+  · protocol：`BulkKind::Credit`（FLAG_CREDIT=0x02，无载荷）；`ClientHello` /
+    `HostHelloOk` 各加 `bulk_window: bool`（`#[serde(default)]`），**双方都声明才启用**。
+  · uulan-bulk：接收方每消费一帧回一条信用（窗口 +1），发送方窗口用完等信用；
+    读任务先 `try_send`，满了才退回老的阻塞式分派（不丢数据）；
+    新增 `Stream::split()`（发/收两半共享一个 Core，注销仍在 Drop）；
+    连接断/收尾时 `Semaphore::close()` → 卡在窗口上的发送立刻返回 BrokenPipe。
+  · 两条端口映射桥（控制端 forward / 被控端 portmap）改成「一个方向一个任务」：
+    上行 = 本机 socket 读 + 等窗口发送；下行 = bulk 读 + 有界队列 + 独立写任务。
+    `send_data` 会等信用，绝不能留在 `select!` 分支体里（11-21「只发不收死锁」同族）。
+  · 文件传输仍走 `register_unwindowed`：控制端 `fsx` 是独占整条连接直写、不读信用，
+    给它开窗口就是两端互相等死。窗口是**逐流**由接收方注册时决定的。
+
+三、本机数字
+  · `cargo test --workspace` = **616 passed / 0 failed / 1 ignored（零警告）**
+    （开工基线 608；新增 8 条：protocol 2 + bulk 6）
+  · `cargo build --release` 零警告、RC=0
+  · `verify-portmap-e2e.sh` RC=0：262144 单流 + 两条并发流（131072 / 196608）+
+    **只发不收 4 MiB** 全部逐字节一致，收尾统计「连接 4 / 上行 4784128 / 下行 4784128」
+  · `verify-files-e2e.sh` RC=0：6 MiB 往返 sha256 一致（fs 走的是新加的「不开窗口」路径）
+
+四、真机数字
+  · 台架 `verify-samekind-concurrency-e2e.sh`（Windows 控制端 HEAD + 真机 HEAD 构建）
+    **22 通过 / 0 失败 / 0 跳过 × 两轮**（改前 21/0/1，那 1 条是「停读拖住别的流」的观察项）
+    - A 段 6 条全双工流 sha256 全一致（并发窗口 636 ms / 4740096 字节每方向）
+    - B 段两条终端区间重叠 7.0 s、互不串；C 段坏目标 18 ms 关连接
+    - **D 段从观察项翻成硬判据**：A 停读 10 s 期间 B 的 1 MiB 往返
+      **19 ms / 30 ms**（改前 6892 ms，快 230~360 倍）；A 恢复后自己那 4 MiB
+      回读只花 27 ms / 26 ms（数据一帧没丢）
+  · 真机 host.log 同一轮里两种口径都出现，正是兼容性的现场证据：
+    `window=Some(16)`（新 Windows 控制端）与 `window=None`（11-22 真机自编的旧控制端）
+  · 现网回归（新控制端连**旧**生产被控端，验兼容不回归）：355 帧 / 29.6 fps /
+    首帧 220 ms / corr **0.9985** / MAE 0.69%
+  · 正式被控端换 HEAD：sha `91ccb995…` → `12c3f2e1…`，MainPID 1708226 → 1904318，
+    NRestarts 3→4，设备 ID 805747189 不变；换后回归 355 帧 / 29.6 fps / 首帧 230 ms /
+    corr **0.9985** / MAE 0.69%，journal 里 `bulk 多路复用（按流窗口） window=Some(16)`
+  · 现网文件传输（新 host 的 fs 流）：2 MiB `--put` + `--get`，本机原文件 / 真机文件 /
+    回传文件 sha256 三处一致（6e79953f2902）
+
+五、机器状态与撤法
+  · 正式被控端二进制：`~/.local/uulan/bin/uulan-host`（HEAD 构建 12c3f2e1），
+    备份 `uulan-host.bak-20261122_225904`；撤法 = `cp -a` 备份回同名 + 
+    `systemctl --user kill -s KILL uulan-host`
+  · 真机源码换成 HEAD（保留 target）：`~/.local/uulan/src.old.20261122_225111`；
+    撤法 = 把 src 挪走、把这个目录改回 src（target 缓存一起）
+  · 中继**没动**（PROTO_VERSION 仍是 4，中继只比对版本号、内容字节盲转发）
+  · 台架物料已清：真机 /tmp/uulan-sk.* 三轮目录、reg.*.ppm、~/uulan-fsreg.bin；
+    本机按口令 sha256 前 8 位扫 D:/uulan-bin、scratch、Temp —— 删掉本轮自造的 3 个
+    `pw` 文件后**命中 0**
+
+六、仍未验 / 下一步
+  · 三台及以上控制端并发、跨会话两条端口映射同时打同一目标、多信宿的音频争用。
+  · 面板的 Windows 终端窗口（`CREATE_NEW_CONSOLE`）与面板上的 PAM 真会话 —— 要人到机器跟前。
+  · 窗口大小 16 帧是常数（`uulan_bulk::STREAM_WINDOW`），跨广域网的吞吐没有量过；
+    内网 RTT < 1 ms 时 1 MiB 在途足够。
