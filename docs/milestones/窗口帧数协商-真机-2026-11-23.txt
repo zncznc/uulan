@@ -1,0 +1,92 @@
+窗口帧数协商（M8 第二轮）· 真机验收
+2026-11-23 05:00 夜批（开发机 Windows + 真麒麟 192.168.223.15）
+
+一、为什么改
+────────────
+2026-11-23 01:00 班把「窗口 16 帧 = 1 MiB 在途」在广域网上的代价量成了数：
+`scripts/verify-bulk-window-wan-e2e.sh` 11/0/0，RTT 100 ms 时 1 MiB 往返 558 ms、
+50 ms 档 377 ms，而同档**裸代理地板**只要 232 / 144 ms —— 多出来的那截就是「窗口 16 帧换一次信用」，
+吞吐封顶 ≈ 窗口/RTT。DESIGN 的同节已写明修法：把窗口帧数变成**握手协商值（新字段 + 两端取 min），改常数不算**。
+本轮兑现这一条。
+
+二、改了什么（协议向后兼容，PROTO_VERSION 仍 4，中继零改动）
+────────────
+1. `crates/uulan-protocol/src/msg.rs`
+   - `ClientHello.bulk_window_frames: u16`、`HostHelloOk.bulk_window_frames: u16`，
+     都是 `#[serde(default)]`，0 = 没声明（老端 / 只想用默认值）。
+2. `crates/uulan-bulk/src/lib.rs`
+   - `WINDOW_MIN = 1`、`WINDOW_MAX = 96`（96 × 64 KiB = 6 MiB 在途/流，上限由内存账决定）。
+   - `negotiate_window(client: (bool, u16), host: (bool, u16)) -> Option<usize>`：
+     双方都声明 `bulk_window` 才谈得上；帧数取**较小值**（发送方在途上限必须 ≤ 接收方能缓冲的量）；
+     0 按 `STREAM_WINDOW`(16)；最后 `clamp(WINDOW_MIN, WINDOW_MAX)`（对端数据钳而不拒）。
+   - 单测 2 条：协商表的对称性/取 min/钳位；协商出的窗口真的落到信用上（2W 帧全到、顺序不乱）。
+3. `crates/uulan-host/src/{config.rs,main.rs,session.rs}`
+   - 配置项 `bulk_window_frames`（默认 16）；`check()` 越界（<1 或 >96，含 0）**让服务起不来**，
+     错误里点名配置项；`--bulk-window <帧数>` 命令行覆盖并落盘（同 `--mic-sink` 的做法）。
+   - `HelloOk` 报本端值；会话 mux 用协商值；日志多两个字段：
+     `window=Some(n) client_frames=… host_frames=…`。
+   - 单测 2 处：老配置（无该字段）按 16 读入；越界/0 必须报错、边界 1 与 96 合法。
+4. `crates/uulan-client/src/{connect.rs,forward.rs,main.rs}`
+   - `--bulk-window <帧数>`（1..=96，写坏当场 bail）→ 只经 `UULAN_BULK_WINDOW` 环境变量传进
+     `connect()`（同 OS 模式凭据的做法，argv 里不多出一种形态）；`ClientHello` 报本端值。
+   - `Connected.bulk_window: Option<usize>`（协商结果）；`Forwarder::start(.., window: Option<usize>)`
+     —— 调用点不再自己算帧数。
+   - 转发会话启动时打一行 `按流窗口 : Some(n)`（可 grep，台架据此判「两端谈成了几帧」）。
+
+三、本机
+────────────
+- 本轮开工基线（HEAD 4191692）：**616 passed / 0 failed / 1 ignored，零警告**。
+- 改后（`CARGO_BUILD_JOBS=2` 跑，D: 盘并行链接会饱和）：
+  **620 passed / 0 failed / 1 ignored，零警告**（616 → 620：protocol +1 老 Hello 兼容，
+  bulk +2 协商表与信用门控，host +1 越界硬错）。
+- `cargo build --release` 零警告；`cargo check -p uulan-host -p uulan-fs -p uulan-bulk
+  --target x86_64-unknown-linux-gnu` 通过（cfg(linux) 的代码只有这么查）。
+
+四、真机台架：`scripts/verify-bulk-window-negotiation-e2e.sh`（新脚本）
+────────────
+台架形态：真机侧独立中继（:21997）+ echo 目标（:21998）+ 合成采集源被控端（lavfi，不抢 CPU），
+控制端在开发机（工作区外 exe）。每个阶段重启被控端以换窗口值；判据同时要**两端各自算出的数对上**。
+
+  阶段 A（两端都写 64）：控制端 `按流窗口 : Some(64)`；被控端
+    `window=Some(64) client_frames=64 host_frames=64`；1 MiB 全双工 40 / 25 ms，sha256 一致。
+  阶段 B（被控端 64、控制端 24）：两端都是 `Some(24)`；1 MiB 44 / 38 ms，sha256 一致
+    —— 取 min 的口径在线上真的生效（不是只在一端算）。
+  阶段 C（控制端不声明，等同老端）：两端都是 `Some(16)`；1 MiB 40 / 33 ms，sha256 一致
+    —— 不被对面的 64 拉大，老行为不变。
+  阶段 D（50 ms 单向延迟代理，4 MiB 全双工）：
+    16 帧：857 ms / 859 ms（两轮）
+    64 帧：340 ms / 318 ms（两轮）
+    提速 60% / 63%；四条流 sha256 全一致（放大窗口不是靠丢字节换吞吐）。
+
+结果：**14 通过 / 0 失败 / 0 跳过 × 两轮**（第一轮与第二轮都 14/0/0）。
+
+五、现网回归（正式被控端换成 HEAD 构建）
+────────────
+- 构建：真机 `cargo build --release -p uulan-server -p uulan-host` 44.31 s、RC=0、零警告；
+  host sha256 `da8fa4890882a157cf3224915fb084b8dff979a42b6796e2d72fff84bdd370d4`。
+- 换法：`cp -a uulan-host uulan-host.bak-20261123_051410` → 新件先落 `.new-<TS>` 再 `mv -f`
+  （直接 cp 覆盖运行中的文件 = ETXTBSY）→ `systemctl --user kill -s KILL uulan-host`。
+- 结果：MainPID 1904318 → 1961917，`is-active=active`，`/proc/<pid>/exe` =
+  `~/.local/uulan/bin/uulan-host`，sha256 与 target/release 一致，设备 ID 仍 805747189
+  （journal：`已用原有设备 ID 上线`）。
+- 现网回归（本机 cargo test 已收工后复测，2026-11-23 05:34）：**356 帧 / 29.5 fps / 丢帧 0 /
+  首帧 219 ms / 与真机 x11grab 截图相关系数 0.9999 / MAE 0.45%**；同会话被控端日志
+  `window=Some(16) client_frames=0 host_frames=16` —— 正式被控端与未带 `--bulk-window` 的
+  控制端仍落在老口径 16 帧上（兼容没坏），画面质量与基线（355 帧 / 首帧 230 ms / corr 0.9985~1.0000）同档。
+  ⚠ 首跑（05:14）取到过 373 帧 / 丢帧 14 / 首帧 773 ms —— 当时本机正在并行跑全量 `cargo test`
+  （D: 盘 PercentDiskTime 833%），**那是台架环境不是产品回归**；判回归前先看本机在干什么。
+
+六、撤法
+────────────
+- 真机二进制：`mv -f ~/.local/uulan/bin/uulan-host.bak-20261123_051410 ~/.local/uulan/bin/uulan-host`
+  → `systemctl --user kill -s KILL uulan-host`（Restart=always 拉起旧件）。
+- 源码：`~/.local/uulan/src.old.<TS>`（本轮 TS=20261123_050828）换回 `src` 即可，`target/` 缓存已随新源码保留。
+- 配置：若用过 `--bulk-window`，`host.json` 里的 `bulk_window_frames` 会被写成那个值；改回 16 或删掉该键
+  （缺键 = 默认 16）。
+- 协议/代码：字段是 `serde(default)`，直接回退旧二进制即可，不需要成对降级；中继从没改过。
+
+七、仍未验
+────────────
+- 多信宿音频争用（这台机器只有一块声卡）。
+- 窗口**上限 96** 是内存账定的上限，不是测出来的最优点；更大的值没有台架结论。
+- 延迟台架只加「控制端↔中继」一腿，真实双端广域网（两端都慢）未验 —— RTT 是下界、吞吐是上界。

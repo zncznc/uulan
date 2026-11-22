@@ -56,6 +56,9 @@ struct Args {
     fs_op: Option<uulan_client::fsx::Op>,
     /// 端口映射规则（给了就只干这件事，不开窗口也不收画面）。
     forward: Vec<uulan_client::ForwardSpec>,
+    /// 按流窗口帧数（M8 第二轮）：本端愿意承认的在途帧数。不写 = 不声明（协商按默认 16）。
+    /// 只在端口映射会话里有意义（文件传输走 `register_unwindowed`）。
+    bulk_window: Option<u16>,
     /// 开一个远端终端（交互式），同样不开窗口也不收画面。
     term: bool,
     /// 列远端当前的终端会话（`--terms`）：一次性，同样不开窗口、不收画面。
@@ -206,6 +209,8 @@ uulan-client —— uulan 内网远控的控制端
 端口映射（做完就退出，不开窗口、不收画面；可写多次）：
   --forward [绑定地址:]本地端口:目标主机:目标端口
                              例：--forward 2222:127.0.0.1:22
+  --bulk-window <帧数>      按流窗口帧数（默认不声明 = 16）：广域网上调大能提吞吐，
+                             握手时与被控端取较小值，两端都要调
                              目标地址站在被控端的立场解析，白名单由被控端判定
                              不加 --seconds 就一直转发，Ctrl-C 结束
   -h, --help          显示本帮助
@@ -234,6 +239,7 @@ fn parse_args() -> Result<Args> {
         no_clipboard: false,
         fs_op: None,
         forward: Vec::new(),
+        bulk_window: None,
         term: false,
         terms: false,
         power: None,
@@ -308,6 +314,23 @@ fn parse_args() -> Result<Args> {
             "--forward" => {
                 let spec = it.next().context("--forward 需要 [绑定地址:]本地端口:目标主机:目标端口")?;
                 a.forward.push(uulan_client::ForwardSpec::parse(&spec)?);
+            }
+            "--bulk-window" => {
+                // 帧数写坏了当场死（同 --term-size 那类参数闸门）：静默夹住会让
+                // 「我明明给了 64」在日志里查不出来。
+                let v = it.next().context("--bulk-window 需要帧数（1..=96）")?;
+                let n: u16 = v
+                    .trim()
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("--bulk-window 要一个整数帧数（收到 {v:?}）"))?;
+                if !(uulan_bulk::WINDOW_MIN..=uulan_bulk::WINDOW_MAX).contains(&n) {
+                    anyhow::bail!(
+                        "--bulk-window {n} 超出 {}..={} 帧",
+                        uulan_bulk::WINDOW_MIN,
+                        uulan_bulk::WINDOW_MAX
+                    );
+                }
+                a.bulk_window = Some(n);
             }
             "--devices" => a.devices = true,
             "--last" => a.last = true,
@@ -850,6 +873,10 @@ async fn main() -> Result<()> {
     if let Some(u) = args.os_user.as_deref() {
         std::env::set_var("UULAN_OS_USER", u);
     }
+    // 按流窗口帧数同样只进环境变量：connect() 统一从环境读，口径只有一处。
+    if let Some(n) = args.bulk_window {
+        std::env::set_var("UULAN_BULK_WINDOW", n.to_string());
+    }
     if let Some(f) = args.os_password_file.as_ref() {
         let raw = std::fs::read_to_string(f)
             .with_context(|| format!("读不了 --os-password-file：{}", f.display()))?;
@@ -1058,7 +1085,7 @@ async fn main() -> Result<()> {
             eprintln!("被控端不支持端口映射（对面版本太旧，或没实现这个能力）");
             std::process::exit(2);
         }
-        let fwd = uulan_client::Forwarder::start(c.control, c.bulk, c.host.bulk_window);
+        let fwd = uulan_client::Forwarder::start(c.control, c.bulk, c.bulk_window);
         for spec in &args.forward {
             let addr = fwd.listen(spec.clone()).await.context("本机监听失败")?;
             println!(
@@ -1067,6 +1094,8 @@ async fn main() -> Result<()> {
             );
         }
         // 这一行是给脚本看的「就绪信号」：后面才可能出现真实转发。
+        // 协商结果打一行：台架靠它判「两端真的谈成了几帧」，而不是回头猜。
+        println!("按流窗口 : {:?}", c.bulk_window);
         println!("转发已就绪（{} 条）", args.forward.len());
         match args.seconds {
             Some(s) => tokio::time::sleep(Duration::from_secs_f64(s)).await,

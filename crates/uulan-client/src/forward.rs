@@ -192,9 +192,10 @@ struct Inner {
 impl Forwarder {
     /// 接管已鉴权的控制连接与 bulk 连接。
     ///
-    /// `bulk_window` 来自握手（`HostHelloOk::bulk_window`）：控制端自己一定支持，
-    /// 所以只要对面也声明了就开按流窗口。老被控端不发这个位 → 保持老行为。
-    pub fn start(control: SecControl, bulk: SecConn, bulk_window: bool) -> Self {
+    /// `window` 来自握手协商（`Connected::bulk_window` → `uulan_bulk::negotiate_window`）：
+    /// `Some(n)` = 两端都声明了按流窗口且帧数谈成了 n；`None` = 老被控端，保持老行为。
+    /// **不要在调用点自己算帧数** —— 口径必须只有一份，否则一端窗口大、一端队列小。
+    pub fn start(control: SecControl, bulk: SecConn, window: Option<usize>) -> Self {
         let (cr, mut cw) = control.into_split();
         let (br, bw) = bulk.into_split();
         let (tx, mut rx) = mpsc::channel::<Out>(64);
@@ -267,11 +268,7 @@ impl Forwarder {
             inner: Arc::new(Inner {
                 ctl: tx,
                 pending,
-                mux: uulan_bulk::spawn_windowed(
-                    br,
-                    bw,
-                    bulk_window.then_some(uulan_bulk::STREAM_WINDOW),
-                ),
+                mux: uulan_bulk::spawn_windowed(br, bw, window),
                 next_id: AtomicU64::new(1),
                 stats: Arc::new(Counters::default()),
                 listeners: Mutex::new(Vec::new()),

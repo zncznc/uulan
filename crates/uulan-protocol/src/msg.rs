@@ -44,6 +44,13 @@ pub struct ClientHello {
     /// 双方都声明才算数（`bulk_window = 我这边 && 对面`）。
     #[serde(default)]
     pub bulk_window: bool,
+    /// 本端**愿意承认的按流窗口帧数**（M8 第二轮，2026-11-23）。
+    ///
+    /// `0` = 没声明（老端 / 只想用默认值）→ 对端按
+    /// `uulan_bulk::STREAM_WINDOW` 算。协商口径只有一份：
+    /// `uulan_bulk::negotiate_window`（两端各算一次，取较小值，结果必然相同）。
+    #[serde(default)]
+    pub bulk_window_frames: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +65,10 @@ pub struct HostHelloOk {
     /// [`ClientHello::bulk_window`]：双方都声明才启用。
     #[serde(default)]
     pub bulk_window: bool,
+    /// 被控端愿意承认的按流窗口帧数（M8 第二轮）。`0` = 没声明 → 默认值。
+    /// 与控制端取较小值，见 [`ClientHello::bulk_window_frames`]。
+    #[serde(default)]
+    pub bulk_window_frames: u16,
     /// 被控端是否有图形会话。无头机器（`UU_DESKTOP_BACKEND=none` 那种）只有终端/文件/端口映射。
     pub has_desktop: bool,
     /// 这台被控端开了 PAM 第二因素。
@@ -683,6 +694,37 @@ let f = H2C::AuthFail { reason: AuthFailReason::BadPassword, retry_after_ms: 100
         assert_eq!(v.encoder, "auto");
     }
 
+    /// 老对端的 Hello / HelloOk 里没有 `bulk_window_frames`（M8 第二轮新增）：
+    /// 必须解成 0 =「没声明」→ 协商按默认帧数走。**多一个字段不能让会话断掉**。
+    #[test]
+    fn old_hello_without_bulk_window_frames_still_parses() {
+        let c: C2H = serde_json::from_str(
+            r#"{"type":"hello","os":"windows","version":"0.1.0","name":"x","caps":[],"bulk_window":true}"#,
+        )
+        .unwrap();
+        match c {
+            C2H::Hello(h) => {
+                assert!(h.bulk_window);
+                assert_eq!(h.bulk_window_frames, 0);
+            }
+            other => panic!("解成了 {other:?}"),
+        }
+
+        let h: H2C = serde_json::from_str(
+            r#"{"type":"hello_ok","device_id":"1","os":"kylin","version":"0.1.0","name":"k",
+                "screen":{"w":1920,"h":1080},"caps":[],"bulk_window":true,"has_desktop":true}"#,
+        )
+        .unwrap();
+        match h {
+            H2C::HelloOk(h) => {
+                assert!(h.bulk_window);
+                assert_eq!(h.bulk_window_frames, 0);
+                assert!(!h.pam_required, "缺字段一律 serde(default)");
+            }
+            other => panic!("解成了 {other:?}"),
+        }
+    }
+
     #[test]
     fn quality_presets_have_bitrate_caps_where_expected() {
         assert_eq!(quality_preset(Quality::High).1, 2_000);
@@ -747,6 +789,7 @@ let f = H2C::AuthFail { reason: AuthFailReason::BadPassword, retry_after_ms: 100
             name: "ZNC-7G4D".into(),
             caps: vec![Cap::Clipboard, Cap::Files, Cap::Terminal],
             bulk_window: true,
+            bulk_window_frames: 64,
         }));
         rt_c2h(C2H::Auth { proofs: vec!["ab12".into(), "cd34".into()] });
         rt_c2h(C2H::MouseMoveAbs { x: 1.0, y: 0.0 });
@@ -778,6 +821,7 @@ let f = H2C::AuthFail { reason: AuthFailReason::BadPassword, retry_after_ms: 100
             screen: Screen { w: 1920, h: 1080 },
             caps: vec![Cap::Clipboard, Cap::Metrics],
             bulk_window: false,
+            bulk_window_frames: 0,
             has_desktop: true,
             pam_required: false,
         }));

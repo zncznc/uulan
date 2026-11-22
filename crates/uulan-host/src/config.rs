@@ -168,6 +168,15 @@ pub struct HostConfig {
     #[serde(default)]
     pub power_allow: Vec<String>,
 
+    /// 按流窗口帧数（M8 第二轮）：本端**愿意承认**的在途帧数，默认 16。
+    ///
+    /// 握手时双方各报一个，取较小值（`uulan_bulk::negotiate_window`）。
+    /// 广域网上 16 帧 = 1 MiB 会成为吞吐上限（≈窗口/RTT），把两端都调大才有效。
+    /// 越界（<1 或 >`uulan_bulk::WINDOW_MAX`）**让服务起不来**，不静默夹住 ——
+    /// 与 `mic_sink` / `power_allow` 同一条纪律。
+    #[serde(default = "default_bulk_window_frames")]
+    pub bulk_window_frames: u16,
+
     /// 测试钩子：把电源动作的执行程序换成这一个（参数固定为动作名，见 `power::plan`）。
     ///
     /// 本机验收台用它钉「命令真的被执行、退出码真的回了话」而不真碰电源
@@ -180,6 +189,12 @@ pub struct HostConfig {
 /// 合法词表只有一份 —— 在 `crate::mic::parse_sink`。
 fn default_mic_sink() -> String {
     "speaker".into()
+}
+
+/// 默认窗口帧数 = `uulan_bulk::STREAM_WINDOW`。写死一个数而不是引用常量，
+/// 是因为配置格式要能独立于代码版本解释；两者不一致由测试钉住。
+fn default_bulk_window_frames() -> u16 {
+    16
 }
 
 fn default_true() -> bool {
@@ -237,6 +252,7 @@ impl Default for HostConfig {
             audio_source: None,
             mic_sink: default_mic_sink(),
             power_allow: Vec::new(),
+            bulk_window_frames: default_bulk_window_frames(),
             power_test_program: None,
         }
     }
@@ -297,6 +313,16 @@ impl HostConfig {
         }
         if let Err(e) = crate::power::parse_allow(&self.power_allow) {
             return Err(ConfigError::Power(e));
+        }
+        // 窗口帧数：写 0 是「忘了填」不是「关掉窗口」（关窗口由握手能力位决定），
+        // 所以一律当错 —— 静默当成默认值会让「我明明配了 96」查不出来。
+        if !(uulan_bulk::WINDOW_MIN..=uulan_bulk::WINDOW_MAX).contains(&self.bulk_window_frames) {
+            return Err(ConfigError::Empty(format!(
+                "bulk_window_frames={} 超出 {}..={}（0 不是「关掉窗口」的意思）",
+                self.bulk_window_frames,
+                uulan_bulk::WINDOW_MIN,
+                uulan_bulk::WINDOW_MAX
+            )));
         }
         Ok(())
     }
@@ -821,5 +847,27 @@ mod tests_users {
         let legacy = "{\"server\":\"h:1\",\"password\":\"abcd1234\",\"reg_token\":\"t\"}";
         let parsed: HostConfig = serde_json::from_str(legacy).unwrap_or_else(|e| panic!("{e}"));
         assert!(parsed.users.is_empty());
+        // 同一份老配置里也没有 bulk_window_frames（M8 第二轮加的）→ 按默认 16。
+        assert_eq!(parsed.bulk_window_frames, 16);
+        assert_eq!(parsed.bulk_window_frames as usize, uulan_bulk::STREAM_WINDOW);
+    }
+
+    /// 窗口帧数写坏了必须让服务起不来：静默夹住会让「我明明配了 96」查不出来。
+    #[test]
+    fn bulk_window_frames_out_of_range_is_a_hard_error() {
+        let mut c = HostConfig::default();
+        assert_eq!(c.bulk_window_frames, 16);
+        c.check().unwrap_or_else(|e| panic!("默认值必须合法: {e}"));
+
+        for bad in [0u16, uulan_bulk::WINDOW_MAX + 1, 65535] {
+            c.bulk_window_frames = bad;
+            let e = c.check().expect_err(&format!("{bad} 帧不该被接受")).to_string();
+            assert!(e.contains("bulk_window_frames"), "错误必须点名配置项: {e}");
+        }
+        // 边界值本身要能用（1 帧 = 一次一发；96 帧 = 上限）。
+        for ok in [uulan_bulk::WINDOW_MIN, uulan_bulk::WINDOW_MAX] {
+            c.bulk_window_frames = ok;
+            c.check().unwrap_or_else(|e| panic!("{ok} 帧应当合法: {e}"));
+        }
     }
 }

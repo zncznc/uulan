@@ -772,10 +772,18 @@ pub async fn run_with_sink(
     info!(home = %fs_roots.home.display(), allow_absolute = fs_roots.allow_absolute, "文件服务已就绪");
 
     let (bulk_rd, bulk_wr) = bulk.into_split();
-    // 按流窗口（M8）：被控端自己一定支持，所以只要控制端也声明了就开。
-    // 两端都发才算数 —— 单方面等一份永远不来的信用就是死锁。
-    let bulk_window = client.bulk_window.then_some(uulan_bulk::STREAM_WINDOW);
-    info!(window = ?bulk_window, "bulk 多路复用（按流窗口）");
+    // 按流窗口（M8）：口径只有一份 `uulan_bulk::negotiate_window`（两端各算一次，取较小值）。
+    // 两端都声明才算数 —— 单方面等一份永远不来的信用就是死锁。
+    let bulk_window = uulan_bulk::negotiate_window(
+        (client.bulk_window, client.bulk_window_frames),
+        (true, cfg.bulk_window_frames),
+    );
+    info!(
+        window = ?bulk_window,
+        client_frames = client.bulk_window_frames,
+        host_frames = cfg.bulk_window_frames,
+        "bulk 多路复用（按流窗口）"
+    );
     let mux = uulan_bulk::spawn_windowed(bulk_rd, bulk_wr, bulk_window);
 
     // 端口映射白名单：配置写错就退回「只允许回环」，绝不因为一行配置写错而放开全网段。
@@ -1083,6 +1091,8 @@ where
             caps,
             // 按流窗口（M8）：老控制端不发这个位 → 它那边 false → 双方都不开，行为不变。
             bulk_window: true,
+            // 本端愿意承认的帧数（M8 第二轮）：两端取 min，广域网上两端都调大才有效。
+            bulk_window_frames: cfg.bulk_window_frames,
             has_desktop: true,
             // 提前告知：这台机器还要第二因素。控制端据此决定**要不要读那一帧**，
             // 不抢先读，免得把后面正常的推送当 PAM 消息吃掉。

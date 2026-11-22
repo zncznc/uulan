@@ -151,7 +151,7 @@ async fn harness() -> (Forwarder, u16) {
     let device = spawn_host(&srv, test_config(&srv)).await;
     let echo = echo_server().await;
     let c = session_to(&srv, &device).await;
-    let fwd = Forwarder::start(c.control, c.bulk, c.host.bulk_window);
+    let fwd = Forwarder::start(c.control, c.bulk, c.bulk_window);
     let spec = ForwardSpec {
         bind: "127.0.0.1:0".parse().unwrap(),
         target_host: "127.0.0.1".into(),
@@ -234,7 +234,7 @@ async fn dead_target_fails_the_local_connection_quickly() {
     };
 
     let c = session_to(&srv, &device).await;
-    let fwd = Forwarder::start(c.control, c.bulk, c.host.bulk_window);
+    let fwd = Forwarder::start(c.control, c.bulk, c.bulk_window);
     let spec = ForwardSpec {
         bind: "127.0.0.1:0".parse().unwrap(),
         target_host: "127.0.0.1".into(),

@@ -878,6 +878,7 @@ mod tests {
             screen: uulan_protocol::msg::Screen { w: 1920, h: 1080 },
             caps: vec![],
             bulk_window: false,
+            bulk_window_frames: 0,
             has_desktop: true,
         };
         let stats = Arc::new(WatchStats::default());

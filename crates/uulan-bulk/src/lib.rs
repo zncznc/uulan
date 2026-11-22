@@ -68,6 +68,32 @@ pub const STREAM_QUEUE: usize = 8;
 /// 局域网（RTT < 1 ms）下足够跑满链路，又让每条卡住的流最多占 1 MiB 内存。
 pub const STREAM_WINDOW: usize = 16;
 
+/// 协商窗口的下界。**不能是 0**：窗口 0 帧 = 发一帧就要等一份永远不来的信用。
+pub const WINDOW_MIN: u16 = 1;
+
+/// 协商窗口的上界：96 帧 × 64 KiB = 6 MiB 在途/流。
+///
+/// 再大就变成「一条流卡死吃掉半台机器的内存」，而 96 帧在 100 ms RTT 上已经能跑到
+/// ~60 MB/s，对内网远控足够。要更大先想清楚内存账。
+pub const WINDOW_MAX: u16 = 96;
+
+/// 握手协商出的按流窗口帧数；`None` = 这场会话不开窗口（老行为）。
+///
+/// 口径只有这一份，**两端各算一次、结果必须相同**：
+///
+/// - 双方都声明 `bulk_window` 才谈得上协商（单方面开窗口 = 等一份永远不来的信用）；
+/// - 帧数取两端声明的**较小值** —— 发送方的在途上限必须 ≤ 接收方能缓冲的量，
+///   取 min 才两头都对得上（两端口径不一致会让读任务在队列上憋住，等于没修）；
+/// - `0` = 没声明（老端或只想用默认值）→ 按 [`STREAM_WINDOW`] 算；
+/// - 最后钳在 [`WINDOW_MIN`]..=[`WINDOW_MAX`]：对端发来的数是不可信输入，钳而不拒。
+pub fn negotiate_window(client: (bool, u16), host: (bool, u16)) -> Option<usize> {
+    if !client.0 || !host.0 {
+        return None;
+    }
+    let pick = |f: u16| if f == 0 { STREAM_WINDOW as u16 } else { f };
+    Some(pick(client.1).min(pick(host.1)).clamp(WINDOW_MIN, WINDOW_MAX) as usize)
+}
+
 /// 开窗口的流，队列比窗口多留几格：`END` 不占窗口，算错一格也不该把连接憋死。
 const WINDOW_SLACK: usize = 4;
 
@@ -455,6 +481,61 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tokio::io::duplex;
+
+    /// 协商口径：两端各算一次必须得同一个数，否则一端窗口大、一端队列小，
+    /// 「读任务永不因为某条流阻塞」这条承诺当场失效。
+    #[test]
+    fn window_negotiation_is_symmetric_and_min_takes_precedence() {
+        // 双方都没声明 → 不开窗口（老行为）。
+        assert_eq!(negotiate_window((false, 0), (true, 0)), None);
+        assert_eq!(negotiate_window((true, 64), (false, 0)), None);
+        // 都声明但都没写帧数 → 默认 16（老端组合：新老混跑仍是 16）。
+        assert_eq!(negotiate_window((true, 0), (true, 0)), Some(STREAM_WINDOW));
+        // 一边没写帧数 = 它那端的队列还是按默认 16 建的 → 取 min 之后就是 16。
+        // 这正是「调大窗口必须两端都写」的原因：只调一端没有任何效果。
+        assert_eq!(negotiate_window((true, 64), (true, 0)), Some(STREAM_WINDOW));
+        assert_eq!(negotiate_window((true, 0), (true, 48)), Some(STREAM_WINDOW));
+        // 两边都写才谈得上放大/缩小，取小。
+        assert_eq!(negotiate_window((true, 64), (true, 24)), Some(24));
+        assert_eq!(negotiate_window((true, 64), (true, 96)), Some(64));
+        // 对称：谁报的是控制端不影响结果。
+        assert_eq!(
+            negotiate_window((true, 64), (true, 24)),
+            negotiate_window((true, 24), (true, 64))
+        );
+        // 对端发来的数不可信：越界钳住而不是拒绝会话（min 之后仍可能越界，所以钳在最后）。
+        assert_eq!(negotiate_window((true, 60_000), (true, 60_000)), Some(WINDOW_MAX as usize));
+        assert_eq!(negotiate_window((true, 4096), (true, 4096)), Some(WINDOW_MAX as usize));
+        assert_eq!(negotiate_window((true, 1), (true, 1)), Some(WINDOW_MIN as usize));
+    }
+
+    /// 协商出来的窗口必须真的落到信用上：窗口 W 的流，发送端最多超前 W 帧；
+    /// 对端每消费一帧放一帧过去，一帧都不丢、顺序不乱。
+    #[tokio::test]
+    async fn negotiated_window_really_gates_the_sender() {
+        let w = negotiate_window((true, 24), (true, 96)).expect("双方都声明了就应当开窗口");
+        assert_eq!(w, 24);
+        let (a_out, b_in) = duplex(256 * 1024);
+        let (b_out, a_in) = duplex(4096);
+        let a = spawn_windowed(a_in, a_out, Some(w));
+        let b = spawn_windowed(b_in, b_out, Some(w));
+        let mut sa = a.register(1).unwrap();
+        let mut sb = b.register(1).unwrap();
+        // 发送端跑在独立任务里：窗口用完后它会等信用，不能和「收」串在一个任务里（那就是死锁）。
+        let sender = tokio::spawn(async move {
+            for i in 0..(w * 2) {
+                sa.send_data(&[i as u8]).await.unwrap();
+            }
+        });
+        for i in 0..(w * 2) {
+            let f = recv_data(&mut sb).await;
+            assert_eq!(&f.data[..], &[i as u8][..]);
+        }
+        tokio::time::timeout(Duration::from_secs(2), sender)
+            .await
+            .expect("2W 帧全收完，发送端就该退出")
+            .unwrap();
+    }
 
     /// 一对通过内存管道相连的 mux（a 的写 → b 的读，b 的写 → a 的读）。
     fn linked() -> (Mux, Mux) {

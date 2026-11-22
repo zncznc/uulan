@@ -57,6 +57,10 @@ pub struct Connected {
     pub audio: SecConn,
     /// 服务端下发的会话票据（排障用）。
     pub session: String,
+    /// 握手协商出的按流窗口帧数（M8 第二轮）；`None` = 不开窗口（老被控端）。
+    ///
+    /// 口径在 `uulan_bulk::negotiate_window`（两端取 min），**不要**在调用点自己再算一遍。
+    pub bulk_window: Option<usize>,
 }
 
 impl Connected {
@@ -97,6 +101,16 @@ pub async fn connect(
     };
     let RelaySet { control, video, bulk, audio } = relays;
     let mut control = control;
+
+    // 本端愿意承认的按流窗口帧数（M8 第二轮）：0 = 没声明 → 协商按默认值。
+    // CLI 的 `--bulk-window` 只是这个环境变量的设值入口（同 OS 模式的凭据），
+    // 这样 argv / 进程表里不会出现额外的形态差异。
+    let my_frames: u16 = match std::env::var("UULAN_BULK_WINDOW") {
+        Ok(v) if !v.trim().is_empty() => v.trim().parse().map_err(|_| {
+            ClientError::Unexpected(format!("UULAN_BULK_WINDOW 不是整数帧数：{v:?}"))
+        })?,
+        _ => 0,
+    };
 
     // 握手也要有超时：被控端可能连上了中继但自己的会话线程卡住。
     let (host, keys, ctl) = timeout(Duration::from_secs(15), async {
@@ -142,6 +156,8 @@ pub async fn connect(
                 caps: caps.clone(),
                 // 按流窗口（M8）：声明了才可能启用，双方都声明才算数。
                 bulk_window: true,
+                // 帧数协商（M8 第二轮）：两端取 min，局域网不写就是 16。
+                bulk_window_frames: my_frames,
             }),
         )
         .await?;
@@ -260,6 +276,11 @@ pub async fn connect(
     .map_err(|_| ClientError::Timeout)
     .and_then(|r| r)?;
 
+    // 协商结果两端各算一次、必须相同：口径只在 `uulan_bulk::negotiate_window` 里。
+    let bulk_window = uulan_bulk::negotiate_window(
+        (true, my_frames),
+        (host.bulk_window, host.bulk_window_frames),
+    );
     Ok(Connected {
         host,
         control: ctl,
@@ -267,6 +288,7 @@ pub async fn connect(
         bulk: SecConn::new(bulk, &keys.channel(Channel::Bulk), Role::Client, Channel::Bulk),
         audio: SecConn::new(audio, &keys.channel(Channel::Audio), Role::Client, Channel::Audio),
         session,
+        bulk_window,
     })
 }
 

@@ -40,6 +40,8 @@ struct Args {
     audio_source: Option<String>,
     /// 麦克风转接的落点覆盖（`speaker` / `null`）。不写 = 配置里的值（默认 speaker）。
     mic_sink: Option<String>,
+    /// 按流窗口帧数的命令行覆盖（M8）。不写 = 配置里的值（默认 16）。
+    bulk_window: Option<String>,
     ffmpeg: Option<PathBuf>,
     encoder: Option<Encoder>,
     name: Option<String>,
@@ -85,6 +87,8 @@ uulan-host —— uulan 内网远控的被控端
   --diagnose          自检：显示 / XTest / ffmpeg / 中继 / 配置可写性，给一行结论 + 建议
                       只读，不注册中继、不改配置；退出码 0 = 能跑，1 = 有失败项
   --audio-source <源> 音频采集源（M7）：`pulse:<设备>` / `lavfi:<表达式>`；
+  --bulk-window <帧数> 按流窗口帧数（默认 16，1..=96）：广域网上调大能提吞吐；
+                      握手时两端取较小值，所以两端都要调
   --mic-sink <落点> 麦克风转接（M7 上行）本机送到哪儿：`speaker`（默认）/
                       `null`（解码后丢弃，验收台专用）；拼错词服务直接起不来
                       不写 = 自动探测 PulseAudio 默认输出的 monitor
@@ -103,6 +107,7 @@ fn parse_args() -> Result<Args> {
         capture: None,
         audio_source: None,
         mic_sink: None,
+        bulk_window: None,
         ffmpeg: None,
         encoder: None,
         name: None,
@@ -128,6 +133,7 @@ fn parse_args() -> Result<Args> {
             "--capture" => a.capture = Some(it.next().unwrap_or_default()),
             "--audio-source" => a.audio_source = Some(it.next().unwrap_or_default()),
             "--mic-sink" => a.mic_sink = Some(it.next().unwrap_or_default()),
+            "--bulk-window" => a.bulk_window = Some(it.next().unwrap_or_default()),
             "--ffmpeg" => a.ffmpeg = Some(PathBuf::from(it.next().unwrap_or_default())),
             "--name" => a.name = Some(it.next().unwrap_or_default()),
             "--encoder" => {
@@ -218,6 +224,24 @@ async fn main() -> Result<()> {
         };
         if cfg.mic_sink != as_str {
             cfg.mic_sink = as_str.to_string();
+            dirty = true;
+        }
+    }
+    if let Some(v) = &args.bulk_window {
+        // 帧数写坏了当场死（同 mic_sink / power_allow 纪律）：夹住会让「我配了 96」查不出来。
+        let n: u16 = v
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("--bulk-window 要一个整数帧数（收到 {v:?}）"))?;
+        if !(uulan_bulk::WINDOW_MIN..=uulan_bulk::WINDOW_MAX).contains(&n) {
+            anyhow::bail!(
+                "--bulk-window {n} 超出 {}..={} 帧",
+                uulan_bulk::WINDOW_MIN,
+                uulan_bulk::WINDOW_MAX
+            );
+        }
+        if cfg.bulk_window_frames != n {
+            cfg.bulk_window_frames = n;
             dirty = true;
         }
     }
