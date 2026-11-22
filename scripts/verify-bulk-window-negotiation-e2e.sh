@@ -48,10 +48,10 @@ mkdir -p "$WORKW" || env_out "建不了 $WORKW"
 # ── 真机侧：中继 + echo + 可重复重启的被控端（窗口帧数由参数给） ──────────────
 cat > "$WORKW/remote.sh" <<'RSH'
 #!/usr/bin/env bash
-# remote.sh <WORK> <PORT> <E1> <HOSTWIN> <start|stophost|stopall>
+# remote.sh <WORK> <PORT> <E1> <HOSTWIN> <start|stophost|stopall> [旧被控端二进制]
 set -u
 BIN="$HOME/.local/uulan/src/target/release"
-WORK="$1"; PORT="$2"; E1="$3"; HOSTWIN="$4"; ACTION="$5"
+WORK="$1"; PORT="$2"; E1="$3"; HOSTWIN="$4"; ACTION="$5"; OLDBIN="${6:-}"
 mkdir -p "$WORK" || exit 1
 
 if [ "$ACTION" = "start" ]; then
@@ -91,9 +91,16 @@ PY
     for _ in $(seq 1 50); do kill -0 "$(cat "$WORK/host.pid")" 2>/dev/null || break; sleep 0.1; done
   fi
   : > "$WORK/host.log"
-  RUST_LOG=info NO_COLOR=1 "$BIN/uulan-host" --server "127.0.0.1:$PORT" \
-    --config "$WORK/host.json" --bulk-window "$HOSTWIN" \
-    --capture "lavfi:testsrc2=size=640x360:rate=10" --name neg-bench >>"$WORK/host.log" 2>&1 &
+  # 旧二进制（兼容性验证用）不认识 --bulk-window，所以两种起法分开。
+  if [ -n "$OLDBIN" ] && [ -x "$OLDBIN" ]; then
+    RUST_LOG=info NO_COLOR=1 "$OLDBIN" --server "127.0.0.1:$PORT" \
+      --config "$WORK/host.json" \
+      --capture "lavfi:testsrc2=size=640x360:rate=10" --name neg-old >>"$WORK/host.log" 2>&1 &
+  else
+    RUST_LOG=info NO_COLOR=1 "$BIN/uulan-host" --server "127.0.0.1:$PORT" \
+      --config "$WORK/host.json" --bulk-window "$HOSTWIN" \
+      --capture "lavfi:testsrc2=size=640x360:rate=10" --name neg-bench >>"$WORK/host.log" 2>&1 &
+  fi
   echo $! > "$WORK/host.pid"
   dev=""
   for _ in $(seq 1 300); do
@@ -201,8 +208,9 @@ chmod 600 "$WORKW/pw.txt"
 [ -s "$WORKW/pw.txt" ] || env_out "口令不合格式"
 ok "台架就绪（设备 $DEV）"
 
-start_host() {   # start_host <hostwin>
-  ssh "$KY" "bash $WORKK/remote.sh $WORKK $PORT $E1 $1 start" > "$WORKW/bed-$1.out" 2>&1
+start_host() {   # start_host <hostwin> [旧被控端二进制]
+  local old="${2:-}"
+  ssh "$KY" "bash $WORKK/remote.sh $WORKK $PORT $E1 $1 start $old" > "$WORKW/bed-$1.out" 2>&1
   grep -q READY "$WORKW/bed-$1.out" || { bad "被控端（窗口 $1）没起来"; return 1; }
   return 0
 }
@@ -299,6 +307,21 @@ awk -v a="$T16" -v b="$T64" 'BEGIN{exit !(b < a)}' \
 awk -v a="$T16" -v b="$T64" 'BEGIN{exit !(b*100 <= a*80)}' \
   && ok "提速幅度 ≥20%（$(awk -v a="$T16" -v b="$T64" 'BEGIN{printf "%.0f", (1-b/a)*100}')%）" \
   || skip "提速 <20%（$(awk -v a="$T16" -v b="$T64" 'BEGIN{printf "%.0f", (1-b/a)*100}')%）—— 只作观察，不判红（台架时间基有抖动）"
+
+echo "== 6. 阶段 E：新控制端 + **旧被控端二进制**（真老端兼容）=="
+if [ -n "${UULAN_OLD_HOST:-}" ]; then
+  if ssh "$KY" "[ -x ${UULAN_OLD_HOST} ] && echo YES" 2>/dev/null | grep -q YES; then
+    start_host 16 "$UULAN_OLD_HOST" || exit 1
+    sleep 0.5
+    # 新控制端报 64 帧；旧被控端根本不认识这个字段（没有 --bulk-window 参数）→ 它按 16 开窗口，
+    # 控制端算 min(64, 16) = 16。两端都是 16，数据才可能一字节不丢。
+    run_stage E - 64 0 1048576 16
+  else
+    skip "旧被控端二进制不存在：$UULAN_OLD_HOST"
+  fi
+else
+  skip "没给 UULAN_OLD_HOST（旧被控端二进制路径）—— 新控制端→老被控端 这一格本轮未验"
+fi
 
 echo
 echo "==== 结果：$PASS 通过 / $FAIL 失败 / $SKIP 跳过 ===="
