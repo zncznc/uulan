@@ -37,6 +37,13 @@ pub struct ClientHello {
     pub version: String,
     pub name: String,
     pub caps: Vec<Cap>,
+    /// 控制端认不认 bulk 的**按流滑动窗口**（M8，2026-11-22）。
+    ///
+    /// `#[serde(default)]` → 老控制端不发 = false → 老行为（读任务阻塞式分派），
+    /// 新老两端混着跑也不会因为「一端等信用、一端不发」而互相等死。
+    /// 双方都声明才算数（`bulk_window = 我这边 && 对面`）。
+    #[serde(default)]
+    pub bulk_window: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +54,10 @@ pub struct HostHelloOk {
     pub name: String,
     pub screen: Screen,
     pub caps: Vec<Cap>,
+    /// 被控端是否支持 bulk 的按流滑动窗口（M8）。语义同
+    /// [`ClientHello::bulk_window`]：双方都声明才启用。
+    #[serde(default)]
+    pub bulk_window: bool,
     /// 被控端是否有图形会话。无头机器（`UU_DESKTOP_BACKEND=none` 那种）只有终端/文件/端口映射。
     pub has_desktop: bool,
     /// 这台被控端开了 PAM 第二因素。
@@ -735,6 +746,7 @@ let f = H2C::AuthFail { reason: AuthFailReason::BadPassword, retry_after_ms: 100
             version: "0.1.0".into(),
             name: "ZNC-7G4D".into(),
             caps: vec![Cap::Clipboard, Cap::Files, Cap::Terminal],
+            bulk_window: true,
         }));
         rt_c2h(C2H::Auth { proofs: vec!["ab12".into(), "cd34".into()] });
         rt_c2h(C2H::MouseMoveAbs { x: 1.0, y: 0.0 });
@@ -765,6 +777,7 @@ let f = H2C::AuthFail { reason: AuthFailReason::BadPassword, retry_after_ms: 100
             name: "KIRIN-01".into(),
             screen: Screen { w: 1920, h: 1080 },
             caps: vec![Cap::Clipboard, Cap::Metrics],
+            bulk_window: false,
             has_desktop: true,
             pam_required: false,
         }));

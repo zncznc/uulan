@@ -28,6 +28,14 @@ pub const HEADER_LEN: usize = 5;
 /// 流结束标志位。其余位保留，收到就报错（比静默忽略安全）。
 pub const FLAG_END: u8 = 0x01;
 
+/// 流控信用标志位：**把一帧的发送窗口还给对端**，`data` 必须为空。
+///
+/// 只在两端都声明了 `bulk_window` 的会话里出现（见 `msg::ClientHello::bulk_window`）：
+///
+/// 老对端从来不会收到它，所以它不需要认识这个位；反过来万一收到（配置错乱），
+/// `UnknownFlags` 会当场报错、连接收尾 —— 绝不静默吃掉。
+pub const FLAG_CREDIT: u8 = 0x02;
+
 /// 单帧建议负载大小。64 KiB 是「一帧头开销可以忽略」与「不把 TCP 队列堵死」之间的折中。
 pub const CHUNK: usize = 64 * 1024;
 
@@ -36,6 +44,11 @@ pub enum BulkKind {
     Data,
     /// 该 id 的数据结束。**之后同一个 id 不应再出现任何帧。**
     End,
+    /// 流控信用：收到它 = 对端又消费掉了一帧，本端可以再发一帧。
+    ///
+    /// **它不是数据**：绝不能进业务队列（进了就会被当成一个 0 字节的数据段），
+    /// 读任务在分派之前就把它消化掉。见 `uulan_bulk`。
+    Credit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +67,12 @@ impl BulkFrame {
         Self { id, kind: BulkKind::End, data: Bytes::new() }
     }
 
+    /// 一帧的信用（窗口退还）。**一帧数据一条信用**：不做批量攒，理由是
+    /// 「攒到 N 条再发」会在「消费了 N-1 帧就停下等数据」时把整条流失锁在窗口里。
+    pub fn credit(id: u32) -> Self {
+        Self { id, kind: BulkKind::Credit, data: Bytes::new() }
+    }
+
     /// 编码成 `Blob` 帧的 payload。
     pub fn encode(&self) -> Bytes {
         let n = self.data.len();
@@ -62,6 +81,7 @@ impl BulkFrame {
         v.push(match self.kind {
             BulkKind::Data => 0,
             BulkKind::End => FLAG_END,
+            BulkKind::Credit => FLAG_CREDIT,
         });
         v.extend_from_slice(&self.data);
         Bytes::from(v)
@@ -78,8 +98,11 @@ impl BulkFrame {
         }
         let id = u32::from_le_bytes(payload[..4].try_into().unwrap());
         let flags = payload[4];
-        if flags & !FLAG_END != 0 {
+        if flags & !(FLAG_END | FLAG_CREDIT) != 0 {
             return Err(BulkError::UnknownFlags(flags));
+        }
+        if flags & FLAG_END != 0 && flags & FLAG_CREDIT != 0 {
+            return Err(BulkError::FlagConflict(flags));
         }
         let body = Bytes::copy_from_slice(&payload[HEADER_LEN..]);
         if flags & FLAG_END != 0 {
@@ -87,6 +110,13 @@ impl BulkFrame {
                 return Err(BulkError::EndWithData(body.len()));
             }
             Ok(Self { id, kind: BulkKind::End, data: body })
+        } else if flags & FLAG_CREDIT != 0 {
+            // 信用帧不许带载荷：带了就说明对端在别的语义里复用了这个位，
+            // 与其猜，不如当场报错。
+            if !body.is_empty() {
+                return Err(BulkError::CreditWithData(body.len()));
+            }
+            Ok(Self { id, kind: BulkKind::Credit, data: body })
         } else {
             Ok(Self { id, kind: BulkKind::Data, data: body })
         }
@@ -97,8 +127,12 @@ impl BulkFrame {
 pub enum BulkError {
     #[error("bulk 帧太短：{0} 字节（至少 {HEADER_LEN} 字节）")]
     TooShort(usize),
-    #[error("bulk 帧标志位非法：0x{0:02x}（只认识 END=0x01）")]
+    #[error("bulk 帧标志位非法：0x{0:02x}（只认识 END=0x01 / CREDIT=0x02）")]
     UnknownFlags(u8),
+    #[error("bulk 帧标志位冲突：0x{0:02x}（END 与 CREDIT 不能同时置位）")]
+    FlagConflict(u8),
+    #[error("CREDIT 帧不允许带数据（带了 {0} 字节）")]
+    CreditWithData(usize),
     #[error("END 帧不允许带数据（带了 {0} 字节）")]
     EndWithData(usize),
 }
@@ -172,6 +206,32 @@ mod tests {
         let back = BulkFrame::decode(&f.encode()).unwrap();
         assert_eq!(back.data.len(), CHUNK);
         assert_eq!(&back.data[..], &payload[..]);
+    }
+
+    #[test]
+    fn credit_frame_is_five_bytes_and_carries_no_payload() {
+        let enc = BulkFrame::credit(3).encode();
+        assert_eq!(enc.len(), HEADER_LEN);
+        let back = BulkFrame::decode(&enc).unwrap();
+        assert_eq!(back.kind, BulkKind::Credit);
+        assert_eq!(back.id, 3);
+        assert!(back.data.is_empty());
+        // 它和 END 是两个不同的位：谁都不许被当成对方。
+        assert_ne!(BulkFrame::decode(&enc).unwrap().kind, BulkKind::End);
+    }
+
+    #[test]
+    fn credit_with_payload_and_flag_conflict_are_rejected() {
+        let mut enc = Vec::new();
+        enc.extend_from_slice(&7u32.to_le_bytes());
+        enc.push(FLAG_CREDIT);
+        enc.extend_from_slice(b"xx");
+        assert_eq!(BulkFrame::decode(&enc), Err(BulkError::CreditWithData(2)));
+
+        let mut both = Vec::new();
+        both.extend_from_slice(&7u32.to_le_bytes());
+        both.push(FLAG_END | FLAG_CREDIT);
+        assert_eq!(BulkFrame::decode(&both), Err(BulkError::FlagConflict(0x03)));
     }
 
     #[test]

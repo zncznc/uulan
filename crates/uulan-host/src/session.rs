@@ -772,7 +772,11 @@ pub async fn run_with_sink(
     info!(home = %fs_roots.home.display(), allow_absolute = fs_roots.allow_absolute, "文件服务已就绪");
 
     let (bulk_rd, bulk_wr) = bulk.into_split();
-    let mux = uulan_bulk::spawn(bulk_rd, bulk_wr);
+    // 按流窗口（M8）：被控端自己一定支持，所以只要控制端也声明了就开。
+    // 两端都发才算数 —— 单方面等一份永远不来的信用就是死锁。
+    let bulk_window = client.bulk_window.then_some(uulan_bulk::STREAM_WINDOW);
+    info!(window = ?bulk_window, "bulk 多路复用（按流窗口）");
+    let mux = uulan_bulk::spawn_windowed(bulk_rd, bulk_wr, bulk_window);
 
     // 端口映射白名单：配置写错就退回「只允许回环」，绝不因为一行配置写错而放开全网段。
     let policy = PortPolicy::from_config(&cfg.portmap_allow).unwrap_or_else(|e| {
@@ -1077,6 +1081,8 @@ where
             name: cfg.name.clone(),
             screen,
             caps,
+            // 按流窗口（M8）：老控制端不发这个位 → 它那边 false → 双方都不开，行为不变。
+            bulk_window: true,
             has_desktop: true,
             // 提前告知：这台机器还要第二因素。控制端据此决定**要不要读那一帧**，
             // 不抢先读，免得把后面正常的推送当 PAM 消息吃掉。
@@ -1953,7 +1959,9 @@ async fn fs_loop(
         };
 
         let r = if needs_bulk(&op) {
-            match mux.register(id) {
+            // **文件传输必须不走窗口**：控制端的 `fsx` 是独占整条连接直写的实现，
+            // 它不读信用 —— 给它开窗口就是两端互相等死（见 `uulan_bulk` 模块注释）。
+            match mux.register_unwindowed(id) {
                 Some(stream) => {
                     // `peer` 出作用域即注销 id（`uulan_bulk` 的 Core::Drop），
                     // 所以中途 return / panic 都不会在表里留下一个死 id。

@@ -140,6 +140,8 @@ pub async fn connect(
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 name: client_name.to_string(),
                 caps: caps.clone(),
+                // 按流窗口（M8）：声明了才可能启用，双方都声明才算数。
+                bulk_window: true,
             }),
         )
         .await?;

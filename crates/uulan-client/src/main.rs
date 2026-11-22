@@ -1058,7 +1058,7 @@ async fn main() -> Result<()> {
             eprintln!("被控端不支持端口映射（对面版本太旧，或没实现这个能力）");
             std::process::exit(2);
         }
-        let fwd = uulan_client::Forwarder::start(c.control, c.bulk);
+        let fwd = uulan_client::Forwarder::start(c.control, c.bulk, c.host.bulk_window);
         for spec in &args.forward {
             let addr = fwd.listen(spec.clone()).await.context("本机监听失败")?;
             println!(

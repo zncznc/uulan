@@ -395,6 +395,9 @@ where
                 }
                 done += bf.data.len() as u64;
             }
+            // 上传这条流不开窗口（见 uulan_bulk 模块注释），收到信用帧只能说明
+            // 两端理解不一致 —— 忽略，别把它当成一个 0 字节的数据段写进文件。
+            BulkKind::Credit => {}
         }
     }
 

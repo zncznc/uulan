@@ -279,7 +279,8 @@ impl PortMap {
 /// 收尾规则（两端对称）：本地方向读到 EOF 就发 `END`；收到对端 `END` 就 `shutdown()`
 /// 本地的写半边。两边的 END 都到了才退出 —— 只关一半的话，
 /// 「对面还在发数据、我已经不听了」会把数据丢掉（SSH 里的交互式会话尤其明显）。
-async fn bridge(id: u32, mut s: Stream, tcp: TcpStream, target: String) {
+async fn bridge(id: u32, s: Stream, tcp: TcpStream, target: String) {
+    let (mut stx, mut srx) = s.split();
     let (mut rd, mut wr) = tokio::io::split(tcp);
     let (dtx, mut drx) = mpsc::channel::<bytes::Bytes>(DOWN_HIGH);
     let down = Arc::new(AtomicU64::new(0));
@@ -298,52 +299,68 @@ async fn bridge(id: u32, mut s: Stream, tcp: TcpStream, target: String) {
         let _ = wr.shutdown().await;
     });
 
-    let mut buf = vec![0u8; BUF];
-    let mut to_target_sent_end = false; // 目标方向的 END 已经发过
-    let mut from_target_closed = false; // 收到了控制端的 END
-    let mut up = 0u64;
-    let mut pending: Option<bytes::Bytes> = None;
-
-    loop {
-        if to_target_sent_end && from_target_closed && pending.is_none() {
-            break;
-        }
-        tokio::select! {
-            // 控制端 → 目标
-            f = s.recv(), if !from_target_closed && pending.is_none() => match f {
-                Some(f) => match f.kind {
-                    BulkKind::Data => { pending = Some(f.data); }
-                    BulkKind::End => { from_target_closed = true; }
-                },
-                None => break, // bulk 流没了（连接断了 / 会话收尾）
-            },
-            // 目标 → 控制端
-            n = rd.read(&mut buf), if !to_target_sent_end => match n {
+    // 读目标同样必须是**独立任务**（2026-11-22）：按流窗口让 `send_data` 会等对端消费，
+    // 留在 select 分支体里就变成「上行等窗口 → 下行没人读」（同 11-21 的同族 bug）。
+    let w_up_target = target.clone();
+    let up = Arc::new(AtomicU64::new(0));
+    let up_ctr = up.clone();
+    let up_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; BUF];
+        loop {
+            match rd.read(&mut buf).await {
                 Ok(0) => {
-                    to_target_sent_end = true;
-                    if s.send_end().await.is_err() { break }
+                    let _ = stx.send_end().await;
+                    break;
                 }
                 Ok(k) => {
-                    up += k as u64;
-                    if s.send_data(&buf[..k]).await.is_err() { break }
+                    up_ctr.fetch_add(k as u64, Ordering::Relaxed);
+                    if stx.send_data(&buf[..k]).await.is_err() {
+                        break;
+                    }
                 }
                 Err(e) => {
-                    debug!(id, target = %target, error = %e, "读目标失败，映射收尾");
-                    let _ = s.send_end().await;
-                    to_target_sent_end = true;
+                    debug!(id, target = %w_up_target, error = %e, "读目标失败，映射收尾");
+                    let _ = stx.send_end().await;
+                    break;
                 }
-            },
-            p = dtx.reserve(), if pending.is_some() => match p {
-                Ok(permit) => {
-                    if let Some(b) = pending.take() { permit.send(b); }
+            }
+        }
+    });
+
+    // 下行：bulk 流 → 目标。`dtx.send().await` 等写任务腾位置，这就是这条流的反压。
+    let mut stream_gone = false;
+    loop {
+        match srx.recv().await {
+            Some(f) => match f.kind {
+                BulkKind::Data => {
+                    if dtx.send(f.data).await.is_err() {
+                        break;
+                    }
                 }
-                Err(_) => break,
+                BulkKind::End => break,
+                // 信用帧在读任务里就消化掉了，这里永远见不到。
+                BulkKind::Credit => {}
             },
+            None => {
+                stream_gone = true;
+                break;
+            }
         }
     }
     drop(dtx);
     let _ = writer.await;
-    info!(id, target = %target, up, down = down.load(Ordering::Relaxed), "端口映射结束");
+    if stream_gone {
+        up_task.abort();
+    } else {
+        let _ = up_task.await;
+    }
+    info!(
+        id,
+        target = %target,
+        up = up.load(Ordering::Relaxed),
+        down = down.load(Ordering::Relaxed),
+        "端口映射结束"
+    );
 }
 
 

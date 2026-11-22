@@ -191,7 +191,10 @@ struct Inner {
 
 impl Forwarder {
     /// 接管已鉴权的控制连接与 bulk 连接。
-    pub fn start(control: SecControl, bulk: SecConn) -> Self {
+    ///
+    /// `bulk_window` 来自握手（`HostHelloOk::bulk_window`）：控制端自己一定支持，
+    /// 所以只要对面也声明了就开按流窗口。老被控端不发这个位 → 保持老行为。
+    pub fn start(control: SecControl, bulk: SecConn, bulk_window: bool) -> Self {
         let (cr, mut cw) = control.into_split();
         let (br, bw) = bulk.into_split();
         let (tx, mut rx) = mpsc::channel::<Out>(64);
@@ -264,7 +267,11 @@ impl Forwarder {
             inner: Arc::new(Inner {
                 ctl: tx,
                 pending,
-                mux: uulan_bulk::spawn(br, bw),
+                mux: uulan_bulk::spawn_windowed(
+                    br,
+                    bw,
+                    bulk_window.then_some(uulan_bulk::STREAM_WINDOW),
+                ),
                 next_id: AtomicU64::new(1),
                 stats: Arc::new(Counters::default()),
                 listeners: Mutex::new(Vec::new()),
@@ -386,7 +393,8 @@ fn resolve(
 
 /// 本机 socket ↔ bulk 流 的对拷（与控制端相反的视角，规则一致）：
 /// 本地读到 EOF 就发 `END`；收到 `END` 就 `shutdown()` 本地写半边；两边都结束才退出。
-async fn bridge(id: u32, mut s: Stream, tcp: TcpStream, st: Arc<Counters>) {
+async fn bridge(id: u32, s: Stream, tcp: TcpStream, st: Arc<Counters>) {
+    let (mut stx, mut srx) = s.split();
     let (mut rd, mut wr) = tokio::io::split(tcp);
     let (dtx, mut drx) = mpsc::channel::<bytes::Bytes>(DOWN_QUEUE);
     // 写本机连接的是**独立任务**：以前 `tcp.write_all(...).await` 写在 select 分支体里，
@@ -404,47 +412,64 @@ async fn bridge(id: u32, mut s: Stream, tcp: TcpStream, st: Arc<Counters>) {
         let _ = wr.shutdown().await;
     });
 
-    let mut buf = vec![0u8; BUF];
-    let mut local_done = false;
-    let mut remote_done = false;
-    let mut pending: Option<bytes::Bytes> = None;
-    loop {
-        if local_done && remote_done && pending.is_none() {
-            break;
-        }
-        tokio::select! {
-            n = rd.read(&mut buf), if !local_done => match n {
+    // 读本机连接同样必须是**独立任务**（2026-11-22）：开了按流窗口以后 `send_data`
+    // 会等对端消费，把它留在 `select!` 的分支体里就变成「上行等窗口 → 下行没人读」，
+    // 正是 11-21 那个只发不收死锁的同族 bug —— 只不过这次是被流控触发的。
+    // 一个方向一个任务，两个方向各自卡在自己的地方，谁也挡不住谁。
+    let up_st = st.clone();
+    let up = tokio::spawn(async move {
+        let mut buf = vec![0u8; BUF];
+        loop {
+            match rd.read(&mut buf).await {
                 Ok(0) => {
-                    local_done = true;
-                    if s.send_end().await.is_err() { break }
+                    let _ = stx.send_end().await;
+                    break;
                 }
                 Ok(k) => {
-                    st.up.fetch_add(k as u64, Ordering::Relaxed);
-                    if s.send_data(&buf[..k]).await.is_err() { break }
+                    up_st.up.fetch_add(k as u64, Ordering::Relaxed);
+                    if stx.send_data(&buf[..k]).await.is_err() {
+                        break;
+                    }
                 }
                 Err(e) => {
                     debug!(id, error = %e, "本机连接读失败，转发收尾");
-                    let _ = s.send_end().await;
-                    local_done = true;
+                    let _ = stx.send_end().await;
+                    break;
                 }
-            },
-            f = s.recv(), if !remote_done && pending.is_none() => match f {
-                Some(f) => match f.kind {
-                    BulkKind::Data => { pending = Some(f.data); }
-                    BulkKind::End => { remote_done = true; }
-                },
-                None => break,
-            },
-            p = dtx.reserve(), if pending.is_some() => match p {
-                Ok(permit) => {
-                    if let Some(b) = pending.take() { permit.send(b); }
+            }
+        }
+    });
+
+    // 下行：bulk 流 → 本机连接。`dtx.send().await` 会等写任务腾出位置，
+    // 那就是这条流自己的反压（对端会因为收不到信用而停下），不影响别的流。
+    let mut stream_gone = false;
+    loop {
+        match srx.recv().await {
+            Some(f) => match f.kind {
+                BulkKind::Data => {
+                    if dtx.send(f.data).await.is_err() {
+                        break;
+                    }
                 }
-                Err(_) => break,
+                BulkKind::End => break,
+                // 信用帧在读任务里就消化掉了，这里永远见不到；留个分支免得将来 panic。
+                BulkKind::Credit => {}
             },
+            None => {
+                stream_gone = true;
+                break;
+            }
         }
     }
-    drop(dtx);          // 写任务把队列里的字节写完，再关本地写半边
+    drop(dtx); // 写任务把队列里的字节写完，再关本地写半边
     let _ = writer.await;
+    if stream_gone {
+        // 流没了（连接断了 / 会话收尾）：上行那边可能还堵在本机 socket 上，直接掐掉。
+        up.abort();
+    } else {
+        // 对端 END 只代表「它说完了」，本机还可能在发 —— 等它自己收尾（半关闭语义）。
+        let _ = up.await;
+    }
     debug!(id, "一条转发结束");
 }
 

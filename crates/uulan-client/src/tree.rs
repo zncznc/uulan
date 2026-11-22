@@ -321,6 +321,9 @@ async fn download_one(
                 f.write_all(&bf.data).await?;
                 got += bf.data.len() as u64;
             }
+            // 文件传输的流**不开窗口**（控制端 fsx 直写、不读信用），所以这里不该出现
+            // 信用帧。真出现了就说明两端对这条流的模式理解不一致 —— 忽略它比猜安全。
+            BulkKind::Credit => {}
         }
     }
     f.flush().await?;

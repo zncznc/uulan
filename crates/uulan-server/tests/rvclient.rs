@@ -232,6 +232,7 @@ async fn two_endpoints_pair_all_channels_and_exchange_application_frames() -> Re
             version: "0.1.0".into(),
             name: "我的电脑".into(),
             caps: vec![],
+            bulk_window: false,
         }))?,
     )
     .await?;
@@ -251,6 +252,7 @@ async fn two_endpoints_pair_all_channels_and_exchange_application_frames() -> Re
         name: "麒麟-01".into(),
         screen: Screen { w: 1920, h: 1080 },
         caps: vec![],
+        bulk_window: false,
         has_desktop: true,
     });
     write_frame(&mut hc, FrameKind::Json, &serde_json::to_vec(&hello)?).await?;

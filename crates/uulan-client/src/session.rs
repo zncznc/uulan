@@ -877,6 +877,7 @@ mod tests {
             name: "mis-pc".into(),
             screen: uulan_protocol::msg::Screen { w: 1920, h: 1080 },
             caps: vec![],
+            bulk_window: false,
             has_desktop: true,
         };
         let stats = Arc::new(WatchStats::default());
