@@ -1,0 +1,90 @@
+PAM 校验 TCSAFLUSH 竞争修复与 OS 认证模式真机成功路径验收 —— 2026-11-25
+========================================================================
+
+一、问题现象
+────────────
+用户在 Windows 图形面板（uulan-gui.exe）选择系统账户模式（用户名 `mis` + 系统登录密码，
+经中继 `192.168.223.15:21116` 连设备 `805747189`）点击「开始远程控制」，10 秒后失败：
+- 面板提示：`远程会话异常结束（退出码 1，用时 10 秒）—— 被控端拒绝：被控端不允许连接`
+- 真机 `journalctl --user -u uulan-host` 原文：
+  `11月 25 16:47:01 mis-pc uulan-host[1961917]: INFO uulan_host::session: 认证方式：系统账户口令（OS 模式，中继不再受 PAKE 保护） peer=192.168.223.6:51618`
+  `11月 25 16:47:11 mis-pc uulan-host[1961917]: WARN uulan_host::session: OS 认证无法判定 peer=192.168.223.6:51618 error=PAM 校验超时（su 还在等输入 —— 按一次失败处理）`
+
+顺带定位本机启动问题：
+- `D:\default-workspace\uulan\target\release\uulan-gui.exe` 与 `uulan-client.exe` 继承了
+  `Mandatory Label\Low Mandatory Level:(I)(NW)`，直接启动均返回 `0xC0000142`
+  （`STATUS_DLL_INIT_FAILED`）。复制到 `C:\Users\chaoc\AppData\Local\uulan\bin\` 并核对
+  SHA256 一致后，面板正常弹出并可联网。
+
+二、根因与真机探针证据
+────────────
+在真机 `192.168.223.15`（`su，来自 util-linux 2.34`）上用 Python pty 探针观察 `su mis -c /bin/true`
+（未输入任何密码，收到提示符后即 SIGKILL）：
+  `dt=0.016s echo=False prompt=b'\xe8\xbe\x93\xe5\x85\xa5\xe5\xaf\x86\xe7\xa0\x81'`（UTF-8「输入密码」）
+
+`su` / `pam_unix` 启动约 16 ms 后才调用 `tcsetattr(..., TCSAFLUSH, ...)` 关闭回显并**清空
+pty 输入缓冲**，随后打印提示符等待输入。旧版 `crates/uulan-host/src/pam.rs` 在
+`spawn_command` 后零等待立即把密码写进 pty，密码被 `TCSAFLUSH` 冲掉，`su` 一直干等到
+10 秒超时被强杀。
+
+三、改动（仅 `crates/uulan-host/src/pam.rs`）
+────────────
+1. 抽出内部函数 `run_pty_prompt_auth(cmd, password, timeout)`，由 `system_checker` 调用。
+2. 读取线程持续把 pty 输出读干丢弃（仍严守规矩 3：任何字节都不保留、不写日志），仅在
+   首次读到非空输出时经 channel 通知主线程「提示符已出、TCSAFLUSH 已过」。
+3. 主线程轮询 `child.try_wait()` 与提示符信号；收到提示符后短暂让步 10 ms 再写一次口令
+   并 `flush()`（仍严守规矩 2：只写这一次；规矩 1：名单外绝不调用 PAM 在 `session.rs`
+   外层未动）。若写入瞬间子进程已因账户不存在等原因退出，先复查 `child.try_wait()`，
+   避免把干净失败误报成写管道错。
+4. 补充 2 条 `#[cfg(unix)]` 单元测试：
+   - `waits_for_prompt_so_tcsaflush_does_not_swallow_password`：模拟启动 50 ms 后清空
+     提前到达的缓冲再打印 `Password: `，验证正确口令 `Ok(true)`、错误口令 `Ok(false)`。
+   - `hung_prompt_times_out_cleanly`：卡死子进程按超时强杀返回 `Err`。
+
+四、测试与部署证据
+────────────
+1. 真机单元测试与全量测试（`192.168.223.15`）：
+   - `pam::tests` **5/5 通过**（含上述 2 条新增测试）。
+   - `cargo test --workspace --no-fail-fast -- --test-threads=1`：
+     `607 passed / 2 failed / 1 ignored`（2 条失败为 `uulan-client` 合成视频帧时序用例
+     `end_to_end_host_to_client_video` 与 `source_eof_on_screen_shrink_restarts_encoder`，
+     与 PAM/认证链路无关）。
+2. 真机编译与热替换（单任务串行构建）：
+   - 备份 `~/.local/uulan/bin/uulan-host.bak-20261125_1719xx`，落 `.new` 后原子 `mv -f`。
+   - `sha256sum` 源与目标一致：
+     `8b43997930e2f89a73dc9159911bf68574b89826f98b582c1ca62c1ca70990b5`
+   - `systemctl --user kill -s KILL uulan-host` 后由 systemd 拉起新进程 PID `2424585`，
+     `is-active=active`，原有设备 ID `805747189` 不变。
+3. 真机双路复验：
+   - OS 模式名单外账户（`zzz-not-allowed`）：控制端秒拒 `OS_RC=1`，真机 journal 原文
+     `OS 认证拒绝：该账户不在允许名单（未做任何校验尝试）`（零 PAM 调用）。
+   - PAKE 备路错口令：控制端秒拒 `PAKE_RC=1`（「密码不正确」），原有 PAKE 分支无回归。
+4. **真机 OS 模式成功路径（用户亲自点击验证，未向用户索要密码）**：
+   - 真机 journal 原文：
+     `11月 25 17:21:50 mis-pc uulan-host[2424585]: 2026-11-25T09:21:50.772943Z INFO uulan_host::session: 认证方式：系统账户口令（OS 模式，中继不再受 PAKE 保护） peer=192.168.223.6:49350`
+     `11月 25 17:21:50 mis-pc su[2424851]: (to mis) mis on pts/0`
+     `11月 25 17:21:50 mis-pc su[2424851]: pam_unix(su:session): session opened for user mis by (uid=1000)`
+     `11月 25 17:21:50 mis-pc su[2424851]: pam_unix(su:session): session closed for user mis`
+     `11月 25 17:21:50 mis-pc uulan-host[2424585]: 2026-11-25T09:21:50.851015Z INFO uulan_host::session: OS 认证通过（系统账户口令） peer=192.168.223.6:49350 user=mis`
+     `11月 25 17:21:50 mis-pc uulan-host[2424585]: 2026-11-25T09:21:50.851079Z INFO uulan_host::session: 会话已授权，开始推流 peer=192.168.223.6:49350 client_os=windows client_name=ZNC-7G4D device_id=Some("805747189")`
+     `11月 25 17:21:50 mis-pc uulan-host[2424585]: 2026-11-25T09:21:50.852500Z INFO uulan_host::session: 编码源已启动 cur=VideoSettings { fps: 30, quality: Auto, max_bitrate_kbps: 0, scale: 1.0 } screen_w=1920 screen_h=1080`
+     `11月 25 17:23:41 mis-pc uulan-host[2424585]: 2026-11-25T09:23:41.253089Z INFO uulan_host::session: 键鼠事件统计 events=2404 inject_errors=0 dropped_locked=0`
+     `11月 25 17:23:41 mis-pc uulan-host[2424585]: 2026-11-25T09:23:41.259334Z INFO uulan_host: 会话结束 why=对端关闭了连接`
+   - 认证耗时约 **78 ms**，会话持续 111 秒，键鼠注入 **2404 次 / 错误 0 / 锁屏丢弃 0**。
+
+五、安全口径与代价（照实记录）
+────────────
+- OS 模式无法走 PAKE，会话密钥为纯 DH 且跳过 rekey；经中继时中继理论上可中间人看到
+  系统登录密码，直连（`192.168.223.15:21117`）无中继不受影响。
+
+六、撤法
+────────────
+- 真机二进制：`mv -f ~/.local/uulan/bin/uulan-host.bak-20261125_* ~/.local/uulan/bin/uulan-host`
+  后 `systemctl --user kill -s KILL uulan-host`。
+- 源码回退 `crates/uulan-host/src/pam.rs` 即可，无协议与配置变更。
+
+七、仍未验
+────────────
+- 本机 Windows 全量 `cargo test --workspace` 未在正常完整性目录重跑（`D:\default-workspace\uulan\target` 继承 Low Mandatory Level 导致测试 exe 返回 `0xC0000142`）；真机侧 2 条 `uulan-client` 合成视频帧时序用例（`end_to_end_host_to_client_video` / `source_eof_on_screen_shrink_restarts_encoder`）本轮失败待查。
+- OS 模式下「直连 `192.168.223.15:21117`」的真实密码成功路径未单独再点一次（本轮点的是中继路径）。
+- P2 第二因素（PAKE 口令 + 系统密码双因子）的真实密码成功路径未单独复验（共用同一个 `system_checker`）。

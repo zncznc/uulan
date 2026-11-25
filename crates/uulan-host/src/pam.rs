@@ -41,62 +41,103 @@ pub fn in_allow_list(allow: &[String], user: &str) -> bool {
 /// 也就不需要把任何口令哈希交到本程序手里。
 pub fn system_checker(timeout: Duration) -> Checker {
     Arc::new(move |user: &str, password: &str| {
-        use portable_pty::{CommandBuilder, PtySize};
-
-        let sys = portable_pty::native_pty_system();
-        let pair = sys
-            .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
-            .map_err(|e| format!("开伪终端失败：{e}"))?;
-
-        let mut cmd = CommandBuilder::new("su");
+        let mut cmd = portable_pty::CommandBuilder::new("su");
         cmd.arg(user);
         cmd.arg("-c");
         cmd.arg("/bin/true");
-        let mut child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| format!("起 su 失败（这台机器上没有 su？）：{e}"))?;
-        drop(pair.slave);
+        run_pty_prompt_auth(cmd, password, timeout)
+    })
+}
 
-        let mut killer = child.clone_killer();
-        // 规矩 3：另起线程把输出读干丢掉。pty 会回显我们写的口令，所以这段字节
-        // 一段都不许留下；不读还会把 su 卡在写满的缓冲区上。
-        if let Ok(mut rd) = pair.master.try_clone_reader() {
-            std::thread::spawn(move || {
-                let mut sink = [0u8; 4096];
-                loop {
-                    match rd.read(&mut sink) {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {}
+/// 在伪终端里跑一次口令校验进程：等它吐出提示符后再写一次口令，全程不保留任何输出。
+///
+/// 为什么**必须等提示符出来再写**：util-linux `su` / `pam_unix` 在打印 `Password:` / `输入密码`
+/// 之前会调用 `tcsetattr(..., TCSAFLUSH, ...)` 关回显并**清空 pty 输入缓冲**。
+/// `spawn` 完立刻写密码会被 `TCSAFLUSH` 一把冲掉，导致 `su` 干等到 10 秒超时
+/// （2026-11-25 麒麟真机 `su 2.34` 实测：`dt=0.016s echo=False prompt='输入密码'`）。
+fn run_pty_prompt_auth(
+    cmd: portable_pty::CommandBuilder,
+    password: &str,
+    timeout: Duration,
+) -> Result<bool, String> {
+    use portable_pty::PtySize;
+    use std::sync::mpsc;
+
+    let sys = portable_pty::native_pty_system();
+    let pair = sys
+        .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+        .map_err(|e| format!("开伪终端失败：{e}"))?;
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| format!("起 su 失败（这台机器上没有 su？）：{e}"))?;
+    drop(pair.slave);
+
+    let mut killer = child.clone_killer();
+    let (prompt_tx, prompt_rx) = mpsc::channel::<()>();
+
+    // 规矩 3：另起线程把输出读干丢掉。pty 可能回显输入，任何字节都不许留下；
+    // 仅在首次收到非空输出时发一个空信号，告诉主线程「提示符已出、TCSAFLUSH 已过」。
+    if let Ok(mut rd) = pair.master.try_clone_reader() {
+        std::thread::spawn(move || {
+            let mut sink = [0u8; 4096];
+            let mut notified = false;
+            loop {
+                match rd.read(&mut sink) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if !notified {
+                            notified = true;
+                            let _ = prompt_tx.send(());
+                        }
                     }
                 }
-            });
-        }
+            }
+        });
+    }
 
-        let mut writer = pair
-            .master
+    let mut writer = Some(
+        pair.master
             .take_writer()
-            .map_err(|e| format!("伪终端写端拿不到：{e}"))?;
-        // 规矩 2：就写这一次。
-        let sent = writer.write_all(password.as_bytes()).and_then(|_| writer.write_all(b"\n"));
-        drop(writer);
-        sent.map_err(|e| format!("写不进伪终端：{e}"))?;
+            .map_err(|e| format!("伪终端写端拿不到：{e}"))?,
+    );
 
-        let deadline = Instant::now() + timeout;
-        loop {
-            match child.try_wait() {
-                Ok(Some(st)) => return Ok(st.success()),
-                Ok(None) => {}
-                Err(e) => return Err(format!("等 su 退出失败：{e}")),
-            }
-            if Instant::now() >= deadline {
-                let _ = killer.kill();
-                // 超时按拒绝处理（见模块头：Err 一律视为不放行）。
-                return Err("PAM 校验超时（su 还在等输入 —— 按一次失败处理）".to_string());
-            }
-            std::thread::sleep(Duration::from_millis(50));
+    let deadline = Instant::now() + timeout;
+    let mut wrote = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return Ok(st.success()),
+            Ok(None) => {}
+            Err(e) => return Err(format!("等 su 退出失败：{e}")),
         }
-    })
+        // 规矩 2：收到提示符后只写这一次，绝不补写第二次。
+        if !wrote && prompt_rx.try_recv().is_ok() {
+            wrote = true;
+            std::thread::sleep(Duration::from_millis(10));
+            if let Some(mut w) = writer.take() {
+                let sent = w
+                    .write_all(password.as_bytes())
+                    .and_then(|_| w.write_all(b"\n"))
+                    .and_then(|_| w.flush());
+                drop(w);
+                if let Err(e) = sent {
+                    // 子进程可能在报错退出（如账户不存在）时刚好关闭从端，先复查退出码。
+                    if let Ok(Some(st)) = child.try_wait() {
+                        return Ok(st.success());
+                    }
+                    let _ = killer.kill();
+                    return Err(format!("写不进伪终端：{e}"));
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = killer.kill();
+            // 超时按拒绝处理（见模块头：Err 一律视为不放行）。
+            return Err("PAM 校验超时（su 还在等输入 —— 按一次失败处理）".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// 测试用的假校验器：按表放行，别的都拒。
@@ -138,5 +179,38 @@ mod tests {
         assert_eq!(c("mis", "pw1234"), Ok(true));
         assert_eq!(c("mis", "wrong"), Ok(false));
         assert_eq!(c("root", "pw1234"), Ok(false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn waits_for_prompt_so_tcsaflush_does_not_swallow_password() {
+        // 模拟 util-linux su：启动 50ms 后先清空提前写进缓冲区的字节（TCSAFLUSH），
+        // 再打印提示符并读取一行口令。若 spawn 后立刻写密码，会被清空并超时。
+        let script = r#"sleep 0.05; while read -t 0.02 -r _; do :; done; printf 'Password: '; IFS= read -r pw; [ "$pw" = "ok-pass" ]"#;
+
+        let mut cmd_ok = portable_pty::CommandBuilder::new("bash");
+        cmd_ok.args(["-c", script]);
+        assert_eq!(
+            run_pty_prompt_auth(cmd_ok, "ok-pass", Duration::from_secs(3)),
+            Ok(true)
+        );
+
+        let mut cmd_bad = portable_pty::CommandBuilder::new("bash");
+        cmd_bad.args(["-c", script]);
+        assert_eq!(
+            run_pty_prompt_auth(cmd_bad, "wrong-pass", Duration::from_secs(3)),
+            Ok(false)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hung_prompt_times_out_cleanly() {
+        let mut cmd = portable_pty::CommandBuilder::new("sh");
+        cmd.args(["-c", "sleep 5"]);
+        let t0 = Instant::now();
+        let res = run_pty_prompt_auth(cmd, "any", Duration::from_millis(250));
+        assert!(res.is_err(), "卡死的子进程必须按超时拒绝：{res:?}");
+        assert!(t0.elapsed() < Duration::from_secs(2), "超时强杀耗时过长");
     }
 }
