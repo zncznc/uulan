@@ -35,7 +35,7 @@ use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_RELAY: &str = "192.168.223.15:21116";
+const DEFAULT_RELAY: &str = "";
 
 /// 面板自己的配置。**这里现在会存访问口令**（`remember_pw=true` 时）——
 /// 用户明确要求去掉 `host.pw` 那个"读文件"的拐弯，选择"内网图省事"。
@@ -968,7 +968,11 @@ impl eframe::App for App {
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
                         ui.label("中继地址");
-                        ui.add(egui::TextEdit::singleline(&mut self.relay).desired_width(240.0));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.relay)
+                                .desired_width(240.0)
+                                .hint_text("例 192.168.1.10:21116"),
+                        );
                         // 刷新在后台线程里跑：这里只负责「按下」和「显示在跑」。
                         let busy = self.refresh.is_some();
                         let label = if busy { "刷新中…" } else { "刷新设备" };
