@@ -1,0 +1,67 @@
+握手往返压缩（四通道并发拨号 + Hello/Auth 流水线）· 真机 A/B 验收 —— 2026-11-26
+=================================================================================
+
+一、这一轮要解决什么
+────────────
+`docs/milestones/双端延迟与固定开销-2026-11-23.txt` 与
+`docs/milestones/两跳延迟视频首帧与卡顿-真机-2026-11-26.txt` 实证：
+广域网下一次 `--ls`/短操作与用户体感首帧（`e2e_first_ms`）的瓶颈都在建会话握手往返
+（改前斜率 ≈ 4.9~6 RTT，400 ms 路程 RTT 下首帧 2452 ms）。
+本轮在不改协议版本号（`PROTO_VERSION=4`、`CRYPTO_VERSION=2`）、不改任何线格式、
+100% 兼容老控制端与老被控端的前提下，实施两处零风险流水线优化。
+
+二、改动（仅 2 个文件）
+────────────
+1. `crates/uulan-protocol/src/rvclient.rs`：
+   - `relay_open_all`：由 4 条 `relay_dial().await?` 串行改为 `tokio::try_join!` 并发拨号，
+     再 `tokio::try_join!` 并发等 `RelayReady`（避免串行 4 次 TCP 三次握手）。
+   - `direct_dial_all`：同样改为 `tokio::try_join!` 并发拨 4 条直连通道（被控端
+     `direct_accept_all` 原先即按通道声明任意顺序归位）。
+2. `crates/uulan-client/src/connect.rs`：
+   - `C2H::Hello` 与紧随其后的 `C2H::Auth`（PAKE 模式）或 `C2H::PamAuth`（OS 模式）
+     改为背靠背流水线发送，随后依次读 `H2C::HelloOk` 与 `H2C::AuthOk/AuthFail`。
+   - 两者均不依赖 `HostHelloOk` 字段；被控端接收顺序、加密密钥、nonce 计数、
+     PAKE `host_proof` 校验、原地 `rekey`、OS 模式跳过 PAKE/rekey、以及 P2 第二因素
+     顺序全部保持不变。
+
+三、测试、部署与双路复验
+────────────
+1. 本机 Windows：`cargo build --release -p uulan-client` 零警告（1m 21s），
+   部署到 `C:\Users\chaoc\AppData\Local\uulan\bin\uulan-client.exe`，SHA256 一致：
+   `7536BF874BC4B320E2313EF8FFAE57FE08C5DD8A9E73580FD1B9220521EF8318`。
+2. 真机 `192.168.223.15`：
+   - `cargo test --workspace --no-fail-fast -- --test-threads=1`：`607 passed / 2 failed / 1 ignored`
+     （2 条失败为既有 `uulan-client` 合成视频帧时序用例，协议/认证/host 全绿）。
+   - `cargo build --release -p uulan-host` 零警告；原子热替换后 `sha256sum` 一致：
+     `52c9152a4a6bbd2b6f0deb9a1928cce2cbd70c28f1b4f3467b69da44b9d56733`，`uulan-host` `active`。
+3. 真机双路认证复验：
+   - OS 模式名单外账户（`zzz-not-allowed`）：秒拒 `OS_OFFLIST_RC=1`（「被控端不允许连接」）。
+   - PAKE 备路错口令：秒拒 `PAKE_BADPW_RC=1`（「密码不正确」）。
+
+四、真机 A/B 实测对比（同一台架 `scripts/verify-video-dual-leg-e2e.sh`，改前 `08dbed3` vs 改后）
+────────────
+两轮均 **7 通过 / 0 失败 / 0 跳过**（`BENCH_R1_RC=0`、`BENCH_R2_RC=0`），
+全档 `drop=0 / steady_drop=0 / corr=0.9999`（fast 档 `0.9902~0.9916`）：
+
+  档位        路程RTT   改前 e2e_first_ms(轮1/轮2)   改后 e2e_first_ms(轮1/轮2)   缩短幅度
+  d0-auto       0 ms         531 / 467 ms                 467 / 484 ms              同档
+  d25-auto    100 ms         891 / 890 ms                 812 / 813 ms           −78 ms (−8.8%)
+  d50-auto    200 ms        1437 / 1641 ms               1218 / 1266 ms         −219~375 ms (−19%)
+  d50-fast    200 ms        1641 / 1484 ms               1233 / 1202 ms         −282~408 ms (−22%)
+  d100-auto   400 ms        2452 / 2452 ms               2046 / 2016 ms         −406~436 ms (−17%)
+
+斜率变化：`(2452−499)/400 = 4.88 RTT` → `(2031−475)/400 = 3.89 RTT`，**实测整整压缩 1.0 个完整端到端 RTT**。
+
+五、安全口径与撤法
+────────────
+- 安全模型与改动前完全一致：PAKE 模式仍双向证明 + 原地 rekey；OS 模式仍纯 DH + 跳过 rekey
+  （经中继时中继理论上可中间人看到系统登录密码，直连不受影响）。
+- 撤法：真机恢复 `~/.local/uulan/bin/uulan-host.bak-*` 并 `systemctl --user kill -s KILL uulan-host`，
+  源码回退两个文件即可，无协议/配置变更。
+
+六、仍未验
+────────────
+- 新客户端 + 旧被控端二进制的跨版本真机实测（线格式零变更，理论上 100% 兼容，本轮未单独起旧件对照）。
+- OS 模式真实登录密码成功路径在本次改后未再次请用户点击复测（逻辑与上一轮跑通版等价）。
+- 若要进一步把 3.9 RTT 压到 2 RTT，需改动协议（如把 CryptoHello 与 PakeInit/AuthMode 合并进首包），
+  属协议升级项，留作后续独立里程碑。

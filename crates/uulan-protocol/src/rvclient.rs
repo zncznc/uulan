@@ -236,22 +236,26 @@ impl RvConn {
         session: &str,
         role: Role,
     ) -> Result<RelaySet, RvError> {
-        // 先把四条都拨出去，再一起等 ready。
-        // 若改成「拨一条等一条」，对端在第一条上就会和我们互相等待（虽然也能成，
-        // 但会把配对串行化，四条通道的建立时间叠加）。
+        // 并发拨出四条通道、再并发等 ready：
+        // 过去四条串行 `relay_dial().await?` 会把 4 次 TCP 三次握手串起来（高 RTT 下多烧 3 个单腿 RTT），
+        // `try_join!` 让四条 SYN 与 RelayOpen 同时在途，零协议改动、100% 兼容老端与老中继。
         //
         // **音频通道也在这里一次拨齐**（M7）。做成「要用了再拨」的话，两端都得
         // 在会话中途协商谁先拨、谁等谁，多出一整条状态机；而多一条空闲 TCP
         // 连接的代价是可以忽略的（内网 RTT < 1ms，不传就一个字节都没有）。
         // 用不用它由控制端的 `C2H::AudioStart` 决定 —— 通道开着 ≠ 有声音在传。
-        let mut control = self.relay_dial(session, Channel::Control, role).await?;
-        let mut video = self.relay_dial(session, Channel::Video, role).await?;
-        let mut bulk = self.relay_dial(session, Channel::Bulk, role).await?;
-        let mut audio = self.relay_dial(session, Channel::Audio, role).await?;
-        await_relay_ready(&mut control).await?;
-        await_relay_ready(&mut video).await?;
-        await_relay_ready(&mut bulk).await?;
-        await_relay_ready(&mut audio).await?;
+        let (mut control, mut video, mut bulk, mut audio) = tokio::try_join!(
+            self.relay_dial(session, Channel::Control, role),
+            self.relay_dial(session, Channel::Video, role),
+            self.relay_dial(session, Channel::Bulk, role),
+            self.relay_dial(session, Channel::Audio, role),
+        )?;
+        tokio::try_join!(
+            await_relay_ready(&mut control),
+            await_relay_ready(&mut video),
+            await_relay_ready(&mut bulk),
+            await_relay_ready(&mut audio),
+        )?;
         Ok(RelaySet { control, video, bulk, audio })
     }
 
@@ -373,12 +377,16 @@ async fn direct_dial_one(addr: &str, channel: Channel, role: Role) -> Result<Tcp
     Ok(s)
 }
 
-/// 控制端：一次拨齐四条直连通道（顺序拨，被控端逐条回执，语义与 relay_open_all 对齐）。
+/// 控制端：一次并发拨齐四条直连通道（被控端 `direct_accept_all` 任意顺序归位，语义与 relay_open_all 对齐）。
+///
+/// 并发拨号可省掉 3 个串行 TCP+回执 RTT，零协议改动、完全兼容老被控端。
 pub async fn direct_dial_all(addr: &str) -> Result<RelaySet, RvError> {
-    let control = direct_dial_one(addr, Channel::Control, Role::Client).await?;
-    let video = direct_dial_one(addr, Channel::Video, Role::Client).await?;
-    let bulk = direct_dial_one(addr, Channel::Bulk, Role::Client).await?;
-    let audio = direct_dial_one(addr, Channel::Audio, Role::Client).await?;
+    let (control, video, bulk, audio) = tokio::try_join!(
+        direct_dial_one(addr, Channel::Control, Role::Client),
+        direct_dial_one(addr, Channel::Video, Role::Client),
+        direct_dial_one(addr, Channel::Bulk, Role::Client),
+        direct_dial_one(addr, Channel::Audio, Role::Client),
+    )?;
     Ok(RelaySet { control, video, bulk, audio })
 }
 

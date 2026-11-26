@@ -146,7 +146,18 @@ pub async fn connect(
         // Hello/Auth 也必须是密文，而且这两半之后要一直用到会话结束（计数器不能归零重来）。
         let mut ctl = SecControl::new(control, &keys0.channel(Channel::Control), Role::Client);
 
-        // 1) Hello
+        // 1) Hello + Auth 背靠背流水线发送（零协议改动，省 1 个完整端到端 RTT）：
+        //    Auth 证明（PAKE）与 PamAuth 凭据（OS 模式）均不依赖 HostHelloOk 字段；
+        //    被控端本来就按顺序读 Hello → 发 HelloOk → 读 Auth/PamAuth → 发 AuthOk，
+        //    因此 100% 兼容老被控端，且不改变加密密钥、nonce 计数与 rekey 时机。
+        if os_mode {
+            let user = std::env::var("UULAN_OS_USER").unwrap_or_default();
+            if user.is_empty() {
+                return Err(ClientError::Unexpected(
+                    "要用用户名密码认证，必须给 --os-user".into(),
+                ));
+            }
+        }
         send_c2h(
             &mut ctl.wr,
             &C2H::Hello(ClientHello {
@@ -162,7 +173,20 @@ pub async fn connect(
         )
         .await?;
 
-        // 2) HelloOk
+        // 2) 紧接着发 Auth / PamAuth（不干等 HelloOk 回来）：
+        //    备路（临时码/口令）送证明，口令本身从不上线；
+        //    OS 模式送「系统账户名 + 登录密码」—— 此处通道已是密文，但**没有 PAKE**，
+        //    中继在理论上能中间人看到这个密码（这是换掉 PAKE 的已知代价）。
+        if os_mode {
+            let user = std::env::var("UULAN_OS_USER").unwrap_or_default();
+            let password = std::env::var("UULAN_OS_PASSWORD").unwrap_or_default();
+            send_c2h(&mut ctl.wr, &C2H::PamAuth { user, password }).await?;
+        } else {
+            let proofs: Vec<String> = cands.iter().map(|k| k.client_proof()).collect();
+            send_c2h(&mut ctl.wr, &C2H::Auth { proofs }).await?;
+        }
+
+        // 3) 依次收 HelloOk 与 AuthOk/AuthFail
         let host: H2C = match read_h2c(&mut ctl.rd).await? {
             Some(m) => m,
             None => return Err(ClientError::Unexpected("握手期间被控端断开".into())),
@@ -172,25 +196,6 @@ pub async fn connect(
             H2C::Bye { reason } => return Err(ClientError::Rejected(reason)),
             other => return Err(ClientError::Unexpected(format!("{other:?}"))),
         };
-
-        // 3) Auth：一组口令证明，口令本身从不上线。
-        //    每个候选次序各给一份 —— 被控端看哪份对得上它自己的共享点，就知道我们用的是哪个凭据。
-        // 备路（临时码/口令）送证明，口令本身从不上线；
-        // OS 模式送「系统账户名 + 登录密码」—— 此处通道已是密文，但**没有 PAKE**，
-        // 中继在理论上能中间人看到这个密码（这是换掉 PAKE 的已知代价）。
-        if os_mode {
-            let user = std::env::var("UULAN_OS_USER").unwrap_or_default();
-            let password = std::env::var("UULAN_OS_PASSWORD").unwrap_or_default();
-            if user.is_empty() {
-                return Err(ClientError::Unexpected(
-                    "要用用户名密码认证，必须给 --os-user".into(),
-                ));
-            }
-            send_c2h(&mut ctl.wr, &C2H::PamAuth { user, password }).await?;
-        } else {
-            let proofs: Vec<String> = cands.iter().map(|k| k.client_proof()).collect();
-            send_c2h(&mut ctl.wr, &C2H::Auth { proofs }).await?;
-        }
 
         let resp: H2C = match read_h2c(&mut ctl.rd).await? {
             Some(m) => m,
