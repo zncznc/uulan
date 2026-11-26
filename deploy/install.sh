@@ -186,6 +186,11 @@ if [ -x "$BIN_DIR/uulan-client" ]; then
     install -m 0755 "$BIN_DIR/uulan-client" "$PREFIX/bin/uulan-client"
     HAVE_CLIENT=1
 fi
+HAVE_GUI=0
+if [ -x "$BIN_DIR/uulan-gui" ]; then
+    install -m 0755 "$BIN_DIR/uulan-gui" "$PREFIX/bin/uulan-gui"
+    HAVE_GUI=1
+fi
 if [ -d "$HERE/doc" ]; then
     cp -f "$HERE/doc/"*.md "$PREFIX/doc/" 2>/dev/null || true
 fi
@@ -240,10 +245,21 @@ if [ "$DO_HOST" = 1 ]; then
     fi
 
     say "安装 uulan-host.service（用户单元）"
-    install -d -m 0755 "$USER_UNIT_DIR"
+    # 若此前曾以 root 建出过 ~/.config/systemd 导致属主为 root，先修复归属，
+    # 否则随后的 `systemctl --user enable` 建 default.target.wants 软链会报 Failed。
+    if [ "$(id -u)" = 0 ] && [ -d "$USER_HOME/.config/systemd" ]; then
+        chown -R "$UULAN_USER:$UULAN_USER" "$USER_HOME/.config/systemd" || true
+    fi
+    as_user install -d -m 0755 "$USER_UNIT_DIR" "$USER_UNIT_DIR/default.target.wants"
     sed -e "s|@UULAN_PREFIX@|$PREFIX|g" -e "s|@UULAN_SERVER@|$SERVER|g" \
         "$UNIT_SRC/uulan-host.service" > "$USER_UNIT_DIR/uulan-host.service"
-    [ "$(id -u)" = 0 ] && chown "$UULAN_USER" "$USER_UNIT_DIR/uulan-host.service" || true
+    if [ "$(id -u)" = 0 ]; then
+        chown -R "$UULAN_USER:$UULAN_USER" "$USER_HOME/.config/systemd" || true
+    fi
+    # 清理悬空旧软链，避免 systemd 245 报 Unit file .../default.target.wants/uulan-host.service does not exist
+    if [ -L "$USER_UNIT_DIR/default.target.wants/uulan-host.service" ] && [ ! -e "$USER_UNIT_DIR/default.target.wants/uulan-host.service" ]; then
+        rm -f "$USER_UNIT_DIR/default.target.wants/uulan-host.service"
+    fi
 
     # 开机即启动（不等登录）。被控端自己等 X，所以「先开机后登录」也能追上。
     loginctl enable-linger "$UULAN_USER" \
@@ -265,6 +281,19 @@ if [ "$DO_HOST" = 1 ]; then
             user_ctl status --no-pager uulan-host.service || true
             die "被控端没起来（X 没就绪时会一直重试，见 journalctl --user -u uulan-host）"
         fi
+    fi
+fi
+
+# ---------- 图形面板与桌面图标（包里带 uulan-gui 就自动装上） ----------
+if [ "$HAVE_GUI" = 1 ]; then
+    GUI_SCRIPT=""
+    for c in "$HERE/install-gui.sh" "$HERE/../scripts/install-kylin-gui.sh"; do
+        [ -f "$c" ] && { GUI_SCRIPT="$c"; break; }
+    done
+    if [ -n "$GUI_SCRIPT" ]; then
+        say "安装图形面板与桌面图标「uulan 远程协助」"
+        as_user bash "$GUI_SCRIPT" --bin "$PREFIX/bin/uulan-gui" \
+            || echo "警告: 桌面图标安装未完全成功，可切到 $UULAN_USER 手动跑 bash install-gui.sh" >&2
     fi
 fi
 
