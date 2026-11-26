@@ -1,0 +1,56 @@
+广域网恶劣链路台架（抖动 / 停顿 / 限速）· 真机验收 —— 2026-11-26
+==================================================================
+
+一、这一轮要回答什么、口径是什么
+────────────
+此前 `scripts/latency-proxy.py` 只模拟固定单向延迟。本轮扩展为保序抖动、单向令牌桶限速与
+周期性重传停顿，在真机 `192.168.223.15`（X11 `:0` 1920x1080@30fps）上验证三条广域网退化边界：
+  A. 高抖动 + 周期性重传停顿（`delay=25ms, jitter=30ms, stall=200ms/2s`）下视频是否断线/花屏；
+  B. 4 Mbps 窄带宽下 `auto` 与 `--quality fast` 的首帧与帧率对照；
+  C. 8 Mbps 窄带宽 + 抖动下 bulk 4 MiB 全双工（`w=16` vs `w=64`）是否一致、窗口放大在带宽封顶时是否仍有收益。
+
+**口径**：用户态代理模拟的是 TCP 层的保序抖动、周期性队头阻塞停顿与单向限速，
+不等同于内核 `tc netem` 的真实 IP 层随机丢包与拥塞控制交互；不动真机正式服务与配置，
+独立端口 `:21986/:21987`，收尾全清。
+
+二、改动
+────────────
+1. `scripts/latency-proxy.py`：完全向后兼容原 3 个位置参数，新增可选参数
+   `--jitter-ms`（保序抖动）、`--rate-kbps`（单向限速）、`--stall-every-s` / `--stall-ms`（周期停顿）、`--seed`。
+2. 新增 `scripts/verify-wan-impairment-e2e.sh`：覆盖场景 A/B/C，机器可查判据。
+
+三、真机实测结果（正式两轮，均 7 通过 / 0 失败 / 0 跳过）
+────────────
+轮 1（`wanimp-20261126-092301`，RC=0）：
+  场景A jitter-stall-auto : aus=237 dec=232 drop=0 fps=28.7 first_ms=201 kbps=7851 corr=0.9999
+  场景B rate4m-auto       : aus=90  dec=84  drop=0 fps=10.4 first_ms=814 kbps=2948 corr=0.9999
+  场景B rate4m-fast       : aus=235 dec=231 drop=0 fps=28.6 first_ms=314 kbps=999  corr=0.9935
+  场景C bulk wan-w16 4MiB : ok=true ms=6358 mbps=5.28 got=4194304 err=[]
+  场景C bulk wan-w64 4MiB : ok=true ms=8140 mbps=4.12 got=4194304 err=[]
+
+轮 2（`wanimp-20261126-092352`，RC=0）：
+  场景A jitter-stall-auto : aus=239 dec=233 drop=0 fps=28.7 first_ms=209 kbps=7841 corr=0.9999
+  场景B rate4m-auto       : aus=105 dec=92  drop=0 fps=11.4 first_ms=873 kbps=3449 corr=0.9999
+  场景B rate4m-fast       : aus=235 dec=231 drop=0 fps=28.6 first_ms=304 kbps=1000 corr=0.9934
+  场景C bulk wan-w16 4MiB : ok=true ms=6218 mbps=5.40 got=4194304 err=[]
+  场景C bulk wan-w64 4MiB : ok=true ms=5657 mbps=5.93 got=4194304 err=[]
+
+四、关键结论（工程边界）
+────────────
+1. **抗抖动/停顿能力**：`25ms + 30ms` 抖动叠加每 2 秒 200ms 停顿下，1080p30 仍稳在
+   `28.7 fps / drop=0 / corr=0.9999`，不断线、不花屏。
+2. **窄带宽下 `--quality fast` 收益显著**：4 Mbps 限速下 `auto` 被 TCP 反压降到
+   `10.4~11.4 fps`、首帧 `814~873 ms`；切 `--quality fast`（~1 Mbps）后帧率救回
+   `28.6 fps`（2.5~2.7×）、首帧压到 `304~314 ms`（快 2.6~2.9×）、`drop=0`。
+3. **带宽封顶时放大 bulk 窗口无提速**：8 Mbps 限速下 4 MiB 全双工 `w=16` 为 `5.28~5.40 Mbps`，
+   `w=64` 为 `4.12~5.93 Mbps`（受排队抖动影响方差更大），sha256 全一致不丢字节。
+   调参口诀：高 RTT 高带宽调大 `--bulk-window`；窄带宽场景保持默认 16 帧即可。
+
+五、撤法
+────────────
+- 零产品代码改动，未动真机正式服务与配置；收尾已删 `/tmp/uulan-wanimp.*` 与临时口令。
+
+六、仍未验
+────────────
+- 内核层 `tc netem` 真实 IP 随机丢包（需 root 改 qdisc，真机 `mis` 无免密 sudo）。
+- 握手往返数（≈5~6 RTT）压缩尚未实施（下一里程碑项）。
