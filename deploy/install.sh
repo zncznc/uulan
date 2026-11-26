@@ -237,11 +237,13 @@ if [ "$DO_HOST" = 1 ]; then
     install -d -m 0700 "$CFG_DIR"
     [ "$(id -u)" = 0 ] && chown "$UULAN_USER" "$CFG_DIR" || true
 
-    # 配置文件不存在就先让程序自己生成（随机 12 位密码 + 0600）。
+    # 配置文件不存在就先让程序自己生成（随机 12 位密码 + 0600），并默认开启
+    # 系统账户认证（只允许当前桌面用户 $UULAN_USER，绝不放 root；同时保留临时码备路）。
     # 这里**故意不打印密码**：安装输出经常被贴进工单/日志。看密码用 `uulan-host --show`。
     if [ ! -f "$CFG" ]; then
-        say "生成配置文件 $CFG（访问密码随机；用 uulan-host --show 查看）"
+        say "生成配置文件 $CFG（默认启用系统账户认证：仅允许 $UULAN_USER；临时码备路照常可用）"
         as_user "$PREFIX/bin/uulan-host" --server "$SERVER" --show >/dev/null
+        as_user "$PREFIX/bin/uulan-host" --pam --pam-allow "$UULAN_USER" --auth os >/dev/null
     fi
 
     say "安装 uulan-host.service（用户单元）"
