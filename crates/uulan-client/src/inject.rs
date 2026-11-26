@@ -367,7 +367,7 @@ pub async fn run_with(hooks: Hooks, steps: &[Step], annotate: bool) -> Result<Ou
     let hs = hooks.status.snapshot();
     if hs.known && hs.locked {
         // 说清楚「为什么一条都没注入」：不然看图的人会以为是注入坏了。
-        println!("被控端处于锁屏：键鼠按策略不发（XTest 会绕过锁屏抓取，往锁屏里打字有风险）");
+        println!("提示：被控端当前处于锁屏界面，键鼠事件已按远程解锁模式照常发送");
     }
     println!(
         "已发送 {} 条输入帧（移动 {} / 按键 {} / 文本 {} / 点击 {} / 滚轮 {}；未送出 {}；被控端拒绝 {}）",

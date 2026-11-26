@@ -184,33 +184,32 @@ async fn locked_host_reports_state_and_load_and_the_client_stops_injecting() {
         s.cpu_pct_x100 as f64 / 100.0
     );
 
-    // ③ 锁屏期间控制端根本不该把键鼠发出去
+    // ③ 锁屏期间控制端照常发送键鼠，被控端照常注入（支持远程解锁）
     let input = link.input();
     assert!(input.send(C2H::MouseMoveAbs { x: 0.5, y: 0.5 }), "通道没坏，返回 true");
     assert!(input.send(C2H::Key { vk: 0x41, down: true, repeat: false }));
-    // 非输入消息照走（锁屏时还要能传文件、发剪贴板）—— 用 Ping 当哨兵
+    // 非输入消息照走
     assert!(input.send(C2H::Ping { seq: 7, sent_ms: 0 }));
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while out.lock().unwrap().len() < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "锁屏时键鼠应照常注入，实际收到：{:?}",
+            out.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let dropped = st.snapshot().dropped_locked;
-    assert_eq!(dropped, 2, "两条输入应当被控制端挡下，实际挡了 {dropped}");
-    assert!(
-        out.lock().unwrap().is_empty(),
-        "锁屏时被控端一条注入指令都不该收到：{:?}",
-        out.lock().unwrap()
-    );
-    assert_eq!(link.stats().snapshot().total(), 0, "没发出去就不该计入上报数");
+    assert_eq!(dropped, 0, "锁屏不再拦截键鼠，dropped_locked 应为 0，实际 {dropped}");
+    assert_eq!(link.stats().snapshot().total(), 2, "两条输入应正常计入上报数");
 
     link.close("锁屏链路测试结束").await;
 }
-/// 被控端自己的那道门禁：**绕过控制端策略**直接往控制通道里写输入帧。
-///
-/// 为什么需要这一条：上面那个测试验的是「控制端不会发」，而门禁的另一半在
-/// 被控端 —— 老版本控制端、第三方脚本、或者控制端还没来得及收到 `SystemState`
-/// 时，帧照样会到被控端。真机上已经踩到过这个窗口（`--inject` 把指针打进了锁屏，
-/// 注入前 x:1599 y:0 → 注入后 x:700 y:400），所以这一条必须独立钉住。
+
+/// 锁屏状态下直接写控制通道输入帧：被控端同样放行注入，不再丢弃。
 #[tokio::test]
-async fn host_itself_drops_input_while_locked_even_if_the_client_ignores_it() {
+async fn host_itself_allows_input_while_locked() {
     use uulan_protocol::frame::{read_frame, write_frame, FrameKind};
     use uulan_protocol::msg::H2C;
 
@@ -221,7 +220,7 @@ async fn host_itself_drops_input_while_locked_even_if_the_client_ignores_it() {
 
     let c = timeout(
         Duration::from_secs(20),
-        connect::connect(&addr, &device_id, &cfg.password, "无视状态的粗鲁控制端", vec![],
+        connect::connect(&addr, &device_id, &cfg.password, "锁屏直发控制端", vec![],
             None,  // 集成测试都走中继
 ),
     )
@@ -233,7 +232,7 @@ async fn host_itself_drops_input_while_locked_even_if_the_client_ignores_it() {
 
     let (mut rd, mut wr) = c.control.into_split();
 
-    // 第一帧就该是锁屏状态 —— 它必须**先于任何输入**到达（这就是开局那一拍探针的意义）。
+    // 第一帧仍先上报锁屏状态
     let first = timeout(Duration::from_secs(10), read_frame(&mut rd))
         .await
         .expect("等第一帧超时")
@@ -246,9 +245,6 @@ async fn host_itself_drops_input_while_locked_even_if_the_client_ignores_it() {
     assert!(locked, "假探针说这台机器锁着");
     assert!(has_desktop);
 
-    // 三条移动 + 一条按键，原样写进去：不经过 InputSender，没有任何控制端侧过滤。
-    // 用真的 `C2H` 序列化（不是手写 JSON）：线上是扁平格式（`type` 字段），
-    // 手写的 `{"MouseMoveAbs": {…}}` 会被被控端当成「无法解析」丢掉 —— 那测试就白跑了。
     for msg in [
         C2H::MouseMoveAbs { x: 0.5, y: 0.5 },
         C2H::MouseMoveAbs { x: 0.1, y: 0.9 },
@@ -258,28 +254,13 @@ async fn host_itself_drops_input_while_locked_even_if_the_client_ignores_it() {
         write_frame(&mut wr, FrameKind::Json, &bytes).await.expect("写输入帧失败");
     }
 
-    // 被控端必须回一条「已锁屏，键鼠未注入」；并且注入后端一条指令都没收到。
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        assert!(std::time::Instant::now() < deadline, "10 秒内没收到 InputError");
-        let Ok(Ok(f)) = timeout(Duration::from_secs(5), read_frame(&mut rd)).await else {
-            break;
-        };
-        if f.kind != FrameKind::Json {
-            continue;
-        }
-        match f.decode_json::<H2C>() {
-            Ok(H2C::InputError { message }) => {
-                assert!(message.contains("锁屏"), "报错要说明原因：{message}");
-                break;
-            }
-            Ok(_) => continue,
-            Err(_) => continue,
-        }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while out.lock().unwrap().len() < 3 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "锁屏时 3 条输入均应注入，实际收到：{:?}",
+            out.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(
-        out.lock().unwrap().is_empty(),
-        "锁屏时注入后端一条指令都不该收到：{:?}",
-        out.lock().unwrap()
-    );
 }

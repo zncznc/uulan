@@ -270,10 +270,8 @@ impl InputSender {
     /// 这条消息不是「通道坏了」，而是「按状态不发」，混成一个 `false` 会让
     /// 窗口以为连接断了。
     pub fn send(&self, m: C2H) -> bool {
-        if m.is_input() && self.status.locked() {
-            self.status.dropped_locked.fetch_add(1, Ordering::Relaxed);
-            return true;
-        }
+        // 锁屏界面允许继续发送键鼠事件，支持用户在远程锁屏界面直接操作解锁。
+        let _ = &self.status;
         match &m {
             C2H::MouseMoveAbs { .. } | C2H::MouseMoveRel { .. } => {
                 self.stats.moves.fetch_add(1, Ordering::Relaxed);
@@ -453,7 +451,7 @@ impl ControlLink {
                                         if locked {
                                             warn!(
                                                 has_desktop,
-                                                "被控端已锁屏：暂停发送键鼠（解锁后自动恢复）"
+                                                "被控端处于锁屏界面（远程键鼠保持开启，可直接操作解锁）"
                                             );
                                         } else {
                                             info!(has_desktop, "被控端已解锁：恢复发送键鼠");
@@ -660,24 +658,25 @@ mod tests {
     }
 
     #[test]
-    fn locked_host_stops_input_at_the_client_and_keeps_the_channel_healthy() {
+    fn locked_host_still_forwards_input_for_remote_unlock() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let st = Arc::new(HostStatus::default());
         st.apply_state(true, true);
         let sender = InputSender { tx, stats: Arc::new(InputStats::default()), status: st.clone() };
 
-        // 锁屏期间：输入类消息一律不发，但**返回 true**（通道没坏，别让窗口以为断线了）
+        // 锁屏期间：键鼠输入照常放行，便于远程操作锁屏界面解锁
         assert!(sender.send(C2H::MouseMoveAbs { x: 0.5, y: 0.5 }));
         assert!(sender.send(C2H::Key { vk: 0x41, down: true, repeat: false }));
-        assert!(rx.try_recv().is_err(), "锁屏时不该往控制通道里塞输入");
-        assert_eq!(st.snapshot().dropped_locked, 2);
-        assert_eq!(sender.stats.snapshot().total(), 0, "没发出去就不该算进上报计数");
+        assert!(matches!(rx.try_recv(), Ok(C2H::MouseMoveAbs { .. })));
+        assert!(matches!(rx.try_recv(), Ok(C2H::Key { .. })));
+        assert_eq!(st.snapshot().dropped_locked, 0);
+        assert_eq!(sender.stats.snapshot().total(), 2);
 
-        // 非输入消息照常走：锁屏时还得能传文件/发剪贴板/道别
+        // 非输入消息照常走
         assert!(sender.send(C2H::Clip { text: "还在工作".into() }));
         assert!(matches!(rx.try_recv(), Ok(C2H::Clip { .. })));
 
-        // 解锁后立刻恢复
+        // 解锁后照常
         st.apply_state(false, true);
         assert!(sender.send(C2H::MouseMoveAbs { x: 0.1, y: 0.1 }));
         assert!(matches!(rx.try_recv(), Ok(C2H::MouseMoveAbs { .. })));

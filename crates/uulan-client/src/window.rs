@@ -99,8 +99,8 @@ impl Overlay {
             s.push_str(&format!(" · 延迟 {:.1}ms", self.rtt_local_us as f64 / 1000.0));
         }
         if self.locked {
-            // 放在最后：锁屏是「现在为什么点不动」的直接答案，最该一眼看到。
-            s.push_str(" · 已锁屏（键鼠已暂停）");
+            // 仅提示当前处于锁屏界面，不再暂停键鼠。
+            s.push_str(" · 已锁屏");
         }
         // 断线/重连中排在锁屏之后：画面不动的时候，先解释「为什么不动」。
         if !self.phase.label().is_empty() {
@@ -721,7 +721,7 @@ mod tests {
         o.locked = true;
         let t = o.title(1280, 720);
         assert!(t.contains("已锁屏"), "{t}");
-        assert!(t.contains("键鼠已暂停"), "{t}");
+        assert!(!t.contains("键鼠已暂停"), "{t}");
     }
 
     #[test]

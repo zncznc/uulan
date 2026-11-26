@@ -1,0 +1,47 @@
+锁屏界面放行远程键鼠（支持远程解锁）· 真机验收 —— 2026-11-26
+==============================================================
+
+一、需求变更
+────────────
+此前被控端与控制端各自有一道「锁屏时丢弃键鼠输入」的门禁（窗口标题提示「已锁屏（键鼠已暂停）」）。
+用户明确提出新需求：麒麟真机在锁屏界面状态下也要能够使用远程键鼠操作解锁。
+
+二、改动
+────────────
+1. `crates/uulan-host/src/session.rs`：
+   - 移除 `control_loop` 中 `if msg.is_input() && input.locked` 丢弃门禁及不再使用的 `report_dropped_locked`。
+   - 保留 `SystemState { locked, has_desktop }` 状态探测上报，及切入锁屏瞬间松开已按下修饰键的防粘键保护。
+2. `crates/uulan-client/src/control.rs`：
+   - 移除 `InputSender::send` 中 `if m.is_input() && self.status.locked()` 拦截；更新日志提示与单测。
+3. `crates/uulan-client/src/window.rs` & `crates/uulan-client/src/inject.rs`：
+   - 窗口标题由「已锁屏（键鼠已暂停）」改为「已锁屏」（保留状态提示，不再误报暂停）；更新 `--inject` 提示与单测。
+4. `crates/uulan-client/tests/locked_host.rs`：
+   - 更新两条集成测试，断言锁屏状态下 `SystemState` 与 `Metrics` 照常到达，且键鼠输入不再被两端拦截（`dropped_locked == 0`，注入后端实收全部事件）。
+
+三、测试、部署与真机锁屏实测
+────────────
+1. 真机 `192.168.223.15` 测试：
+   - `cargo test -p uulan-client --test locked_host -- --test-threads=1`：**2 passed / 0 failed**。
+   - `cargo test --workspace --no-fail-fast -- --test-threads=1`：`607 passed / 2 failed / 1 ignored`
+     （2 条失败为既有 `uulan-client` 合成视频帧时序用例，与本改动无关）。
+2. 真机 `uulan-host` 部署：
+   - 单任务编译零警告；热替换后 `sha256sum` 源与目标一致：
+     `593ef46c7e86ea70d022c3d8efb9684a341b07ee6a67e0b527a3f2f9075fd8c1`，`uulan-host` `active`。
+3. 本机 Windows `uulan-client.exe` 部署：
+   - 编译零警告，同步到 `C:\Users\chaoc\AppData\Local\uulan\bin\uulan-client.exe` 并核对 SHA256 一致。
+4. **真机物理 `:0` 锁屏态实测**：
+   - 控制端收到 `SystemState { locked: true, has_desktop: true }`。
+   - 注入前 `xdotool getmouselocation`：`x:512 y:384`。
+   - 执行 `--direct 192.168.223.15:21989 --inject move:640,400`：
+     `已发送 1 条输入帧（移动 1 / 未送出 0 / 被控端拒绝 0）`，`INJECT_RC=0`。
+   - 注入后 `xdotool getmouselocation` 独立判据：**`x:640 y:400`**（一像素不差）。
+
+四、撤法
+────────────
+- 真机恢复 `~/.local/uulan/bin/uulan-host.bak-*` 并 `systemctl --user kill -s KILL uulan-host`；
+  源码回退上述 5 个文件即可，无协议与配置变更。
+
+五、仍未验
+────────────
+- 锁屏界面下人工输入系统密码完成解锁的完整 GUI 交互流未由 agent 替代操作（不索要密码，请用户远程亲自操作验证）。
+- `control.rs`/`inject.rs` 末尾两句纯日志文案调整后同步重编本机 `uulan-client.exe`（功能逻辑未变）。

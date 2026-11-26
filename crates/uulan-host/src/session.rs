@@ -838,7 +838,7 @@ pub async fn run_with_sink(
     // 锁屏探针：默认按采集源自动决定；测试注入闭包。
     let lock = params.lock_probe.take().or_else(|| probe::production_lock_probe(&params.capture));
     if lock.is_some() {
-        info!("桌面状态探针已启用（锁屏时停止键鼠注入）");
+        info!("桌面状态探针已启用（锁屏状态会上报控制端，键鼠注入保持开启）");
     } else {
         info!("桌面状态探针未启用（合成源 / 非 X11 采集），不会发送 SystemState");
     }
@@ -1361,8 +1361,8 @@ impl InputLoop {
 
     /// 锁屏状态变了。
     ///
-    /// 变成「锁着」的那一刻要把已经按下的键**松开**：控制端此刻可能正按着 Ctrl，
-    /// 而接下来的释放事件会被我们丢掉 —— 不主动松开就会在解锁后留下一个卡住的修饰键。
+    /// 变成「锁着」的那一刻先把之前按住的键松开（防止切到锁屏界面瞬间卡住修饰键），
+    /// 但**不再暂停后续键鼠注入**，让用户可以从远程操作锁屏界面完成解锁。
     fn set_locked(&mut self, locked: bool) {
         if self.locked == locked {
             return;
@@ -1375,9 +1375,9 @@ impl InputLoop {
                     debug!(error = %e, "锁屏时释放按键失败");
                 }
             }
-            info!("被控端已锁屏：暂停键鼠注入（已按下的键已松开）");
+            info!("被控端已锁屏（已按下的键已松开，远程键鼠注入保持开启以支持远程解锁）");
         } else {
-            info!("被控端已解锁：恢复键鼠注入");
+            info!("被控端已解锁");
         }
     }
 
@@ -1419,27 +1419,6 @@ impl InputLoop {
         self.last_report = Some(Instant::now());
         warn!(sink = self.sink.name(), error = %e, total = self.errors, "键鼠注入失败，已通知控制端");
         send_out(out, H2C::InputError { message: e })
-    }
-
-    /// 锁屏期间丢掉的输入**也要让控制端知道**，否则用户只会觉得「键鼠没反应」。
-    ///
-    /// 复用它自己的节流（2 秒一条），但计数是独立的：`errors` 表示「注入失败」，
-    /// 这里表示「按策略没注入」—— 两者的排查方向完全不同，不能混成一个数。
-    fn report_dropped_locked(&mut self, out: &mpsc::UnboundedSender<Out>) -> Result<(), String> {
-        let due = self
-            .last_report
-            .map(|t| t.elapsed() >= INPUT_ERROR_REPORT_EVERY)
-            .unwrap_or(true);
-        if !due {
-            return Ok(());
-        }
-        self.last_report = Some(Instant::now());
-        send_out(
-            out,
-            H2C::InputError {
-                message: format!("被控端已锁屏，键鼠未注入（已丢 {} 条）", self.dropped_locked),
-            },
-        )
     }
 
     /// 会话收尾：松开所有还按着的键/按钮，恢复 X 的全局状态（autorepeat、键盘映射）。
@@ -1659,14 +1638,8 @@ async fn control_loop(
                         debug!("控制连接上收到意外的 Blob 帧，已忽略");
                     }
                     In::Msg(msg) => {
-                        // 锁屏门禁**必须放在喂 Mapper 之前**（见 dropped_locked 的注释）。
-                        // 只挡输入类消息：剪贴板、文件、终端、Ping、Bye 在锁屏时照样要工作，
-                        // 否则用户连「解锁前先传个文件」都做不到。
-                        if msg.is_input() && input.locked {
-                            input.dropped_locked += 1;
-                            input.report_dropped_locked(out)?;
-                            continue;
-                        }
+                        // 锁屏界面也放行键鼠输入（用户明确要求远程操作锁屏界面解锁）；
+                        // 锁屏状态仅通过 SystemState 上报用于标题提示，不再丢弃输入。
                         // 先同步屏幕尺寸，再换算坐标：换分辨率后的第一条消息也不会落偏。
                         input.sync_screen();
                         match msg {
