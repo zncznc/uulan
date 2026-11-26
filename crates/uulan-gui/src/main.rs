@@ -465,7 +465,10 @@ impl App {
         let mut cmd = spawn_command(&client, &args, &host);
         apply_creation_flags(&mut cmd, &mode);
         if redirects_stdout(&mode) {
-            match std::fs::File::create(&log_path) {
+            // 先清空再以 append(true) 打开：Windows 下 stdout/stderr 共用非 append 句柄
+            // 并发写入会互相覆盖并留下 0x00 空洞、劈断 UTF-8 中文。
+            let _ = std::fs::write(&log_path, b"");
+            match std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
                 Ok(f) => match f.try_clone() {
                     Ok(f2) => {
                         cmd.stdout(Stdio::from(f2)).stderr(Stdio::from(f));

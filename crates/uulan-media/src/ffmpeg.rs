@@ -367,6 +367,17 @@ pub fn find_ffmpeg(explicit: Option<&Path>) -> Option<PathBuf> {
             return Some(p);
         }
     }
+    // 同目录优先：便携包把 ffmpeg.exe / ffmpeg 放在可执行文件旁边时，无需用户配置系统 PATH。
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for name in ["ffmpeg.exe", "ffmpeg"] {
+                let cand = dir.join(name);
+                if cand.exists() {
+                    return Some(cand);
+                }
+            }
+        }
+    }
     // PATH 上找：不真的去 spawn（省一次进程），只判断文件存在
     if let Some(paths) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&paths) {
