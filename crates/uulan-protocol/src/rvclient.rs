@@ -432,14 +432,43 @@ async fn gather_channels(
             None => listener.accept().await?,
         };
         s.set_nodelay(true).ok();
-        let f = read_frame(&mut s).await?;
-        let intro: ToServer = serde_json::from_slice(&f.payload)?;
+        // 单条连接最多给 2 秒发 DirectOpen，防止只连不发的探针吃光整轮 5 秒超时。
+        let f = match tokio::time::timeout(Duration::from_secs(2), read_frame(&mut s)).await {
+            Ok(Ok(f)) => f,
+            Ok(Err(e)) => {
+                // 若已有合法通道在等齐（!got.is_empty()），绝不能因为中途插进来的
+                // 0 字节探活连接（例如被控端 uulan-gui 的 probe_direct_port）或扫描器
+                // 把整轮合法连接连坐 drop 掉（否则控制端直接收到 io: early eof）。
+                if !got.is_empty() {
+                    continue;
+                }
+                return Err(e.into());
+            }
+            Err(_) => {
+                if !got.is_empty() {
+                    continue;
+                }
+                return Err(RvError::Timeout(Duration::from_secs(2)));
+            }
+        };
+        let intro: ToServer = match serde_json::from_slice(&f.payload) {
+            Ok(v) => v,
+            Err(e) => {
+                if !got.is_empty() {
+                    continue;
+                }
+                return Err(e.into());
+            }
+        };
         let channel = match intro {
             ToServer::DirectOpen { channel, role } => {
                 // 角色在这里只用于日志与"谁在监听"的直觉检查：直连时被控端是 Host 侧，
                 // 对端理应是 Client。真正的凭据判定在会话里的 PAKE，不在这里 ——
                 // 所以这条不合规**不能**当致命错误（免得以后改成谁都能自称 Host）。
                 if !matches!(role, Role::Client) {
+                    if !got.is_empty() {
+                        continue;
+                    }
                     return Err(RvError::Unexpected {
                         expected: "直连对端角色为 client",
                         got: format!("{role:?}"),
@@ -448,7 +477,10 @@ async fn gather_channels(
                 channel
             }
             other => {
-                return Err(RvError::Unexpected { expected: "direct_open", got: format!("{other:?}") })
+                if !got.is_empty() {
+                    continue;
+                }
+                return Err(RvError::Unexpected { expected: "direct_open", got: format!("{other:?}") });
             }
         };
         if got.insert(channel, s).is_some() {
@@ -486,4 +518,32 @@ async fn gather_channels(
         },
         peer.expect("有连接就有地址"),
     ))
+}
+
+#[cfg(test)]
+mod direct_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn direct_accept_ignores_interleaved_empty_probes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let accept_task = tokio::spawn(async move { direct_accept_all(&listener).await });
+
+        // 先拨 control，再故意插两条 0 字节探活连接（模拟 uulan-gui 的 probe_direct_port），
+        // 再拨齐其余三条通道 —— 旧实现会被探活的 early eof 连坐把整轮合法连接 drop 掉。
+        let c1 = direct_dial_one(&addr, Channel::Control, Role::Client).await.unwrap();
+        let _probe1 = TcpStream::connect(&addr).await.unwrap();
+        drop(_probe1);
+        let _probe2 = TcpStream::connect(&addr).await.unwrap();
+        drop(_probe2);
+        let c2 = direct_dial_one(&addr, Channel::Video, Role::Client).await.unwrap();
+        let c3 = direct_dial_one(&addr, Channel::Bulk, Role::Client).await.unwrap();
+        let c4 = direct_dial_one(&addr, Channel::Audio, Role::Client).await.unwrap();
+        let _ = (c1, c2, c3, c4);
+
+        let accepted = accept_task.await.unwrap();
+        assert!(accepted.is_ok(), "探活连接不该打断合法直连：{accepted:?}");
+    }
 }
