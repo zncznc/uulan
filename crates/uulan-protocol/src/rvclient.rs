@@ -543,7 +543,8 @@ mod direct_tests {
         let c4 = direct_dial_one(&addr, Channel::Audio, Role::Client).await.unwrap();
         let _ = (c1, c2, c3, c4);
 
-        let accepted = accept_task.await.unwrap();
-        assert!(accepted.is_ok(), "探活连接不该打断合法直连：{accepted:?}");
+        if let Err(e) = accept_task.await.unwrap() {
+            panic!("探活连接不该打断合法直连：{e}");
+        }
     }
 }
