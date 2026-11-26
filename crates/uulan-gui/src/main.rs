@@ -865,8 +865,16 @@ impl eframe::App for App {
                 Ok(Some(st)) => {
                     let secs = born.elapsed().as_secs();
                     let code = st.code();
-                    let raw = std::fs::read_to_string(&lp).unwrap_or_default();
-                    let tail: String = raw.lines().rev().take(3).collect::<Vec<_>>().join(" ← ");
+                    let raw = std::fs::read(&lp)
+                        .map(|b| String::from_utf8_lossy(&b).into_owned())
+                        .unwrap_or_default();
+                    let tail: String = raw
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .rev()
+                        .take(3)
+                        .collect::<Vec<_>>()
+                        .join(" ← ");
                     if secs < 10 {
                         let what = if self.child_term { "终端窗口" } else { "远程进程" };
                         // 终端模式没有日志文件（输出留在那个窗口里），别再指向一个
