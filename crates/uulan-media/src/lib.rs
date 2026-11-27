@@ -14,6 +14,8 @@ pub mod playback;
 pub mod decode;
 pub mod ffmpeg;
 pub mod source;
+#[cfg(all(windows, feature = "builtin-h264"))]
+pub mod win_gdi;
 
 pub use annexb::{nal, AuSplitter, Nal};
 pub use decode::{DecoderReader, DecoderWriter, VideoDecoder};

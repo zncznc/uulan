@@ -35,6 +35,10 @@ portable-pty = "0.9"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Windows 被控端内置 OpenH264 编码 + GDI 抓屏，零 ffmpeg.exe 依赖。
+[target.'cfg(windows)'.dependencies]
+uulan-media = { path = "../uulan-media", features = ["builtin-h264"] }
+
 [dev-dependencies]
 tokio = { workspace = true }
 uulan-server = { path = "../uulan-server" }

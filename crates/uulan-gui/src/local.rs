@@ -235,7 +235,32 @@ fn local_ips() -> Vec<String> {
 
 #[cfg(windows)]
 fn local_ips() -> Vec<String> {
-    Vec::new()
+    use std::os::windows::process::CommandExt;
+    let Ok(o) = std::process::Command::new("ipconfig")
+        .creation_flags(0x0800_0000)
+        .output()
+    else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&o.stdout);
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if !(line.contains("IPv4") || line.contains("IP Address")) {
+            continue;
+        }
+        if let Some((_, rhs)) = line.rsplit_once(':') {
+            let ip = rhs.trim().trim_end_matches("(首选)").trim_end_matches("(Preferred)").trim();
+            if !ip.is_empty()
+                && !ip.starts_with("127.")
+                && !ip.starts_with("169.254.")
+                && ip.parse::<std::net::Ipv4Addr>().is_ok()
+                && !out.iter().any(|x| x == ip)
+            {
+                out.push(ip.to_string());
+            }
+        }
+    }
+    out
 }
 
 pub struct LocalPanel {
@@ -399,6 +424,10 @@ impl LocalPanel {
             let home = PathBuf::from(h);
             cands.push(home.join(".config").join("lanlink").join("host.json"));
             cands.push(home.join(".lanlink").join("host.json"));
+        }
+        if let Some(p) = std::env::var_os("USERPROFILE") {
+            let home = PathBuf::from(p);
+            cands.push(home.join(".config").join("lanlink").join("host.json"));
         }
         for p in ["/opt/lanlink/etc/host.json", "/etc/lanlink/host.json"] {
             cands.push(PathBuf::from(p));

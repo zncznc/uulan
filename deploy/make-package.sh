@@ -12,7 +12,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-VERSION="0.2.0"
+VERSION="0.3.0"
 OUT=/tmp
 WITH_CLIENT=0
 WITH_GUI=0

@@ -356,9 +356,22 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let ffmpeg = ffmpeg::find_ffmpeg(args.ffmpeg.as_deref()).ok_or_else(|| {
-        anyhow::anyhow!("找不到 ffmpeg。被控端靠它抓屏与编码，请先安装，或用 --ffmpeg 指定路径。")
-    })?;
+    #[cfg(windows)]
+    uulan_media::win_gdi::set_dpi_aware();
+
+    let ffmpeg = match ffmpeg::find_ffmpeg(args.ffmpeg.as_deref()) {
+        Some(p) => p,
+        None => {
+            #[cfg(windows)]
+            if matches!(cfg.capture, CaptureInput::X11 { .. }) {
+                PathBuf::from("builtin-win-gdi")
+            } else {
+                anyhow::bail!("找不到 ffmpeg。合成采集源（lavfi）需要 ffmpeg，请先安装或用 --ffmpeg 指定路径。");
+            }
+            #[cfg(not(windows))]
+            anyhow::bail!("找不到 ffmpeg。被控端靠它抓屏与编码，请先安装，或用 --ffmpeg 指定路径。");
+        }
+    };
     let encoder = args.encoder.unwrap_or(Encoder::X264);
 
     print_credentials(&cfg, &cfg_path, false);

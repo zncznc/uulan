@@ -1,0 +1,31 @@
+里程碑：lanlink v0.3.0 补齐 Windows 原生被控端（2026-11-27）
+==============================================================
+
+一、改动摘要
+------------
+1. Windows 原生被控端采集与编码（crates/uulan-media/src/win_gdi.rs + source.rs）：
+   - 通过 Win32 GDI（SetProcessDPIAware / GetDC / CreateDIBSection / BitBlt / StretchBlt）抓取桌面，零外部 ffmpeg.exe 依赖。
+   - 使用内置 OpenH264（Level::Level_5_2，Profile::Baseline，ScreenContentRealTime）直接编码为标准 Annex-B H.264 AU。
+2. Windows 键鼠注入（crates/uulan-host/src/input/win32.rs + mod.rs）：
+   - 实现 Win32Sink（SendInput）：支持虚拟桌面绝对移动（MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_ABSOLUTE）、相对移动、左/中/右/侧键、纵横向滚轮、KeySym→VK 映射及 Unicode 文本注入（KEYEVENTF_UNICODE）。
+3. 被控端入口与图形面板联动（uulan-host/main.rs, session.rs, uulan-gui/local.rs）：
+   - Windows 被控端默认走 GDI+OpenH264，不再报错找不到 ffmpeg；通过 GetSystemMetrics 探测真实物理分辨率。
+   - local.rs 补齐 Windows ipconfig 本机局域网 IP 探测与 %USERPROFILE%\.config\lanlink\host.json 路径查找。
+   - Windows 便携包内同时交付 lanlink-gui.exe、lanlink-client.exe、lanlink-host.exe，面板内「让本机成为被控端」可直接上线被控。
+4. 版本升级：workspace 版本由 0.2.0 升至 0.3.0。
+
+二、验证结果
+------------
+1. Windows 本机单测：
+   - cargo test -p uulan-media --features builtin-h264 --lib：40/0 通过（含 2560x1440 BGRA → OpenH264 编码 → OpenH264 解码闭环验证）
+   - cargo test -p uulan-host --lib：157/0 通过（含 Win32 INPUT ABI 40B 校验与 KeySym→VK 映射测试）
+2. Windows 被控端链路实测（lanlink-host.exe + lanlink-client.exe 本地环回，零 ffmpeg.exe）：
+   - 控制端成功直连 Windows 被控端，握手与鉴权通过（ZNC-7G4D windows 0.3.0 2560x1440），VideoCfg、控制通道指标、Win32 剪贴板后端、portable-pty 终端与 win32-sendinput 注入后端均正常就绪。
+   - 注：工具执行环境运行在隔离虚拟桌面（WinSta0\exebox-*），非用户真实交互桌面，因此在该隔离桌面下 BitBlt 返回 err=6、SendInput 返回 0。
+3. 麒麟真机（192.168.223.15）全量回归：
+   - cargo test --workspace --no-fail-fast -- --test-threads=1：614 通过 / 2 失败 / 0 忽略（2 项为已知既有不稳定项：end_to_end_host_to_client_video、source_eof_on_screen_shrink_restarts_encoder，无新增回归）。
+
+三、未验的部分（必须明示）
+--------------------------
+1. 受限于本机沙箱虚拟桌面隔离（WinSta0\exebox-*），Windows 被控端真实交互桌面下的「画面出图像素内容」与「SendInput 实际落点」需用户本人在真实 Windows 桌面点击「让本机成为被控端」后由另一台电脑连入验一次。
+2. 麒麟 Linux 离线包 0.3.0 与双端同步打包在本次收尾统一构建；麒麟真机服务未重复替换（与 0.2.0 代码变更仅限 Windows 分支与版本号）。

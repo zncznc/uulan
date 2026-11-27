@@ -1,8 +1,7 @@
 //! 编码侧：抓屏（或任何输入）→ H.264 → 一路带时间戳的访问单元（AU）。
 //!
-//! 这一层刻意**不碰 X11**：输入段由调用方给（生产环境是 `-f x11grab`，
-//! 测试里是 `-f lavfi` 合成源）。好处是被控端的整条编码链路在开发机上就能端到端验证，
-//! 不必等一台真的麒麟机器。
+//! Linux 生产环境走 `ffmpeg -f x11grab`；Windows 生产环境（启用 `builtin-h264`）走
+//! 原生 GDI 抓屏 + 内置 OpenH264 编码（零 `ffmpeg.exe` 依赖）；测试走 `-f lavfi` 合成源。
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -26,16 +25,28 @@ pub struct Au {
     pub keyframe: bool,
 }
 
+enum SourceBackend {
+    Ffmpeg {
+        child: Child,
+        stdout: ChildStdout,
+        splitter: AuSplitter,
+        ready: VecDeque<Au>,
+        buf: Vec<u8>,
+        started: Instant,
+        eof: bool,
+        flushed: bool,
+    },
+    #[cfg(all(windows, feature = "builtin-h264"))]
+    WinGdi {
+        rx: tokio::sync::mpsc::Receiver<Au>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    },
+}
+
 /// 正在运行的编码源。
 pub struct VideoSource {
-    child: Child,
-    stdout: ChildStdout,
-    splitter: AuSplitter,
-    ready: VecDeque<Au>,
-    buf: Vec<u8>,
-    started: Instant,
-    eof: bool,
-    flushed: bool,
+    backend: SourceBackend,
     emitted: u64,
     keyframes: u64,
     bytes: u64,
@@ -55,14 +66,29 @@ impl VideoSource {
             ffmpeg::drain_stderr(err, "encoder");
         }
         Ok(Self {
-            child,
-            stdout,
-            splitter: AuSplitter::new(),
-            ready: VecDeque::new(),
-            buf: vec![0u8; 64 * 1024],
-            started: Instant::now(),
-            eof: false,
-            flushed: false,
+            backend: SourceBackend::Ffmpeg {
+                child,
+                stdout,
+                splitter: AuSplitter::new(),
+                ready: VecDeque::new(),
+                buf: vec![0u8; 64 * 1024],
+                started: Instant::now(),
+                eof: false,
+                flushed: false,
+            },
+            emitted: 0,
+            keyframes: 0,
+            bytes: 0,
+            opts,
+        })
+    }
+
+    /// Windows 生产路径：GDI 抓屏 + 内置 OpenH264 编码，不依赖 `ffmpeg.exe`。
+    #[cfg(all(windows, feature = "builtin-h264"))]
+    pub async fn start_windows_gdi(opts: CaptureOptions) -> Result<Self, MediaError> {
+        let (rx, stop, worker) = crate::win_gdi::spawn_windows_source(opts.clone())?;
+        Ok(Self {
+            backend: SourceBackend::WinGdi { rx, stop, worker: Some(worker) },
             emitted: 0,
             keyframes: 0,
             bytes: 0,
@@ -92,62 +118,103 @@ impl VideoSource {
     }
 
     /// 取下一个 AU。流结束返回 `None`。
-    ///
-    /// 语义是「尽快返回」：一旦切分器攒够一个完整 AU 就立刻交出，不等下一帧的字节。
-    /// 这是低延迟的前提 —— 等整帧收完再发，一帧的编码时间就白等了。
     pub async fn next_au(&mut self) -> Result<Option<Au>, MediaError> {
-        loop {
-            if let Some(au) = self.ready.pop_front() {
-                return Ok(Some(au));
-            }
-            if self.eof {
-                if !self.flushed {
-                    self.flushed = true;
-                    if let Some(last) = self.splitter.flush() {
-                        let ts = self.started.elapsed().as_micros() as u64;
-                        return Ok(Some(self.record(last, ts)));
-                    }
+        match &mut self.backend {
+            SourceBackend::Ffmpeg {
+                stdout,
+                splitter,
+                ready,
+                buf,
+                started,
+                eof,
+                flushed,
+                ..
+            } => loop {
+                if let Some(au) = ready.pop_front() {
+                    return Ok(Some(au));
                 }
-                return Ok(None);
-            }
+                if *eof {
+                    if !*flushed {
+                        *flushed = true;
+                        if let Some(last) = splitter.flush() {
+                            let ts = started.elapsed().as_micros() as u64;
+                            let keyframe = annexb::is_keyframe_au(&last);
+                            self.emitted += 1;
+                            if keyframe {
+                                self.keyframes += 1;
+                            }
+                            return Ok(Some(Au { ts_us: ts, data: last, keyframe }));
+                        }
+                    }
+                    return Ok(None);
+                }
 
-            let n = self.stdout.read(&mut self.buf).await?;
-            if n == 0 {
-                self.eof = true;
-                continue;
-            }
-            self.bytes += n as u64;
-            let ts = self.started.elapsed().as_micros() as u64;
-            for au in self.splitter.push(&self.buf[..n]) {
-                let ready = self.record(au, ts);
-                self.ready.push_back(ready);
-            }
+                let n = stdout.read(buf).await?;
+                if n == 0 {
+                    *eof = true;
+                    continue;
+                }
+                self.bytes += n as u64;
+                let ts = started.elapsed().as_micros() as u64;
+                for data in splitter.push(&buf[..n]) {
+                    let keyframe = annexb::is_keyframe_au(&data);
+                    self.emitted += 1;
+                    if keyframe {
+                        self.keyframes += 1;
+                    }
+                    ready.push_back(Au { ts_us: ts, data, keyframe });
+                }
+            },
+            #[cfg(all(windows, feature = "builtin-h264"))]
+            SourceBackend::WinGdi { rx, .. } => match rx.recv().await {
+                Some(au) => {
+                    self.emitted += 1;
+                    self.bytes += au.data.len() as u64;
+                    if au.keyframe {
+                        self.keyframes += 1;
+                    }
+                    Ok(Some(au))
+                }
+                None => Ok(None),
+            },
         }
     }
 
-    fn record(&mut self, data: Vec<u8>, ts_us: u64) -> Au {
-        let keyframe = annexb::is_keyframe_au(&data);
-        self.emitted += 1;
-        if keyframe {
-            self.keyframes += 1;
-        }
-        Au { ts_us, data, keyframe }
-    }
-
-    /// 主动结束：杀掉 ffmpeg 并回收。
-    ///
-    /// 用 kill 而不是等它自然退出 —— 抓屏进程不会自己结束。
+    /// 主动结束：杀掉编码子进程或停止编码线程并回收。
     pub async fn stop(&mut self) -> Result<(), MediaError> {
-        let _ = self.child.start_kill();
-        let _ = self.child.wait().await;
+        match &mut self.backend {
+            SourceBackend::Ffmpeg { child, .. } => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
+            #[cfg(all(windows, feature = "builtin-h264"))]
+            SourceBackend::WinGdi { stop, worker, rx } => {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                rx.close();
+                if let Some(h) = worker.take() {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = h.join();
+                    })
+                    .await;
+                }
+            }
+        }
         Ok(())
     }
 }
 
 impl Drop for VideoSource {
     fn drop(&mut self) {
-        // spawn 时设了 kill_on_drop，这里只是兜底确保不留孤儿 ffmpeg。
-        let _ = self.child.start_kill();
+        match &mut self.backend {
+            SourceBackend::Ffmpeg { child, .. } => {
+                let _ = child.start_kill();
+            }
+            #[cfg(all(windows, feature = "builtin-h264"))]
+            SourceBackend::WinGdi { stop, rx, .. } => {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                rx.close();
+            }
+        }
     }
 }
 
@@ -168,7 +235,6 @@ mod tests {
         assert!(annexb::is_keyframe_au(&mk(&[9, 7, 8, 6, 5, 5])));
         assert!(!annexb::is_keyframe_au(&mk(&[9, 1])));
         assert!(!annexb::is_keyframe_au(&mk(&[9, 6, 1])));
-        // 同一 AU 里 IDR 之后又跟了 P（非规范但不应崩）
         assert!(annexb::is_keyframe_au(&mk(&[9, 5, 1])));
     }
 }

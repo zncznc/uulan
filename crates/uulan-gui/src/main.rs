@@ -1267,7 +1267,7 @@ fn main() {
         ..Default::default()
     };
     if let Err(e) = eframe::run_native(
-        "lanlink 内网远控 v0.2.0",
+        "lanlink 内网远控 v0.3.0",
         opts,
         Box::new(move |_cc| Ok(Box::new(App::new(relaunch.clone())))),
     ) {

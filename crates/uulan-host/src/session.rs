@@ -2095,16 +2095,26 @@ async fn video_loop(
         let opts = make_capture_options(&capture, screen, encoder, cur);
         let input = capture.to_ffmpeg_input(&opts);
 
-        let mut src = match VideoSource::start_with_input(&ffmpeg, opts, &input).await {
-            Ok(s) => s,
-            Err(e) => {
-                // 采集起不来时必须**告诉控制端为什么**，而不是静默关掉视频通道。
-                // 静默关闭在控制端那边只剩一个光秃秃的 "early eof" ——
-                // 排查的人无从判断到底是没装 ffmpeg、DISPLAY 不对，还是参数写错。
-                warn!(error = %e, "启动编码源失败");
-                let why = H2C::Bye { reason: format!("被控端无法开始采集：{e}") };
-                let _ = send_h2c(&mut video, &why).await;
-                return;
+        let mut src = {
+            #[cfg(windows)]
+            let started = if matches!(capture, CaptureInput::X11 { .. }) {
+                VideoSource::start_windows_gdi(opts).await
+            } else {
+                VideoSource::start_with_input(&ffmpeg, opts, &input).await
+            };
+            #[cfg(not(windows))]
+            let started = VideoSource::start_with_input(&ffmpeg, opts, &input).await;
+            match started {
+                Ok(s) => s,
+                Err(e) => {
+                    // 采集起不来时必须**告诉控制端为什么**，而不是静默关掉视频通道。
+                    // 静默关闭在控制端那边只剩一个光秃秃的 "early eof" ——
+                    // 排查的人无从判断到底是没装 ffmpeg、DISPLAY 不对，还是参数写错。
+                    warn!(error = %e, "启动编码源失败");
+                    let why = H2C::Bye { reason: format!("被控端无法开始采集：{e}") };
+                    let _ = send_h2c(&mut video, &why).await;
+                    return;
+                }
             }
         };
         info!(?cur, screen_w = screen.w, screen_h = screen.h, "编码源已启动");
@@ -2443,6 +2453,15 @@ pub async fn resolve_region(capture: &CaptureInput, cfg: &HostConfig) -> Region 
         return Region::full(cfg.screen_width, cfg.screen_height);
     }
     if let Some(disp) = capture.display() {
+        #[cfg(windows)]
+        {
+            if matches!(capture, CaptureInput::X11 { display: None, .. }) {
+                if let Some((w, h)) = uulan_media::win_gdi::primary_screen_size() {
+                    info!(w, h, "从 Win32 GetSystemMetrics 探测到屏幕尺寸");
+                    return Region::full(w, h);
+                }
+            }
+        }
         if let Some(r) = crate::capture::detect_x11_region(&disp, capture.monitor_idx()).await {
             // 变量名刻意不叫 `display`：tracing 里 `%display` 会被宏解析成
             // 它自己的 `display()` 辅助函数，而不是我们的局部变量。
@@ -2477,6 +2496,21 @@ pub async fn refresh_region(capture: &CaptureInput, cfg: &HostConfig, cached: Re
         return Region::full(cfg.screen_width, cfg.screen_height);
     }
     if let Some(disp) = capture.display() {
+        #[cfg(windows)]
+        {
+            let _ = disp;
+            if matches!(capture, CaptureInput::X11 { display: None, .. }) {
+                if let Some((w, h)) = uulan_media::win_gdi::primary_screen_size() {
+                    let r = Region::full(w, h);
+                    if r != cached {
+                        info!(from_w = cached.w, from_h = cached.h, to_w = r.w, to_h = r.h, "Windows 屏幕尺寸变化");
+                    }
+                    return r;
+                }
+            }
+            return cached;
+        }
+        #[cfg(not(windows))]
         return match crate::capture::detect_x11_region(&disp, capture.monitor_idx()).await {
             Some(r) => {
                 if r != cached {

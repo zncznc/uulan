@@ -360,10 +360,14 @@ pub fn default_sink(capture: &CaptureInput) -> Box<dyn InputSink> {
             }
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        Box::new(win32::Win32Sink::open())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         Box::new(NullSink::new(format!(
-            "本平台（{}）不支持 X11 输入注入：被控端需要跑在麒麟/Linux 的 X11 会话里",
+            "本平台（{}）暂不支持桌面输入注入",
             std::env::consts::OS
         )))
     }
@@ -371,6 +375,9 @@ pub fn default_sink(capture: &CaptureInput) -> Box<dyn InputSink> {
 
 #[cfg(target_os = "linux")]
 pub mod x11;
+
+#[cfg(target_os = "windows")]
+pub mod win32;
 
 #[cfg(test)]
 mod tests {
