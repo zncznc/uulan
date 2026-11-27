@@ -286,6 +286,11 @@ pub struct LocalPanel {
     host_since: Option<std::time::Instant>,
     /// 直连端口探活结果（`reload()` 时探一次；每帧探等于每秒一次无谓连接）。
     listen_open: Option<bool>,
+    /// 本机局域网 IP 缓存（只在 `reload()` 时更新，绝不在 `ui()` 里每帧起子进程）。
+    cached_ips: Vec<String>,
+    /// 外部被控端进程探测缓存（最多每 2 秒探一次 `tasklist` / `ps`，避免每帧起进程）。
+    ext_probe_at: Option<std::time::Instant>,
+    ext_online: bool,
 }
 
 
@@ -313,14 +318,25 @@ impl LocalPanel {
                 }
             }
         }
-        // 再看系统里有没有别的 uulan-host 在跑（root 装的系统/用户服务就是这种）。
+        // 节流：外部服务进程最多每 2 秒探一次，绝不在每帧重绘里起子进程。
+        if let Some(at) = self.ext_probe_at {
+            if at.elapsed() < std::time::Duration::from_secs(2) {
+                return match self.ext_online {
+                    true => ("作为服务常驻（关掉本程序不会下线）", true),
+                    false => ("未上线", false),
+                };
+            }
+        }
+        // 再看系统里有没有别的 lanlink-host 在跑（root 装的系统/用户服务就是这种）。
         let found = || -> bool {
             // 闭包里不能用 `?`（它得返回 bool），所以全程 map + unwrap_or：
             // 探不到进程就当"没在跑"，绝不为这个把面板弄崩。
             #[cfg(windows)]
             {
+                use std::os::windows::process::CommandExt;
                 std::process::Command::new("tasklist")
                     .args(["/FI", "IMAGENAME eq lanlink-host.exe", "/NH"])
+                    .creation_flags(0x0800_0000)
                     .output()
                     .map(|o| String::from_utf8_lossy(&o.stdout).contains("lanlink-host.exe"))
                     .unwrap_or(false)
@@ -338,7 +354,10 @@ impl LocalPanel {
                     .unwrap_or(false)
             }
         };
-        match found() {
+        let online = found();
+        self.ext_probe_at = Some(std::time::Instant::now());
+        self.ext_online = online;
+        match online {
             true => ("作为服务常驻（关掉本程序不会下线）", true),
             false => ("未上线", false),
         }
@@ -441,6 +460,9 @@ impl LocalPanel {
             host_child: None,
             host_since: None,
             listen_open: None,
+            cached_ips: Vec::new(),
+            ext_probe_at: None,
+            ext_online: false,
         };
         p.reload();
         p
@@ -521,6 +543,7 @@ impl LocalPanel {
                         .unwrap_or_default();
                     self.status.clear();
                     self.listen_open = probe_direct_port();
+                    self.cached_ips = local_ips();
                     Some(Info {
                         path: path.clone(),
                         id: g("device_id"),
@@ -728,7 +751,7 @@ impl LocalPanel {
             root.group(|ui| {
                 ui.label(egui::RichText::new("对方怎么连我（当面念这几行）").strong());
                 ui.separator();
-                let how = connect_hint(&info, self.listen_open, &local_ips());
+                let how = connect_hint(&info, self.listen_open, &self.cached_ips);
                 ui.label(egui::RichText::new(format!("认证方式：{}", how.mode)).strong());
                 for l in &how.lines {
                     ui.label(egui::RichText::new(l.clone()).monospace());
