@@ -52,18 +52,26 @@ pub struct Rect {
     pub h: u32,
 }
 
-/// 画面 → 窗口的摆放：**整数倍放大、从不缩小、居中留边**。
+/// 画面 → 窗口的摆放：**等比缩放适配窗口（支持缩小与放大）、居中留边、永不裁切**。
 ///
 /// 与 `window::blit` 共用同一份算法（那个函数负责画，这个函数负责算点击位置）。
-/// 两边一旦各算一遍，黑边区域就会点错位置 —— 这是远控里典型的「点不准」。
+/// 早先「从不缩小、超窗裁切」会把 `1920x1080` / 竖屏 `1080x1920` 裁成局部，
+/// 而 `norm_point` 仍把裁切矩形当成全屏 `0..1`，导致鼠标严重漂移。
 pub fn fit_rect(frame_w: u32, frame_h: u32, win_w: u32, win_h: u32) -> Rect {
     if frame_w == 0 || frame_h == 0 || win_w == 0 || win_h == 0 {
         return Rect { ox: 0, oy: 0, w: win_w, h: win_h };
     }
-    // 只取整数倍：远程桌面上要看清的是文字，缩过的字比重采样的锯齿更难受。
-    let scale = (win_w / frame_w).min(win_h / frame_h).max(1);
-    let w = (frame_w * scale).min(win_w);
-    let h = (frame_h * scale).min(win_h);
+    let fw = frame_w as u64;
+    let fh = frame_h as u64;
+    let ww = win_w as u64;
+    let wh = win_h as u64;
+    let (w, h) = if fw * wh >= ww * fh {
+        let h = ((fh * ww) / fw).clamp(1, wh);
+        (ww as u32, h as u32)
+    } else {
+        let w = ((fw * wh) / fh).clamp(1, ww);
+        (w as u32, wh as u32)
+    };
     Rect { ox: (win_w - w) / 2, oy: (win_h - h) / 2, w, h }
 }
 
@@ -347,14 +355,19 @@ mod tests {
     use uulan_protocol::vk::vk_to_keysym;
 
     #[test]
-    fn fit_rect_letterboxes_at_integer_scale() {
-        // 4x2 的画面放进 8x8 的窗口：整数倍 2 → 画成 8x4，上下各留 2 行
+    fn fit_rect_letterboxes_and_scales_preserving_aspect() {
+        // 4x2 的画面放进 8x8 的窗口：等比放大 2 倍 → 8x4，上下各留 2 行
         assert_eq!(fit_rect(4, 2, 8, 8), Rect { ox: 0, oy: 2, w: 8, h: 4 });
-        // 1280x720 放进 1280x800：1 倍，上下各留 40
+        // 1280x720 放进 1280x800：宽顶满，上下各留 40
         assert_eq!(fit_rect(1280, 720, 1280, 800), Rect { ox: 0, oy: 40, w: 1280, h: 720 });
-        // 1920x1080 放进 1280x720：不缩小，1 倍，右边和下边被裁
-        let r = fit_rect(1920, 1080, 1280, 720);
-        assert_eq!((r.w, r.h), (1280, 720), "窗口比画面小的时候按 1 倍裁切");
+        // 1920x1080 放进 1280x720：等比缩小铺满整屏，不裁切
+        assert_eq!(fit_rect(1920, 1080, 1280, 720), Rect { ox: 0, oy: 0, w: 1280, h: 720 });
+        // 竖屏 1080x1920 放进横屏 1280x720：高顶满 720，宽按 9:16 缩到 405，左右居中留黑边
+        let r = fit_rect(1080, 1920, 1280, 720);
+        assert_eq!(r, Rect { ox: 437, oy: 0, w: 405, h: 720 });
+        // 点击竖屏画幅中心，归一化应精确落回 (0.5, 0.5)
+        let (nx, ny) = norm_point(r.ox as f64 + r.w as f64 / 2.0, r.oy as f64 + r.h as f64 / 2.0, r).unwrap();
+        assert!((nx - 0.5).abs() < 0.01 && (ny - 0.5).abs() < 0.01, "({nx},{ny})");
     }
 
     #[test]

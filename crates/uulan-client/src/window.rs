@@ -278,20 +278,22 @@ impl App {
             return;
         }
 
-        // 整倍缩放（1x / 2x…）—— 整数倍时最近邻刚好像素对齐，文字最清楚。
-        // 几何和「点击位置换算」共用 `input::fit_rect`：两边各算一遍的话，黑边区域就会点偏。
+        // 等比缩放（支持缩小与放大）—— 与 `input::fit_rect` / `norm_point` 共用同一矩形，
+        // 保证任意分辨率（含竖屏 1080x1920）与任意窗口尺寸下整屏可见且鼠标零漂移。
         let r = fit_rect(frame.width, frame.height, ww, wh);
         let (dw, dh, ox, oy) = (r.w, r.h, r.ox, r.oy);
-
-        // 最近邻的倍率由实际画面尺寸反推（裁剪时 dw 会被窗口宽度夹住，那就是 1 倍）。
-        let scale = (dw / frame.width).max(1);
+        if dw == 0 || dh == 0 {
+            return;
+        }
         let (fw, fh) = (frame.width as usize, frame.height as usize);
+        let (dw_u64, dh_u64) = (dw as u64, dh as u64);
+        let (fw_u64, fh_u64) = (fw as u64, fh as u64);
         for y in 0..dh {
-            let sy = ((y / scale) as usize).min(fh - 1);
+            let sy = ((y as u64 * fh_u64) / dh_u64).min(fh_u64 - 1) as usize;
             let srow = sy * fw * 4;
             let drow = ((oy + y) as usize) * (ww as usize);
             for x in 0..dw {
-                let sx = ((x / scale) as usize).min(fw - 1);
+                let sx = ((x as u64 * fw_u64) / dw_u64).min(fw_u64 - 1) as usize;
                 let o = srow + sx * 4;
                 // FFmpeg 解出来是 BGRA（小端序），softbuffer 要 0RGB
                 let b = frame.pixels[o] as u32;
@@ -686,12 +688,22 @@ mod tests {
     }
 
     #[test]
-    fn blit_never_scales_below_one_to_one() {
-        // 画面比窗口大时按 1x 裁切，不做缩小（缩小会把字糊掉）
+    fn blit_downscales_full_frame_so_cursor_never_drifts() {
+        // 画面比窗口大时等比缩小整屏显示（不再按 1x 裁切，否则鼠标落点与画面错位）。
+        // 在 100x200 竖屏底部第 190 行放一条蓝色标记线，缩到 100x100 窗口里应居中占 x=25..75、底部仍可见蓝线。
         let mut app = app_with(None);
-        app.blit(&frame(100, 100, (0, 255, 0)), 10, 10);
-        assert_eq!(app.buf.len(), 100);
-        assert!(app.buf.iter().all(|p| *p == 0x0000_FF00), "应是满屏绿");
+        let mut f = frame(100, 200, (0, 255, 0));
+        for x in 0..100 {
+            let o = (190 * 100 + x) * 4;
+            f.pixels[o] = 255;     // B
+            f.pixels[o + 1] = 0;   // G
+            f.pixels[o + 2] = 0;   // R
+        }
+        app.blit(&f, 100, 100);
+        assert_eq!(app.buf.len(), 10000);
+        // 左右是黑边，中间 x=50 的第 95 行（对应 190/200）必须是蓝色
+        assert_eq!(app.buf[95 * 100 + 0], 0x0010_1010, "左侧应为黑边");
+        assert_eq!(app.buf[95 * 100 + 50], 0x0000_00FF, "底部蓝线应完整缩进窗口且位置对齐");
     }
 
     #[test]
