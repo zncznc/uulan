@@ -191,6 +191,11 @@ if [ -x "$BIN_DIR/uulan-gui" ]; then
     install -m 0755 "$BIN_DIR/uulan-gui" "$PREFIX/bin/uulan-gui"
     HAVE_GUI=1
 fi
+HAVE_FFMPEG=0
+if [ -x "$BIN_DIR/ffmpeg" ]; then
+    install -m 0755 "$BIN_DIR/ffmpeg" "$PREFIX/bin/ffmpeg"
+    HAVE_FFMPEG=1
+fi
 if [ -d "$HERE/doc" ]; then
     cp -f "$HERE/doc/"*.md "$PREFIX/doc/" 2>/dev/null || true
 fi

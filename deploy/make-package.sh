@@ -22,13 +22,15 @@ VERSION="$(date +%Y%m%d)"
 OUT=/tmp
 WITH_CLIENT=0
 WITH_GUI=0
+FFMPEG_BIN=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --version) VERSION="$2"; shift 2 ;;
         --out)     OUT="$2"; shift 2 ;;
         --with-client) WITH_CLIENT=1; shift ;;
-    --with-gui)    WITH_GUI=1; shift ;;
+        --with-gui)    WITH_GUI=1; shift ;;
+        --with-ffmpeg) FFMPEG_BIN="$2"; shift 2 ;;
         -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
         *) echo "未知参数 $1" >&2; exit 2 ;;
     esac
@@ -53,6 +55,10 @@ if [ "$WITH_CLIENT" = 1 ]; then
     install -m 0755 "$ROOT/target/release/uulan-client" "$STAGE/$NAME/bin/"
 fi
 install -m 0755 "$HERE/uulan-wait-x.sh"             "$STAGE/$NAME/bin/uulan-wait-x"
+if [ -n "$FFMPEG_BIN" ]; then
+    [ -x "$FFMPEG_BIN" ] || { echo "打包失败：找不到可执行的 ffmpeg：$FFMPEG_BIN" >&2; exit 1; }
+    install -m 0755 "$FFMPEG_BIN" "$STAGE/$NAME/bin/ffmpeg"
+fi
 if [ "$WITH_GUI" = 1 ]; then
     # 面板是给**坐在被控端前的人**用的那一屏，装完之后要能在桌面上双击，
     # 所以连用户态的图标安装脚本一起打进去（install.sh 是 root 跑的，装不了桌面图标）。

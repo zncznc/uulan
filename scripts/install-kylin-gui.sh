@@ -48,12 +48,14 @@ fi
 [ -f "$BIN_SRC" ] || { echo "二进制不存在：$BIN_SRC" >&2; exit 1; }
 install -m 0755 "$BIN_SRC" "$DEST/uulan-gui"
 echo "已安装：$DEST/uulan-gui"
-# 若同目录有 uulan-client，同步放一份到同目录，确保从桌面图标打开面板能直接发起远控
-SRC_CLIENT="$(dirname "$BIN_SRC")/uulan-client"
-if [ -x "$SRC_CLIENT" ] && [ "$(readlink -f "$SRC_CLIENT")" != "$(readlink -f "$DEST/uulan-client" 2>/dev/null || echo '')" ]; then
-  install -m 0755 "$SRC_CLIENT" "$DEST/uulan-client"
-  echo "已同步：$DEST/uulan-client"
-fi
+# 若同目录有 uulan-client / ffmpeg，同步放一份到同目录，确保从桌面图标打开面板能直接发起远控并解码
+for extra in uulan-client ffmpeg; do
+  SRC_EXTRA="$(dirname "$BIN_SRC")/$extra"
+  if [ -x "$SRC_EXTRA" ] && [ "$(readlink -f "$SRC_EXTRA")" != "$(readlink -f "$DEST/$extra" 2>/dev/null || echo '')" ]; then
+    install -m 0755 "$SRC_EXTRA" "$DEST/$extra"
+    echo "已同步：$DEST/$extra"
+  fi
+done
 
 # ---- 菜单项 ----
 APPDIR="$HOME/.local/share/applications"
