@@ -45,12 +45,12 @@ pub struct Recent {
 /// 与 `uulan-host` 的 `host.json` 同一套约定（`XDG_CONFIG_HOME` → `$HOME/.config` →
 /// `%USERPROFILE%\.config`）。控制端和被控端在一台机器上时，现场只需要记一个目录。
 pub fn default_path() -> PathBuf {
-    if let Some(p) = std::env::var_os(ENV_PATH) {
+    if let Some(p) = std::env::var_os("LANLINK_CLIENT_CONFIG").or_else(|| std::env::var_os(ENV_PATH)) {
         if !p.is_empty() {
             return PathBuf::from(p);
         }
     }
-    config_home().join("uulan").join("client.json")
+    config_home().join("lanlink").join("client.json")
 }
 
 fn config_home() -> PathBuf {
@@ -321,6 +321,6 @@ mod tests {
         }
         let p = default_path();
         assert!(p.ends_with("client.json"), "{}", p.display());
-        assert_eq!(p.parent().and_then(|d| d.file_name()), Some(std::ffi::OsStr::new("uulan")));
+        assert_eq!(p.parent().and_then(|d| d.file_name()), Some(std::ffi::OsStr::new("lanlink")));
     }
 }

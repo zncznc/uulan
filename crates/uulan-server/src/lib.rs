@@ -152,7 +152,7 @@ impl Server {
     /// 跑清理任务 + accept 循环。一直不返回。
     pub async fn serve(self, listener: TcpListener) -> Result<()> {
         let addr = listener.local_addr()?;
-        info!(%addr, proto = PROTO_VERSION, "uulan-server 已就绪");
+        info!(%addr, proto = PROTO_VERSION, "lanlink-server 已就绪");
 
         // 后台清理：过期票据、超时等待的 relay 连接、掉线的设备。
         {

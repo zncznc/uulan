@@ -171,7 +171,7 @@ async fn windows_console_goes_raw_so_arrows_and_ctrl_c_work() {
 
     // 客户端二进制：默认用本包的构建产物；`UULAN_CLIENT_EXE` 可指到别处（拿旧二进制验红）。
     let exe = std::env::var("UULAN_CLIENT_EXE")
-        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_uulan-client").to_string());
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_lanlink-client").to_string());
 
     let pty = native_pty_system()
         .openpty(PtySize { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 })

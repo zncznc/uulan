@@ -1,25 +1,21 @@
 #!/bin/bash
-# uulan 安装脚本（银河麒麟 V10 SP1 / 任何 systemd + X11 的 Linux）
+# lanlink 安装脚本（银河麒麟 V10 SP1 / 任何 systemd + X11 的 Linux）
 #
 # 两种装法，装的东西一样，只是位置与单元归属不同：
 #
-#   1) 系统装（root，生产默认）：二进制进 /opt/uulan，中继是**系统单元**，
+#   1) 系统装（root，生产默认）：二进制进 /opt/lanlink，中继是**系统单元**，
 #      被控端是**用户单元**。
 #        sudo bash install.sh --user mis --server 192.168.223.15:21116
 #
-#   2) 用户态装（普通用户，无 root）：全部进 ~/.local/uulan，中继与被控端都是
+#   2) 用户态装（普通用户，无 root）：全部进 ~/.local/lanlink，中继与被控端都是
 #      **用户单元**，靠 `loginctl enable-linger` 开机自启。
 #        bash install.sh --userland --server 192.168.223.15:21116
-#      现场拿不到 sudo 口令时用这个；功能一样（中继也随这个用户跑）。
-#
-# 为什么被控端必须是**用户**单元：它要 x11grab 抓 :0、要 XTest 注入、要读
-# ~/.Xauthority。系统单元跑在 root 下没有会话，X11 授权会拦住 → 抓出来是黑屏。
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 USERLAND=0
 PREFIX=""
-UULAN_USER="${SUDO_USER:-$(id -un)}"
+LANLINK_USER="${SUDO_USER:-$(id -un)}"
 SERVER=127.0.0.1:21116
 BIND=0.0.0.0:21116
 BIN_DIR=""
@@ -33,7 +29,7 @@ say() { echo "==> $*"; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --bin)      BIN_DIR="$2"; shift 2 ;;
-        --user)     UULAN_USER="$2"; shift 2 ;;
+        --user)     LANLINK_USER="$2"; shift 2 ;;
         --server)   SERVER="$2"; shift 2 ;;
         --bind)     BIND="$2"; shift 2 ;;
         --prefix)   PREFIX="$2"; shift 2 ;;
@@ -41,7 +37,7 @@ while [ $# -gt 0 ]; do
         --no-server) DO_SERVER=0; shift ;;
         --no-host)   DO_HOST=0; shift ;;
         --no-start)  DO_START=0; shift ;;
-        -h|--help)  sed -n '2,22p' "$0"; exit 0 ;;
+        -h|--help)  sed -n '2,14p' "$0"; exit 0 ;;
         *) die "未知参数 $1（--help 看用法）" ;;
     esac
 done
@@ -50,21 +46,19 @@ command -v systemctl >/dev/null || die "没有 systemd（这不是 systemd 系�
 
 if [ "$USERLAND" = 1 ]; then
     [ "$(id -u)" != 0 ] || die "用户态装请用普通用户跑（不要 sudo）"
-    UULAN_USER="$(id -un)"
-    PREFIX="${PREFIX:-$HOME/.local/uulan}"
+    LANLINK_USER="$(id -un)"
+    PREFIX="${PREFIX:-$HOME/.local/lanlink}"
 else
-    # UULAN_FAKE_ROOT=1 只给 scripts/verify-install-preflight.sh 在沙箱里跑「系统装」分支用。
-    # 它不构成提权：真非 root 时，后面写 /opt、写系统单元目录本来就没有权限，一步都走不远。
-    [ "${UULAN_FAKE_ROOT:-}" = 1 ] || [ "$(id -u)" = 0 ] || die "系统装需要 root：sudo bash install.sh（没有 root 就用 --userland）"
-    PREFIX="${PREFIX:-/opt/uulan}"
+    [ "${LANLINK_FAKE_ROOT:-${UULAN_FAKE_ROOT:-}}" = 1 ] || [ "$(id -u)" = 0 ] || die "系统装需要 root：sudo bash install.sh（没有 root 就用 --userland）"
+    PREFIX="${PREFIX:-/opt/lanlink}"
 fi
-id "$UULAN_USER" >/dev/null 2>&1 || die "用户不存在: $UULAN_USER"
+id "$LANLINK_USER" >/dev/null 2>&1 || die "用户不存在: $LANLINK_USER"
 
-USER_HOME="$(getent passwd "$UULAN_USER" | cut -d: -f6)"
-USER_UID="$(id -u "$UULAN_USER")"
+USER_HOME="$(getent passwd "$LANLINK_USER" | cut -d: -f6)"
+USER_UID="$(id -u "$LANLINK_USER")"
 USER_UNIT_DIR="$USER_HOME/.config/systemd/user"
-SYSTEM_UNIT_DIR="${UULAN_SYSTEM_UNIT_DIR:-/etc/systemd/system}"   # 覆盖项同上，仅预检测试用
-[ -d "$USER_HOME" ] || die "读不到 $UULAN_USER 的家目录"
+SYSTEM_UNIT_DIR="${LANLINK_SYSTEM_UNIT_DIR:-${UULAN_SYSTEM_UNIT_DIR:-/etc/systemd/system}}"
+[ -d "$USER_HOME" ] || die "读不到 $LANLINK_USER 的家目录"
 
 # 二进制从哪来：--bin > 包内 ./bin > 源码树 target/release
 if [ -z "$BIN_DIR" ]; then
@@ -73,38 +67,29 @@ if [ -z "$BIN_DIR" ]; then
     else die "找不到二进制，用 --bin 指定"
     fi
 fi
-[ -x "$BIN_DIR/uulan-host" ] || die "$BIN_DIR 里没有 uulan-host"
+[ -x "$BIN_DIR/lanlink-host" ] || die "$BIN_DIR 里没有 lanlink-host"
 if [ "$DO_SERVER" = 1 ]; then
-    [ -x "$BIN_DIR/uulan-server" ] || die "$BIN_DIR 里没有 uulan-server"
+    [ -x "$BIN_DIR/lanlink-server" ] || die "$BIN_DIR 里没有 lanlink-server"
 fi
 
 UNIT_SRC="$HERE/systemd"
 [ -d "$UNIT_SRC" ] || UNIT_SRC="$HERE/../deploy/systemd"
 [ -d "$UNIT_SRC" ] || die "找不到 systemd 单元模板（$HERE/systemd）"
 
-# 等 X 的小脚本：源码树里叫 deploy/uulan-wait-x.sh，离线包里被放到 bin/uulan-wait-x。
-# 两种布局都要认，否则「打包能打、装包就断」——真机上第一次装就踩到了。
-#
-# **必须在建 prefix 之前就找到它**：这是最后一个「先落盘、后失败」的输入。
-# 真机上真发生过：PREFIX/bin 和前两个二进制都已经写下去，才在这里 die，
-# 留下一个半装前缀 —— 服务起不来，而且看起来像装成功了。
-# 规矩：所有输入先验完，再动磁盘。
 WAIT_X=""
-for c in "$HERE/uulan-wait-x.sh" "$HERE/bin/uulan-wait-x" "$HERE/bin/uulan-wait-x.sh"; do
+for c in "$HERE/lanlink-wait-x.sh" "$HERE/bin/lanlink-wait-x" "$HERE/bin/lanlink-wait-x.sh"; do
     if [ -f "$c" ]; then WAIT_X="$c"; break; fi
 done
-[ -n "$WAIT_X" ] || die "找不到 uulan-wait-x（源码树应在 deploy/，安装包应在 bin/）"
+[ -n "$WAIT_X" ] || die "找不到 lanlink-wait-x（源码树应在 deploy/，安装包应在 bin/）"
 
-# 让 systemctl --user 在 ssh / 脚本里也能用
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$USER_UID}"
 if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "$XDG_RUNTIME_DIR/bus" ]; then
     export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
 fi
 
-# 以目标用户身份执行（系统装时 root 要降权；用户态装就是自己）
 as_user() {
-    if [ "$(id -u)" = 0 ] && [ "$UULAN_USER" != root ]; then
-        runuser -u "$UULAN_USER" -- env \
+    if [ "$(id -u)" = 0 ] && [ "$LANLINK_USER" != root ]; then
+        runuser -u "$LANLINK_USER" -- env \
             XDG_RUNTIME_DIR="/run/user/$USER_UID" \
             DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" \
             HOME="$USER_HOME" "$@"
@@ -114,46 +99,33 @@ as_user() {
 }
 user_ctl() { as_user systemctl --user "$@"; }
 
-# ---------- 预检：对端中继与目标端口（2026-11-12 真机系统装踩的坑）----------
-# 系统装与用户态装各有一套 uulan-server 单元，抢同一个监听端口。白天那次 root 装
-# 是靠人工先跑了 `systemctl --user disable --now uulan-server.service` 才没撞车 ——
-# 而对端不让位时，失败要到 restart 才暴露，那时 prefix 已建、二进制已换、单元已写，
-# 中继起不来、机器却被改了一半，正是「先落盘、后失败」要防的形态。
-# 所以动磁盘之前查三件事：
-#   1) 对端单元 active  —— 此刻就在占着端口
-#   2) 对端单元 enabled —— 现在不占，下次开机就抢（所以让位必须 disable，不能只 stop）
-#   3) 端口被陌生进程占 —— 兜底；但**本形态自己的中继在跑不算**，
-#      否则「就地升级」（服务活着重装一遍，M5 验过的正式路径）会被自己的端口挡死
+# ---------- 预检：对端中继与目标端口 ----------
 if [ "$DO_SERVER" = 1 ]; then
     RELAY_PORT="${BIND##*:}"
     [ "$RELAY_PORT" != "$BIND" ] || die "--bind 里没带端口: $BIND"
     PEER=""
     if [ "$USERLAND" = 1 ]; then
-        if systemctl is-active --quiet uulan-server.service 2>/dev/null; then
-            PEER="系统单元 uulan-server.service 正在运行"
-        elif systemctl is-enabled --quiet uulan-server.service 2>/dev/null; then
-            PEER="系统单元 uulan-server.service 开着开机自启（下次开机就会抢端口 $RELAY_PORT）"
+        if systemctl is-active --quiet lanlink-server.service 2>/dev/null; then
+            PEER="系统单元 lanlink-server.service 正在运行"
+        elif systemctl is-enabled --quiet lanlink-server.service 2>/dev/null; then
+            PEER="系统单元 lanlink-server.service 开着开机自启（下次开机就会抢端口 $RELAY_PORT）"
         fi
-        # 本形态自己的中继（用户单元）在跑 → 端口占着也算正常，就地升级要放行
         OWN_ACTIVE=0
-        user_ctl is-active --quiet uulan-server.service 2>/dev/null && OWN_ACTIVE=1
+        user_ctl is-active --quiet lanlink-server.service 2>/dev/null && OWN_ACTIVE=1
     else
-        if user_ctl is-active --quiet uulan-server.service 2>/dev/null; then
-            PEER="用户 $UULAN_USER 的用户单元 uulan-server.service 正在运行"
-        elif [ -e "$USER_HOME/.config/systemd/user/default.target.wants/uulan-server.service" ]; then
-            # 用户单元的「enabled」直接查 enable 落下的符号链接，不走总线：
-            # root 的 ssh 会话里 systemctl --user 经常连不上目标用户的 bus，
-            # 而「连不上」不等于「没开自启」，宁可用文件判据。
-            PEER="用户 $UULAN_USER 的用户单元 uulan-server.service 开着开机自启（下次开机就会抢端口 $RELAY_PORT）"
+        if user_ctl is-active --quiet lanlink-server.service 2>/dev/null; then
+            PEER="用户 $LANLINK_USER 的用户单元 lanlink-server.service 正在运行"
+        elif [ -e "$USER_HOME/.config/systemd/user/default.target.wants/lanlink-server.service" ]; then
+            PEER="用户 $LANLINK_USER 的用户单元 lanlink-server.service 开着开机自启（下次开机就会抢端口 $RELAY_PORT）"
         fi
         OWN_ACTIVE=0
-        systemctl is-active --quiet uulan-server.service 2>/dev/null && OWN_ACTIVE=1
+        systemctl is-active --quiet lanlink-server.service 2>/dev/null && OWN_ACTIVE=1
     fi
     if [ -n "$PEER" ]; then
         if [ "$USERLAND" = 1 ]; then
-            FIX="sudo systemctl disable --now uulan-server.service"
+            FIX="sudo systemctl disable --now lanlink-server.service"
         else
-            FIX="sudo -u $UULAN_USER XDG_RUNTIME_DIR=/run/user/$USER_UID systemctl --user disable --now uulan-server.service"
+            FIX="sudo -u $LANLINK_USER XDG_RUNTIME_DIR=/run/user/$USER_UID systemctl --user disable --now lanlink-server.service"
         fi
         die "对端中继没让位：$PEER。
      本次安装要装的是另一套中继单元，两边都监听 $RELAY_PORT，装到一半必炸。
@@ -170,25 +142,21 @@ if [ "$DO_SERVER" = 1 ]; then
     fi
 fi
 
-say "安装到 $PREFIX（$([ "$USERLAND" = 1 ] && echo 用户态 || echo 系统装)，运行身份 $UULAN_USER，中继 $SERVER）"
+say "安装到 $PREFIX（$([ "$USERLAND" = 1 ] && echo 用户态 || echo 系统装)，运行身份 $LANLINK_USER，中继 $SERVER）"
 install -d -m 0755 "$PREFIX" "$PREFIX/bin" "$PREFIX/doc" "$PREFIX/state"
-install -m 0755 "$BIN_DIR/uulan-host" "$PREFIX/bin/uulan-host"
+install -m 0755 "$BIN_DIR/lanlink-host" "$PREFIX/bin/lanlink-host"
 if [ "$DO_SERVER" = 1 ]; then
-    install -m 0755 "$BIN_DIR/uulan-server" "$PREFIX/bin/uulan-server"
+    install -m 0755 "$BIN_DIR/lanlink-server" "$PREFIX/bin/lanlink-server"
 fi
-# 等 X 的小脚本（路径已在预检里确定，这里只落盘）
-install -m 0755 "$WAIT_X" "$PREFIX/bin/uulan-wait-x"
-# 控制端是**可选**的：带 --with-client 打出来的包里有 uulan-client 就装上（不是服务，没有单元）。
-# 它要 winit/softbuffer，只有同款桌面环境编出来的二进制才该装 —— 所以「有就装、没有就跳过」，
-# 缺它不能让整个安装失败（被控端/中继跟它无关）。
+install -m 0755 "$WAIT_X" "$PREFIX/bin/lanlink-wait-x"
 HAVE_CLIENT=0
-if [ -x "$BIN_DIR/uulan-client" ]; then
-    install -m 0755 "$BIN_DIR/uulan-client" "$PREFIX/bin/uulan-client"
+if [ -x "$BIN_DIR/lanlink-client" ]; then
+    install -m 0755 "$BIN_DIR/lanlink-client" "$PREFIX/bin/lanlink-client"
     HAVE_CLIENT=1
 fi
 HAVE_GUI=0
-if [ -x "$BIN_DIR/uulan-gui" ]; then
-    install -m 0755 "$BIN_DIR/uulan-gui" "$PREFIX/bin/uulan-gui"
+if [ -x "$BIN_DIR/lanlink-gui" ]; then
+    install -m 0755 "$BIN_DIR/lanlink-gui" "$PREFIX/bin/lanlink-gui"
     HAVE_GUI=1
 fi
 HAVE_FFMPEG=0
@@ -203,33 +171,33 @@ fi
 # ---------- 中继 ----------
 if [ "$DO_SERVER" = 1 ]; then
     if [ "$USERLAND" = 1 ]; then
-        say "安装 uulan-server.service（用户单元）"
+        say "安装 lanlink-server.service（用户单元）"
         install -d -m 0755 "$USER_UNIT_DIR"
-        sed -e "s|@UULAN_PREFIX@|$PREFIX|g" -e "s|@UULAN_BIND@|$BIND|g" \
-            "$UNIT_SRC/uulan-server.user.service" > "$USER_UNIT_DIR/uulan-server.service"
+        sed -e "s|@LANLINK_PREFIX@|$PREFIX|g" -e "s|@LANLINK_BIND@|$BIND|g" \
+            "$UNIT_SRC/lanlink-server.user.service" > "$USER_UNIT_DIR/lanlink-server.service"
         user_ctl daemon-reload
-        user_ctl enable uulan-server.service >/dev/null
-        [ "$DO_START" = 1 ] && user_ctl restart uulan-server.service
+        user_ctl enable lanlink-server.service >/dev/null
+        [ "$DO_START" = 1 ] && user_ctl restart lanlink-server.service
     else
-        say "安装 uulan-server.service（系统单元）"
-        sed -e "s|@UULAN_PREFIX@|$PREFIX|g" \
-            -e "s|@UULAN_USER@|$UULAN_USER|g" \
-            -e "s|@UULAN_GROUP@|$UULAN_USER|g" \
-            -e "s|@UULAN_BIND@|$BIND|g" \
-            "$UNIT_SRC/uulan-server.service" > "$SYSTEM_UNIT_DIR/uulan-server.service"
-        chown "$UULAN_USER" "$PREFIX/state"
+        say "安装 lanlink-server.service（系统单元）"
+        sed -e "s|@LANLINK_PREFIX@|$PREFIX|g" \
+            -e "s|@LANLINK_USER@|$LANLINK_USER|g" \
+            -e "s|@LANLINK_GROUP@|$LANLINK_USER|g" \
+            -e "s|@LANLINK_BIND@|$BIND|g" \
+            "$UNIT_SRC/lanlink-server.service" > "$SYSTEM_UNIT_DIR/lanlink-server.service"
+        chown "$LANLINK_USER" "$PREFIX/state"
         systemctl daemon-reload
-        systemctl enable uulan-server.service >/dev/null
-        [ "$DO_START" = 1 ] && systemctl restart uulan-server.service
+        systemctl enable lanlink-server.service >/dev/null
+        [ "$DO_START" = 1 ] && systemctl restart lanlink-server.service
     fi
     if [ "$DO_START" = 1 ]; then
         sleep 1
         if [ "$USERLAND" = 1 ]; then
-            user_ctl is-active --quiet uulan-server.service \
-                || { user_ctl status --no-pager uulan-server.service || true; die "中继没起来"; }
+            user_ctl is-active --quiet lanlink-server.service \
+                || { user_ctl status --no-pager lanlink-server.service || true; die "中继没起来"; }
         else
-            systemctl is-active --quiet uulan-server.service \
-                || { journalctl -u uulan-server -n 20 --no-pager; die "中继没起来"; }
+            systemctl is-active --quiet lanlink-server.service \
+                || { journalctl -u lanlink-server -n 20 --no-pager; die "中继没起来"; }
         fi
         say "中继已启动，监听 $BIND"
     fi
@@ -237,78 +205,70 @@ fi
 
 # ---------- 被控端（永远是用户单元） ----------
 if [ "$DO_HOST" = 1 ]; then
-    CFG_DIR="$USER_HOME/.config/uulan"
+    CFG_DIR="$USER_HOME/.config/lanlink"
     CFG="$CFG_DIR/host.json"
     install -d -m 0700 "$CFG_DIR"
-    [ "$(id -u)" = 0 ] && chown "$UULAN_USER" "$CFG_DIR" || true
+    [ "$(id -u)" = 0 ] && chown "$LANLINK_USER" "$CFG_DIR" || true
 
-    # 配置文件不存在就先让程序自己生成（随机 12 位密码 + 0600），并默认开启
-    # 系统账户认证（只允许当前桌面用户 $UULAN_USER，绝不放 root；同时保留临时码备路）。
-    # 这里**故意不打印密码**：安装输出经常被贴进工单/日志。看密码用 `uulan-host --show`。
     if [ ! -f "$CFG" ]; then
-        say "生成配置文件 $CFG（默认启用系统账户认证：仅允许 $UULAN_USER；临时码备路照常可用）"
-        as_user "$PREFIX/bin/uulan-host" --server "$SERVER" --show >/dev/null
-        as_user "$PREFIX/bin/uulan-host" --pam --pam-allow "$UULAN_USER" --auth os >/dev/null
+        say "生成配置文件 $CFG（默认启用系统账户认证：仅允许 $LANLINK_USER；临时码备路照常可用）"
+        as_user "$PREFIX/bin/lanlink-host" --server "$SERVER" --show >/dev/null
+        as_user "$PREFIX/bin/lanlink-host" --pam --pam-allow "$LANLINK_USER" --auth os >/dev/null
     fi
 
-    say "安装 uulan-host.service（用户单元）"
-    # 若此前曾以 root 建出过 ~/.config/systemd 导致属主为 root，先修复归属，
-    # 否则随后的 `systemctl --user enable` 建 default.target.wants 软链会报 Failed。
+    say "安装 lanlink-host.service（用户单元）"
     if [ "$(id -u)" = 0 ] && [ -d "$USER_HOME/.config/systemd" ]; then
-        chown -R "$UULAN_USER:$UULAN_USER" "$USER_HOME/.config/systemd" || true
+        chown -R "$LANLINK_USER:$LANLINK_USER" "$USER_HOME/.config/systemd" || true
     fi
     as_user install -d -m 0755 "$USER_UNIT_DIR" "$USER_UNIT_DIR/default.target.wants"
-    sed -e "s|@UULAN_PREFIX@|$PREFIX|g" -e "s|@UULAN_SERVER@|$SERVER|g" \
-        "$UNIT_SRC/uulan-host.service" > "$USER_UNIT_DIR/uulan-host.service"
+    sed -e "s|@LANLINK_PREFIX@|$PREFIX|g" -e "s|@LANLINK_SERVER@|$SERVER|g" \
+        "$UNIT_SRC/lanlink-host.service" > "$USER_UNIT_DIR/lanlink-host.service"
     if [ "$(id -u)" = 0 ]; then
-        chown -R "$UULAN_USER:$UULAN_USER" "$USER_HOME/.config/systemd" || true
+        chown -R "$LANLINK_USER:$LANLINK_USER" "$USER_HOME/.config/systemd" || true
     fi
-    # 清理悬空旧软链，避免 systemd 245 报 Unit file .../default.target.wants/uulan-host.service does not exist
-    if [ -L "$USER_UNIT_DIR/default.target.wants/uulan-host.service" ] && [ ! -e "$USER_UNIT_DIR/default.target.wants/uulan-host.service" ]; then
-        rm -f "$USER_UNIT_DIR/default.target.wants/uulan-host.service"
+    if [ -L "$USER_UNIT_DIR/default.target.wants/lanlink-host.service" ] && [ ! -e "$USER_UNIT_DIR/default.target.wants/lanlink-host.service" ]; then
+        rm -f "$USER_UNIT_DIR/default.target.wants/lanlink-host.service"
     fi
 
-    # 开机即启动（不等登录）。被控端自己等 X，所以「先开机后登录」也能追上。
-    loginctl enable-linger "$UULAN_USER" \
+    loginctl enable-linger "$LANLINK_USER" \
         || echo "警告: enable-linger 失败，重启后要等这个用户登录才会自启" >&2
 
     if [ "$DO_START" = 1 ]; then
         user_ctl daemon-reload
-        user_ctl enable uulan-host.service >/dev/null
-        user_ctl restart uulan-host.service
+        user_ctl enable lanlink-host.service >/dev/null
+        user_ctl restart lanlink-host.service
         say "等待被控端上线（最多 20 秒）……"
         ok=0
         for _ in $(seq 1 20); do
             sleep 1
-            if user_ctl is-active --quiet uulan-host.service; then ok=1; break; fi
+            if user_ctl is-active --quiet lanlink-host.service; then ok=1; break; fi
         done
         if [ "$ok" = 1 ]; then
             say "被控端已启动"
         else
-            user_ctl status --no-pager uulan-host.service || true
-            die "被控端没起来（X 没就绪时会一直重试，见 journalctl --user -u uulan-host）"
+            user_ctl status --no-pager lanlink-host.service || true
+            die "被控端没起来（X 没就绪时会一直重试，见 journalctl --user -u lanlink-host）"
         fi
     fi
 fi
 
-# ---------- 图形面板与桌面图标（包里带 uulan-gui 就自动装上） ----------
+# ---------- 图形面板与桌面图标（包里带 lanlink-gui 就自动装上） ----------
 if [ "$HAVE_GUI" = 1 ]; then
     GUI_SCRIPT=""
     for c in "$HERE/install-gui.sh" "$HERE/../scripts/install-kylin-gui.sh"; do
         [ -f "$c" ] && { GUI_SCRIPT="$c"; break; }
     done
     if [ -n "$GUI_SCRIPT" ]; then
-        say "安装图形面板与桌面图标「uulan 远程协助」"
-        as_user bash "$GUI_SCRIPT" --bin "$PREFIX/bin/uulan-gui" \
-            || echo "警告: 桌面图标安装未完全成功，可切到 $UULAN_USER 手动跑 bash install-gui.sh" >&2
+        say "安装图形面板与桌面图标「lanlink 远程协助」"
+        as_user bash "$GUI_SCRIPT" --bin "$PREFIX/bin/lanlink-gui" \
+            || echo "警告: 桌面图标安装未完全成功，可切到 $LANLINK_USER 手动跑 bash install-gui.sh" >&2
     fi
 fi
 
 # ---------- 小结 ----------
 DEVICE_ID="（稍后分配：连上中继后写入配置）"
-if [ -f "$USER_HOME/.config/uulan/host.json" ]; then
-    # 只读 device_id，绝不读密码字段
-    DEVICE_ID="$(grep -o '"device_id"[^,}]*' "$USER_HOME/.config/uulan/host.json" \
+if [ -f "$USER_HOME/.config/lanlink/host.json" ]; then
+    DEVICE_ID="$(grep -o '"device_id"[^,}]*' "$USER_HOME/.config/lanlink/host.json" \
         | head -1 | sed 's/.*: *"//; s/"$//')"
     [ -n "$DEVICE_ID" ] || DEVICE_ID="（稍后分配：连上中继后写入配置）"
 fi
@@ -317,16 +277,16 @@ echo
 echo "──────────────────────────────────────────────"
 echo " 安装完成（$([ "$USERLAND" = 1 ] && echo 用户态 || echo 系统装)）"
 if [ "$DO_SERVER" = 1 ]; then
-    echo " 中继     : systemctl$([ "$USERLAND" = 1 ] && echo ' --user') status uulan-server"
+    echo " 中继     : systemctl$([ "$USERLAND" = 1 ] && echo ' --user') status lanlink-server"
 fi
 if [ "$DO_HOST" = 1 ]; then
-    echo " 被控端   : systemctl --user status uulan-host"
+    echo " 被控端   : systemctl --user status lanlink-host"
     echo " 设备 ID  : $DEVICE_ID"
-    echo " 访问密码 : uulan-host --show   （刻意不写进安装日志）"
-    echo " 日志     : journalctl --user -u uulan-host -f"
-    echo " 自检     : $PREFIX/bin/uulan-host --diagnose   （显示/XTest/ffmpeg/中继，退出码 0 = 能跑）"
+    echo " 访问密码 : lanlink-host --show   （刻意不写进安装日志）"
+    echo " 日志     : journalctl --user -u lanlink-host -f"
+    echo " 自检     : $PREFIX/bin/lanlink-host --diagnose   （显示/XTest/ffmpeg/中继，退出码 0 = 能跑）"
 fi
 if [ "$HAVE_CLIENT" = 1 ]; then
-    echo " 控制端   : $PREFIX/bin/uulan-client --server $SERVER --device $DEVICE_ID --password-file <文件>"
+    echo " 控制端   : $PREFIX/bin/lanlink-client --server $SERVER --device $DEVICE_ID --password-file <文件>"
 fi
 echo "──────────────────────────────────────────────"

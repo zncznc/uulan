@@ -1,0 +1,42 @@
+里程碑：更名 lanlink v0.2.0 与 Windows 端内置 OpenH264 零 ffmpeg 解码（2026-11-27）
+========================================================================
+
+一、目标与改动摘要
+------------------
+1. 去除 Windows 控制端远程画面的外部 ffmpeg.exe 依赖：
+   - 在 crates/uulan-media 引入 openh264 0.9.10（BSD-2-Clause，MIT 兼容，通过 builtin-h264 特性启用；Windows 控制端默认开启）。
+   - crates/uulan-media/src/decode.rs 实现进程内 OpenH264 工作线程（AU 切分 NAL → DecodeFrameNoDelay → YUV420→BGRA），保持原有 DecoderWriter/DecoderReader 异步读写拆分接口与帧边界冲刷语义。
+   - crates/uulan-media/src/ffmpeg.rs 为 libx264 编码器显式增加 -profile:v baseline，确保与 OpenH264 100% 兼容且零帧重排延迟。
+   - Linux（麒麟真机无 g++ 编译器）保留原有 ffmpeg 子进程解码回退路径（Linux 离线包本身已同目录自带静态 ffmpeg）。
+2. 版本升级：workspace 版本由 0.1.0 升至 0.2.0。
+3. 全量更名为 lanlink（去产品关联）：
+   - 可执行文件：lanlink-gui、lanlink-client、lanlink-host、lanlink-server、lanlink-wait-x
+   - systemd 单元：lanlink-host.service、lanlink-server.service、lanlink-server.user.service
+   - 配置与安装目录：~/.config/lanlink、%LOCALAPPDATA%\lanlink、/opt/lanlink、~/.local/lanlink
+   - 窗口标题与桌面图标：lanlink 内网远控 v0.2.0 / lanlink · ... / lanlink 远程协助
+   - 修复 scripts/install-kylin-gui.sh 在用户态安装同目录时的同文件 install 报错。
+
+二、验证结果
+------------
+1. Windows 本机：
+   - cargo test -p uulan-media --features builtin-h264：单测 39/0、pipeline 6/0、real_ffmpeg 6/0
+   - cargo test -p uulan-client --lib：137/0
+   - cargo test -p uulan-gui：31/0
+   - release 产物：lanlink-client.exe（4.57 MB，含内置 OpenH264）、lanlink-gui.exe（7.14 MB），零警告
+2. 麒麟真机（192.168.223.15，海光 8 核，Kylin V10 SP1）：
+   - bash scripts/verify-install-preflight.sh：34 通过 / 0 失败
+   - cargo test --workspace --no-fail-fast -- --test-threads=1：614 通过 / 2 失败 / 0 忽略
+     （2 项失败为已知既有不稳定项：end_to_end_host_to_client_video、source_eof_on_screen_shrink_restarts_encoder，无新增回归）
+   - 部署校验：lanlink-host / lanlink-gui / lanlink-client 三组源码与已部署文件 sha256sum 完全一致；lanlink-host.service active，21116/21117 监听正常
+3. 零 ffmpeg 端到端真机实测（Windows 清空 PATH、目录内无 ffmpeg.exe）：
+   - 直连 192.168.223.15:21117：20/20 帧，dropped=0，首帧 123 ms，对端版本 0.2.0
+   - 中继 192.168.223.15:21116（设备 805747189）：10/10 帧，dropped=0，首帧 120 ms
+   - 像素一致性（scripts/compare-ppm.py 对比真机 :0 截屏）：相关系数 0.9999，平均绝对误差 0.41/255（0.16%）
+   - 双认证拒止：OS 名单外 root（退出码 1，被控端不允许连接）、PAKE 错口令（退出码 1，密码不正确）
+
+三、未验的部分（必须明示）
+--------------------------
+1. 麒麟真机上因无免密 sudo，系统级中继单元 uulan-server.service 未切换为 lanlink-server.service（端口 21116 协议兼容，仍由原中继承载；新机用 lanlink-0.2.0-x86_64-linux.tar.gz 的 sudo bash install.sh 会直接安装 lanlink-server.service）。
+2. 未向用户索要系统登录密码，OS 模式“正确登录密码放行”路径需用户本人在面板点击一次复验。
+3. 未在 Windows 控制端实测 --audio / --mic（音频编解码仍需外部 ffmpeg；远程桌面画面与键鼠已完全零 ffmpeg）。
+4. 未在无 g++ 以外的带 g++ Linux 机器上实测 --features builtin-h264 的 Linux 原生编译。

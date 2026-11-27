@@ -1,0 +1,9 @@
+读 D:\default-workspace\uulan\docs\HANDOFF.md，然后按它工作。
+
+要点（细节以该文件为准）：
+1. 回复用中文，只给结论/关键数字/失败点，不要长篇复述过程（用户明确要求省 token）。
+2. 这是银河麒麟 V10 SP1 内网远控项目 uulan：被控端麒麟 + 控制端麒麟/Windows，中继自建。
+3. 验收门槛：cargo test --workspace 全绿（当前基线 578 通过 / 0 失败 / 1 忽略），不能只 cargo build。
+4. 认证硬约束：OS 模式（系统账户名+登录密码）不能走 PAKE，密钥只能是纯 DH 且必须跳过 rekey。
+5. 每个里程碑都要提交并推送 GitHub（zncznc/uulan，公开，MIT）。
+6. HANDOFF 第 8 节列了未完成事项：mis 真实密码成功路径未验（不要索要密码）、麒麟真机曾被并发构建压垮需按命令恢复。

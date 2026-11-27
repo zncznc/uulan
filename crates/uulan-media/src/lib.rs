@@ -24,8 +24,10 @@ pub use source::{Au, VideoSource};
 pub enum MediaError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-    #[error("ffmpeg 子进程已结束")]
+    #[error("解码器已结束")]
     Exited,
-    #[error("编码进程没有 stdout / 解码进程没有 stdout")]
+    #[error("编码进程没有 stdout / 解码器通道不可用")]
     NoPipe,
+    #[error("内置 H.264 解码器错误: {0}")]
+    Decoder(String),
 }

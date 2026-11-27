@@ -118,7 +118,7 @@ struct Args {
 }
 
 const HELP: &str = "\
-uulan-client —— uulan 内网远控的控制端
+lanlink-client —— lanlink 内网远控的控制端
 
 默认打开窗口显示被控端画面；加 --headless 退回命令行模式。
 
@@ -202,9 +202,9 @@ uulan-client —— uulan 内网远控的控制端
 
 上次连接（本机记一个文件，**不存口令**）：
   --last              用上次连成功的那台补上空着的 --server / --device
-                      例：uulan-client --last --password-file ~/.uulan-pw
+                      例：lanlink-client --last --password-file ~/.lanlink-pw
                       命令行显式给的 --server / --device 优先，不会被覆盖
-  --forget            忘掉记住的那台（删掉 ~/.config/uulan/client.json）
+  --forget            忘掉记住的那台（删掉 ~/.config/lanlink/client.json）
 
 端口映射（做完就退出，不开窗口、不收画面；可写多次）：
   --forward [绑定地址:]本地端口:目标主机:目标端口
@@ -796,7 +796,7 @@ fn recent_path() -> PathBuf {
 fn default_client_name() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "uulan-client".to_string())
+        .unwrap_or_else(|_| "lanlink-client".to_string())
 }
 
 #[tokio::main]

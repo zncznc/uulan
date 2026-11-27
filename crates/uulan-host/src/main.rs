@@ -67,7 +67,7 @@ struct Args {
 }
 
 const HELP: &str = "\
-uulan-host —— uulan 内网远控的被控端
+lanlink-host —— lanlink 内网远控的被控端
 
   --listen <地址:端口> 直连监听地址（默认 0.0.0.0:21117；控制端用 --direct 直连它）
   --no-listen         不监听任何端口（只走中继）
@@ -77,7 +77,7 @@ uulan-host —— uulan 内网远控的被控端
   --users             列出本机额外登录身份（口令一律不打印）
   --user-add <名字>   加一个人并现场生成一份独立口令（只打印一次）
   --user-del <名字>   吊销一个人的口令（常驻服务当场生效）
-  --config <path>     配置文件路径（默认 ~/.config/uulan/host.json）
+  --config <path>     配置文件路径（默认 ~/.config/lanlink/host.json）
   --server <addr>     中继地址，覆盖配置里的值（ip:port）
   --capture <spec>    采集源：x11 / x11::0.0 / x11::0.0@<显示器号(0基)> / lavfi:<合成源>[@帧数]
   --ffmpeg <path>     ffmpeg 可执行文件（默认走 PATH）

@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "uulan 内网远控的图形面板（控制端入口）"
+description = "lanlink 内网远控的图形面板（控制端入口）"
+
+[[bin]]
+name = "lanlink-gui"
+path = "src/main.rs"
 
 [dependencies]
 serde = { workspace = true }

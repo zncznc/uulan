@@ -285,9 +285,9 @@ impl LocalPanel {
             #[cfg(windows)]
             {
                 std::process::Command::new("tasklist")
-                    .args(["/FI", "IMAGENAME eq uulan-host.exe", "/NH"])
+                    .args(["/FI", "IMAGENAME eq lanlink-host.exe", "/NH"])
                     .output()
-                    .map(|o| String::from_utf8_lossy(&o.stdout).contains("uulan-host.exe"))
+                    .map(|o| String::from_utf8_lossy(&o.stdout).contains("lanlink-host.exe"))
                     .unwrap_or(false)
             }
             #[cfg(not(windows))]
@@ -298,7 +298,7 @@ impl LocalPanel {
                     .map(|o| {
                         String::from_utf8_lossy(&o.stdout)
                             .lines()
-                            .any(|l| l.contains("uulan-host") && !l.contains("ps -eo args"))
+                            .any(|l| l.contains("lanlink-host") && !l.contains("ps -eo args"))
                     })
                     .unwrap_or(false)
             }
@@ -314,7 +314,7 @@ impl LocalPanel {
     /// 所以这里只是把它拉起来，不替它造任何身份。
     pub fn start_host(&mut self, relay: &str) {
         let Some(host) = Self::host_exe() else {
-            self.status = "找不到 uulan-host 二进制 —— 装了客户端还得带上被控端可执行文件才行。".into();
+            self.status = "找不到 lanlink-host 二进制 —— 装了客户端还得带上被控端可执行文件才行。".into();
             return;
         };
         if self.host_state().1 {
@@ -393,14 +393,14 @@ impl LocalPanel {
     fn config_path() -> Option<PathBuf> {
         let mut cands: Vec<PathBuf> = Vec::new();
         if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
-            cands.push(PathBuf::from(x).join("uulan").join("host.json"));
+            cands.push(PathBuf::from(x).join("lanlink").join("host.json"));
         }
         if let Some(h) = std::env::var_os("HOME") {
             let home = PathBuf::from(h);
-            cands.push(home.join(".config").join("uulan").join("host.json"));
-            cands.push(home.join(".uulan").join("host.json"));
+            cands.push(home.join(".config").join("lanlink").join("host.json"));
+            cands.push(home.join(".lanlink").join("host.json"));
         }
-        for p in ["/opt/uulan/etc/host.json", "/etc/uulan/host.json"] {
+        for p in ["/opt/lanlink/etc/host.json", "/etc/lanlink/host.json"] {
             cands.push(PathBuf::from(p));
         }
         cands.into_iter().find(|p| p.is_file())
@@ -408,7 +408,7 @@ impl LocalPanel {
 
     /// 被控端二进制（生成临时码要用它，别自己造码 —— 造了中继也不认）。
     fn host_exe() -> Option<PathBuf> {
-        let name = if cfg!(windows) { "uulan-host.exe" } else { "uulan-host" };
+        let name = if cfg!(windows) { "lanlink-host.exe" } else { "lanlink-host" };
         let mut cands: Vec<PathBuf> = Vec::new();
         if let Ok(cur) = std::env::current_exe() {
             if let Some(dir) = cur.parent() {
@@ -416,11 +416,11 @@ impl LocalPanel {
                 cands.push(dir.join("..").join(name));
             }
         }
-        cands.push(PathBuf::from("/opt/uulan/bin").join(name));
+        cands.push(PathBuf::from("/opt/lanlink/bin").join(name));
         if let Some(h) = std::env::var_os("HOME") {
             let home = PathBuf::from(h);
-            cands.push(home.join(".local/uulan/bin").join(name));
-            cands.push(home.join(".uulan/bin").join(name));
+            cands.push(home.join(".local/lanlink/bin").join(name));
+            cands.push(home.join(".lanlink/bin").join(name));
         }
         cands.into_iter().find(|p| p.is_file())
     }
@@ -492,7 +492,7 @@ impl LocalPanel {
             return;
         };
         let Some(host) = Self::host_exe() else {
-            self.status = "找不到 uulan-host 二进制 —— 临时码必须由被控端自己生成，中继才认。".into();
+            self.status = "找不到 lanlink-host 二进制 —— 临时码必须由被控端自己生成，中继才认。".into();
             return;
         };
         let mut cmd = Command::new(&host);
@@ -561,7 +561,7 @@ impl LocalPanel {
     /// 返回被控端 stdout 的尾部（`--user-add` 会在这里打印一次口令，正是给人看的）。
     fn run_host_cli(&mut self, args: &[&str]) -> String {
         let Some(host) = Self::host_exe() else {
-            self.status = "找不到 uulan-host 二进制，管不了用户表。".into();
+            self.status = "找不到 lanlink-host 二进制，管不了用户表。".into();
             return String::new();
         };
         let Some(path) = Self::config_path() else {
@@ -640,7 +640,7 @@ impl LocalPanel {
                     self.stop_host();
                 }
                 if self.host_child.is_none() && online {
-                    ui.label(egui::RichText::new("下线请在本机执行：systemctl --user stop uulan-host").small().weak());
+                    ui.label(egui::RichText::new("下线请在本机执行：systemctl --user stop lanlink-host").small().weak());
                 }
             });
             ui.label(egui::RichText::new(

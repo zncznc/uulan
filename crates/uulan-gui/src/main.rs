@@ -153,7 +153,7 @@ impl App {
         }
     }
 
-    /// 配置目录：Windows 用 %LOCALAPPDATA%\uulan，其它平台用 ~/.config/uulan。
+    /// 配置目录：Windows 用 %LOCALAPPDATA%\lanlink，其它平台用 ~/.config/lanlink。
     fn cfg_dir() -> PathBuf {
         #[cfg(windows)]
         let base = std::env::var("LOCALAPPDATA")
@@ -163,12 +163,12 @@ impl App {
         let base = std::env::var("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| std::env::home_dir().unwrap_or_default().join(".config"));
-        base.join("uulan")
+        base.join("lanlink")
     }
 
     /// 控制端二进制：优先取 GUI 旁边的同名文件（安装包形态），其次取构建目录。
     fn client_exe(&self) -> Option<PathBuf> {
-        let exe_name = if cfg!(windows) { "uulan-client.exe" } else { "uulan-client" };
+        let exe_name = if cfg!(windows) { "lanlink-client.exe" } else { "lanlink-client" };
         let mut cand: Vec<PathBuf> = Vec::new();
         if let Ok(cur) = std::env::current_exe() {
             if let Some(dir) = cur.parent() {
@@ -320,7 +320,7 @@ impl App {
             return;
         }
         let Some(client) = self.client_exe() else {
-            self.alert = "找不到 uulan-client —— 请把它和面板放在同一目录。".into();
+            self.alert = "找不到 lanlink-client —— 请把它和面板放在同一目录。".into();
             return;
         };
         let relay = self.relay.trim().to_string();
@@ -407,7 +407,7 @@ impl App {
             // 但被控端以「系统账户」认证时它根本不存在 —— 那种形态只填用户名 + 登录密码。
             return Err("请填「临时码/口令」，或填系统账户（用户名 + 登录密码）。\n\
                 平时填被控端屏幕上那张**一次性临时码**（用完即废、每整点自动换新）。\n\
-                只有长期无人值守接入时才用永久口令：在被控端跑 `uulan-host --show` 能看。".into());
+                只有长期无人值守接入时才用永久口令：在被控端跑 `lanlink-host --show` 能看。".into());
         }
         if !self.os_user.trim().is_empty() && self.os_password.trim().is_empty() {
             return Err("填了系统账户名，但没给它的登录密码（第二因素要用）。".into());
@@ -428,7 +428,7 @@ impl App {
 
     fn launch(&mut self, mode: Mode) {
         let Some(client) = self.client_exe() else {
-            self.status = "找不到 uulan-client —— 请把它和面板放在同一目录。".into();
+            self.status = "找不到 lanlink-client —— 请把它和面板放在同一目录。".into();
             return;
         };
         // 表单没填全必须有显眼回应：旧版只改底部小字，用户报「点了没反应」。
@@ -824,7 +824,7 @@ impl eframe::App for App {
         egui::Panel::top("head").show(root, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.heading("uulan 内网远控");
+                ui.heading("lanlink 内网远控");
                 ui.separator();
                 ui.label("物理隔离内网 · 端到端加密 · 无云服务");
             });
@@ -1252,7 +1252,7 @@ fn main() {
         Some(listener) => local::watch_relaunch(listener, relaunch.clone()),
         None => {
             note_error("已有一个面板在运行 —— 本次启动退出（避免两个窗口显示不同的验证码）。");
-            eprintln!("已有一个 uulan 面板在运行，请在任务栏里找到它。");
+            eprintln!("已有一个 lanlink 面板在运行，请在任务栏里找到它。");
             return;
         }
     }
@@ -1267,7 +1267,7 @@ fn main() {
         ..Default::default()
     };
     if let Err(e) = eframe::run_native(
-        "uulan 内网远控",
+        "lanlink 内网远控 v0.2.0",
         opts,
         Box::new(move |_cc| Ok(Box::new(App::new(relaunch.clone())))),
     ) {

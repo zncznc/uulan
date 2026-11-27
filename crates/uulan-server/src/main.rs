@@ -52,10 +52,10 @@ fn parse_args() -> Result<Args> {
 }
 
 const HELP: &str = "\
-uulan-server —— uulan 内网远控的中继/会合服务器
+lanlink-server —— lanlink 内网远控的中继/会合服务器
 
   --bind <addr>     监听地址（默认 0.0.0.0:21116）
-  --state <path>    设备台账 JSON 路径（默认 ./uulan-devices.json）
+  --state <path>    设备台账 JSON 路径（默认 ./lanlink-devices.json）
   --list            打印台账里登记过的设备后退出
   --forget <id>     从台账里摘掉一台设备后退出
   --no-list         关掉「控制端远程拉设备目录」（默认开放；见下）

@@ -223,7 +223,7 @@ fn hostname_fallback() -> String {
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "uulan-host".to_string())
+        .unwrap_or_else(|| "lanlink-host".to_string())
 }
 
 impl Default for HostConfig {
@@ -259,12 +259,12 @@ impl Default for HostConfig {
 }
 
 impl HostConfig {
-    /// 默认配置路径：`$UULAN_CONFIG` 优先，否则 `~/.config/uulan/host.json`。
+    /// 默认配置路径：`$LANLINK_CONFIG` / `$UULAN_CONFIG` 优先，否则 `~/.config/lanlink/host.json`。
     pub fn default_path() -> PathBuf {
-        if let Some(p) = std::env::var_os("UULAN_CONFIG") {
+        if let Some(p) = std::env::var_os("LANLINK_CONFIG").or_else(|| std::env::var_os("UULAN_CONFIG")) {
             return PathBuf::from(p);
         }
-        config_home().join("uulan").join("host.json")
+        config_home().join("lanlink").join("host.json")
     }
 
     pub fn load(path: &Path) -> Result<Self, ConfigError> {

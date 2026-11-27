@@ -217,6 +217,9 @@ pub fn encode_args_with_input(o: &CaptureOptions, input: &[String]) -> Vec<Strin
             push(&mut a, "ultrafast");
             push(&mut a, "-tune");
             push(&mut a, "zerolatency");
+            // 显式锁定 baseline 档位：确保控制端内置 OpenH264 100% 兼容且零帧重排延迟
+            push(&mut a, "-profile:v");
+            push(&mut a, "baseline");
         }
         Encoder::Nvenc => {
             // p1 = 最快档；tune ll = 低延迟

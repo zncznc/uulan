@@ -1897,6 +1897,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nasm-rs"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "706bf8a5e8c8ddb99128c3291d31bd21f4bcde17f0f4c20ec678d85c74faa149"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "ndk"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2302,6 +2311,27 @@ name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
+
+[[package]]
+name = "openh264"
+version = "0.9.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a30840cd2b2cd6ae39af2544f66adf55357f68e0e4938a096fe0e9f8f412b59"
+dependencies = [
+ "openh264-sys2",
+ "wide",
+]
+
+[[package]]
+name = "openh264-sys2"
+version = "0.9.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8de206369120cab1be98e587adad1389e2ec00b63c62cdb3c13238000c1290a"
+dependencies = [
+ "cc",
+ "nasm-rs",
+ "walkdir",
+]
 
 [[package]]
 name = "orbclient"
@@ -2771,6 +2801,15 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "safe_arch"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42c6efa15875e6ecb39ca61fb0b0c1a40b84fac5a5ffe71eef7d1000c8eb3f5f"
+dependencies = [
+ "bytemuck",
+]
 
 [[package]]
 name = "same-file"
@@ -3472,7 +3511,7 @@ dependencies = [
 
 [[package]]
 name = "uulan-bulk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "thiserror 2.0.21",
@@ -3483,7 +3522,7 @@ dependencies = [
 
 [[package]]
 name = "uulan-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -3510,7 +3549,7 @@ dependencies = [
 
 [[package]]
 name = "uulan-clip"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -3518,7 +3557,7 @@ dependencies = [
 
 [[package]]
 name = "uulan-fs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "sha2",
@@ -3530,7 +3569,7 @@ dependencies = [
 
 [[package]]
 name = "uulan-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -3541,7 +3580,7 @@ dependencies = [
 
 [[package]]
 name = "uulan-host"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -3565,8 +3604,9 @@ dependencies = [
 
 [[package]]
 name = "uulan-media"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "openh264",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -3574,7 +3614,7 @@ dependencies = [
 
 [[package]]
 name = "uulan-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "chacha20poly1305",
@@ -3593,7 +3633,7 @@ dependencies = [
 
 [[package]]
 name = "uulan-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -3902,6 +3942,16 @@ name = "weezl"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
+
+[[package]]
+name = "wide"
+version = "1.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d920ac99c3c8edce110cb8d07dbb324d6d026011dce85b1e9355b70f0adacc4f"
+dependencies = [
+ "bytemuck",
+ "safe_arch",
+]
 
 [[package]]
 name = "winapi"

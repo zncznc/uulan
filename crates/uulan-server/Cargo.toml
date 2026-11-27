@@ -3,10 +3,10 @@ name = "uulan-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "uulan 中继 / 会合服务器（盲转发，不持有任何设备凭据）"
+description = "lanlink 中继 / 会合服务器（盲转发，不持有任何设备凭据）"
 
 [[bin]]
-name = "uulan-server"
+name = "lanlink-server"
 path = "src/main.rs"
 
 [lib]

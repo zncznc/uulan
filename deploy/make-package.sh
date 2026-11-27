@@ -3,22 +3,16 @@
 # 「二进制 + systemd 单元 + 安装脚本 + 文档」的 tar.gz，解包后 sudo bash install.sh。
 #
 # 用法（**在被控端同款机器上跑**，原生编译；不要交叉编译）：
-#   bash deploy/make-package.sh                    # 版本号默认用今天日期
-#   bash deploy/make-package.sh --version 0.3.0 --out /tmp
-#   bash deploy/make-package.sh --with-client      # 连控制端 uulan-client 一起打进去
-#   bash deploy/make-package.sh --with-gui         # 连图形面板 uulan-gui 一起打进去（被控端那一屏）
-#
-# 产物：/tmp/uulan-<version>-x86_64-linux.tar.gz
-#       （解包即得 uulan-<version>-x86_64-linux/{bin,systemd,install.sh,uninstall.sh,doc}）
-#
-# 为什么要 --with-client 而不是默认带上：控制端要 winit/softbuffer 的 X11 后端，
-# 在麒麟 V10 SP1 上必须靠 `x11-dlopen` 特性绕开缺失的 libx11-dev（见 Cargo.toml 注释），
-# 别的发行版/精简系统上可能编不出来；编不出来不该连被控端的包一起打不出来。
+#   bash deploy/make-package.sh                    # 默认版本 0.2.0
+#   bash deploy/make-package.sh --version 0.2.0 --out /tmp
+#   bash deploy/make-package.sh --with-client      # 连控制端 lanlink-client 一起打进去
+#   bash deploy/make-package.sh --with-gui         # 连图形面板 lanlink-gui 一起打进去
+#   bash deploy/make-package.sh --with-ffmpeg /tmp/ffmpeg-static
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-VERSION="$(date +%Y%m%d)"
+VERSION="0.2.0"
 OUT=/tmp
 WITH_CLIENT=0
 WITH_GUI=0
@@ -31,12 +25,12 @@ while [ $# -gt 0 ]; do
         --with-client) WITH_CLIENT=1; shift ;;
         --with-gui)    WITH_GUI=1; shift ;;
         --with-ffmpeg) FFMPEG_BIN="$2"; shift 2 ;;
-        -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
         *) echo "未知参数 $1" >&2; exit 2 ;;
     esac
 done
 
-NAME="uulan-$VERSION-x86_64-linux"
+NAME="lanlink-$VERSION-x86_64-linux"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 
@@ -48,22 +42,20 @@ echo "==> 编译 $PKGS（原生，release）"
 
 echo "==> 组装 $NAME"
 install -d "$STAGE/$NAME/bin" "$STAGE/$NAME/systemd" "$STAGE/$NAME/doc"
-install -m 0755 "$ROOT/target/release/uulan-server" "$STAGE/$NAME/bin/"
-install -m 0755 "$ROOT/target/release/uulan-host"   "$STAGE/$NAME/bin/"
+install -m 0755 "$ROOT/target/release/lanlink-server" "$STAGE/$NAME/bin/"
+install -m 0755 "$ROOT/target/release/lanlink-host"   "$STAGE/$NAME/bin/"
 if [ "$WITH_CLIENT" = 1 ]; then
-    [ -x "$ROOT/target/release/uulan-client" ] || { echo "打包失败：没有编出 uulan-client" >&2; exit 1; }
-    install -m 0755 "$ROOT/target/release/uulan-client" "$STAGE/$NAME/bin/"
+    [ -x "$ROOT/target/release/lanlink-client" ] || { echo "打包失败：没有编出 lanlink-client" >&2; exit 1; }
+    install -m 0755 "$ROOT/target/release/lanlink-client" "$STAGE/$NAME/bin/"
 fi
-install -m 0755 "$HERE/uulan-wait-x.sh"             "$STAGE/$NAME/bin/uulan-wait-x"
+install -m 0755 "$HERE/lanlink-wait-x.sh"             "$STAGE/$NAME/bin/lanlink-wait-x"
 if [ -n "$FFMPEG_BIN" ]; then
     [ -x "$FFMPEG_BIN" ] || { echo "打包失败：找不到可执行的 ffmpeg：$FFMPEG_BIN" >&2; exit 1; }
     install -m 0755 "$FFMPEG_BIN" "$STAGE/$NAME/bin/ffmpeg"
 fi
 if [ "$WITH_GUI" = 1 ]; then
-    # 面板是给**坐在被控端前的人**用的那一屏，装完之后要能在桌面上双击，
-    # 所以连用户态的图标安装脚本一起打进去（install.sh 是 root 跑的，装不了桌面图标）。
-    [ -x "$ROOT/target/release/uulan-gui" ] || { echo "打包失败：没有编出 uulan-gui" >&2; exit 1; }
-    install -m 0755 "$ROOT/target/release/uulan-gui" "$STAGE/$NAME/bin/"
+    [ -x "$ROOT/target/release/lanlink-gui" ] || { echo "打包失败：没有编出 lanlink-gui" >&2; exit 1; }
+    install -m 0755 "$ROOT/target/release/lanlink-gui" "$STAGE/$NAME/bin/"
     install -m 0644 "$ROOT/scripts/install-kylin-gui.sh" "$STAGE/$NAME/install-gui.sh"
 fi
 install -m 0644 "$HERE/systemd/"*.service           "$STAGE/$NAME/systemd/"
@@ -74,7 +66,7 @@ for f in DESIGN.md DEPLOY-KYLIN.md; do
 done
 install -m 0644 "$HERE/README.md" "$STAGE/$NAME/README.md"
 
-[ -f "$STAGE/$NAME/bin/uulan-host" ] || { echo "打包失败：没有二进制" >&2; exit 1; }
+[ -f "$STAGE/$NAME/bin/lanlink-host" ] || { echo "打包失败：没有二进制" >&2; exit 1; }
 
 mkdir -p "$OUT"
 TARBALL="$OUT/$NAME.tar.gz"
@@ -86,5 +78,5 @@ echo
 echo "对方机器上："
 echo "  tar xzf $NAME.tar.gz && cd $NAME && sudo bash install.sh --user <桌面用户> --server <中继IP:端口>"
 if [ "$WITH_GUI" = 1 ]; then
-    echo "  再切到那个桌面用户：bash install-gui.sh        # 装桌面图标「uulan 远程协助」"
+    echo "  再切到那个桌面用户：bash install-gui.sh        # 装桌面图标「lanlink 远程协助」"
 fi

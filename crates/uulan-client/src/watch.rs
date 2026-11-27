@@ -27,7 +27,6 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use uulan_media::annexb;
-use uulan_media::ffmpeg;
 use uulan_media::VideoDecoder;
 use uulan_protocol::frame::{read_frame, video, write_frame, FrameKind};
 use uulan_protocol::msg::{H2C, HostVideoCfg};
@@ -360,15 +359,8 @@ impl VideoWatcher {
             return Err(WatchError::NoVideoCfg);
         }
 
-        let ffmpeg_path = ffmpeg::find_ffmpeg(ffmpeg.as_deref()).ok_or_else(|| {
-            WatchError::Media(uulan_media::MediaError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "找不到 ffmpeg（控制端靠它解码画面）",
-            )))
-        })?;
-
-        // 第一代解码器在这里起：起不来就当场返回错误，别让调用方拿到一个永远不出帧的 watcher。
-        let first = VideoDecoder::start(&ffmpeg_path, enc_w, enc_h).await?;
+        // 第一代解码器在这里起：Windows 走内置 OpenH264（零 ffmpeg 依赖），Linux 无内置特性时自动找 ffmpeg。
+        let first = VideoDecoder::start_auto(ffmpeg.as_deref(), enc_w, enc_h).await?;
         let stats = Arc::new(WatchStats::default());
         // 首帧的 VideoCfg 里也带实测帧率（刚开播通常是 0，编码器重启时可能已经有值）。
         apply_video_cfg(&stats, &info, (enc_w, enc_h));
@@ -386,7 +378,7 @@ impl VideoWatcher {
             write_half,
             info.clone(),
             pending,
-            ffmpeg_path,
+            ffmpeg,
             first,
             stats.clone(),
             latest_tx,
@@ -555,7 +547,7 @@ async fn supervise(
     w: SecWriteHalf,
     mut info: HostVideoCfg,
     mut pending: Vec<(u64, Vec<u8>)>,
-    ffmpeg: PathBuf,
+    ffmpeg: Option<PathBuf>,
     first: VideoDecoder,
     stats: Arc<WatchStats>,
     latest_tx: watch::Sender<Option<Frame>>,
@@ -573,7 +565,7 @@ async fn supervise(
         let (fw, fh) = info.encoded_size();
         let mut decoder = match reuse.take() {
             Some(d) => d,
-            None => match VideoDecoder::start(&ffmpeg, fw, fh).await {
+            None => match VideoDecoder::start_auto(ffmpeg.as_deref(), fw, fh).await {
                 Ok(d) => d,
                 Err(e) => {
                     // 新尺寸的解码器起不来：留着旧尺寸继续解码只会画出错位画面，

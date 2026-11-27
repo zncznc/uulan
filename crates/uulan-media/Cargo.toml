@@ -3,12 +3,17 @@ name = "uulan-media"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "uulan 媒体层：H.264 Annex-B 解析、访问单元切分、FFmpeg 进程编排"
+description = "lanlink 媒体层：H.264 Annex-B 解析、访问单元切分、内置 OpenH264 / FFmpeg 编解码编排"
+
+[features]
+default = []
+builtin-h264 = ["dep:openh264"]
 
 [dependencies]
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+openh264 = { version = "0.9", default-features = false, features = ["source"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

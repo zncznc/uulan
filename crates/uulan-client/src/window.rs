@@ -73,7 +73,7 @@ pub struct Overlay {
 impl Overlay {
     fn title(&self, w: u32, h: u32) -> String {
         let mut s = format!(
-            "uulan · {} · {}x{} · 画面 {}x{} · {:.0} fps · {:.0} kbps",
+            "lanlink · {} · {}x{} · 画面 {}x{} · {:.0} fps · {:.0} kbps",
             self.host_name, self.screen.0, self.screen.1, w, h, self.fps, self.kbps
         );
         // 这里的 fps 是「控制端解出多少帧」，被控端真正编码了多少帧是另一个数 ——
