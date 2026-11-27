@@ -234,6 +234,16 @@ fn local_ips() -> Vec<String> {
 }
 
 #[cfg(windows)]
+fn current_os_user() -> Option<String> {
+    std::env::var("USERNAME").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+#[cfg(not(windows))]
+fn current_os_user() -> Option<String> {
+    std::env::var("USER").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+#[cfg(windows)]
 fn local_ips() -> Vec<String> {
     use std::os::windows::process::CommandExt;
     let Ok(o) = std::process::Command::new("ipconfig")
@@ -345,6 +355,28 @@ impl LocalPanel {
         if self.host_state().1 {
             self.status = "本机已经在被控状态了，不需要再拉一个（两个被控端会抢同一个设备 ID）。".into();
             return;
+        }
+        // 首次启动被控端（尚无 host.json）：自动生成配置并为当前登录用户开启系统账户认证，
+        // 保留临时码作为备路（与 Linux deploy/install.sh 口径完全一致）。
+        if Self::config_path().is_none() {
+            if let Some(cur_user) = current_os_user() {
+                let mut init = Command::new(&host);
+                init.arg("--show");
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    init.creation_flags(0x0800_0000);
+                }
+                let _ = init.output();
+                let mut enable = Command::new(&host);
+                enable.args(["--pam", "--pam-allow", &cur_user, "--auth", "os"]);
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    enable.creation_flags(0x0800_0000);
+                }
+                let _ = enable.output();
+            }
         }
         let dir = host.parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let _ = std::fs::create_dir_all(&dir);
@@ -708,6 +740,20 @@ impl LocalPanel {
                             .color(egui::Color32::from_rgb(220, 120, 40))
                             .strong(),
                     );
+                }
+                if (!info.auth_os || !info.pam_on || info.pam_users.is_empty())
+                    && current_os_user().is_some()
+                {
+                    if let Some(u) = current_os_user() {
+                        if ui.button(format!("启用系统账户登录（仅允许 {u}）")).clicked() {
+                            let _ = self.run_host_cli(&["--pam", "--pam-allow", &u, "--auth", "os"]);
+                            if self.host_child.is_some() {
+                                self.stop_host();
+                                self.start_host(relay);
+                            }
+                            self.status = format!("已开启系统账户登录（允许 {u} 使用本机登录密码连入）。");
+                        }
+                    }
                 }
             });
 

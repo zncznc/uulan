@@ -20,9 +20,12 @@
 //!    pty 默认**回显输入**，所以它的输出里可能直接含那个登录密码。因此这里读出来就丢，
 //!    错误信息里绝不带 su 的任何原文，也不写进日志。
 
+#[cfg(not(windows))]
 use std::io::{Read, Write};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(windows))]
+use std::time::Instant;
 
 /// 校验器：`(用户名, 密码) -> 是否通过`。
 ///
@@ -37,16 +40,100 @@ pub fn in_allow_list(allow: &[String], user: &str) -> bool {
     !u.is_empty() && allow.iter().any(|a| a.trim() == u)
 }
 
-/// 用系统的 `su` 走一遍真 PAM。不需要 root 权限（`su` 本身是 setuid），
-/// 也就不需要把任何口令哈希交到本程序手里。
+/// 用系统原生接口校验账户登录密码：
+/// - Linux/Unix：走 `su` 调真实 PAM。
+/// - Windows：走 `advapi32::LogonUserW` 校验本机/域账户登录密码。
 pub fn system_checker(timeout: Duration) -> Checker {
-    Arc::new(move |user: &str, password: &str| {
-        let mut cmd = portable_pty::CommandBuilder::new("su");
-        cmd.arg(user);
-        cmd.arg("-c");
-        cmd.arg("/bin/true");
-        run_pty_prompt_auth(cmd, password, timeout)
-    })
+    #[cfg(windows)]
+    {
+        let _ = timeout;
+        Arc::new(move |user: &str, password: &str| windows_logon_check(user, password))
+    }
+    #[cfg(not(windows))]
+    {
+        Arc::new(move |user: &str, password: &str| {
+            let mut cmd = portable_pty::CommandBuilder::new("su");
+            cmd.arg(user);
+            cmd.arg("-c");
+            cmd.arg("/bin/true");
+            run_pty_prompt_auth(cmd, password, timeout)
+        })
+    }
+}
+
+#[cfg(windows)]
+fn to_wide_z(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 调 Win32 `LogonUserW` 验证 Windows 账户名与登录密码（绝不保留任何明文凭据）。
+#[cfg(windows)]
+fn windows_logon_check(user: &str, password: &str) -> Result<bool, String> {
+    use std::ffi::c_void;
+
+    const LOGON32_LOGON_INTERACTIVE: u32 = 2;
+    const LOGON32_PROVIDER_DEFAULT: u32 = 0;
+    const ERROR_LOGON_FAILURE: u32 = 1326;
+    const ERROR_ACCOUNT_RESTRICTION: u32 = 1327;
+    const ERROR_INVALID_LOGON_HOURS: u32 = 1328;
+    const ERROR_INVALID_WORKSTATION: u32 = 1329;
+    const ERROR_PASSWORD_EXPIRED: u32 = 1330;
+    const ERROR_ACCOUNT_DISABLED: u32 = 1331;
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn LogonUserW(
+            lpsz_username: *const u16,
+            lpsz_domain: *const u16,
+            lpsz_password: *const u16,
+            dw_logon_type: u32,
+            dw_logon_provider: u32,
+            ph_token: *mut *mut c_void,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CloseHandle(h_object: *mut c_void) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    let u = user.trim();
+    if u.is_empty() || u.contains('\0') || password.contains('\0') {
+        return Ok(false);
+    }
+    let w_user = to_wide_z(u);
+    let w_domain = to_wide_z(".");
+    let w_pass = to_wide_z(password);
+    let mut token: *mut c_void = std::ptr::null_mut();
+
+    let ok = unsafe {
+        LogonUserW(
+            w_user.as_ptr(),
+            w_domain.as_ptr(),
+            w_pass.as_ptr(),
+            LOGON32_LOGON_INTERACTIVE,
+            LOGON32_PROVIDER_DEFAULT,
+            &mut token,
+        )
+    };
+    if ok != 0 {
+        if !token.is_null() {
+            unsafe {
+                let _ = CloseHandle(token);
+            }
+        }
+        return Ok(true);
+    }
+    let err = unsafe { GetLastError() };
+    match err {
+        ERROR_LOGON_FAILURE
+        | ERROR_ACCOUNT_RESTRICTION
+        | ERROR_INVALID_LOGON_HOURS
+        | ERROR_INVALID_WORKSTATION
+        | ERROR_PASSWORD_EXPIRED
+        | ERROR_ACCOUNT_DISABLED => Ok(false),
+        other => Err(format!("Windows 账户校验失败（错误码 {other}）")),
+    }
 }
 
 /// 在伪终端里跑一次口令校验进程：等它吐出提示符后再写一次口令，全程不保留任何输出。
@@ -55,6 +142,7 @@ pub fn system_checker(timeout: Duration) -> Checker {
 /// 之前会调用 `tcsetattr(..., TCSAFLUSH, ...)` 关回显并**清空 pty 输入缓冲**。
 /// `spawn` 完立刻写密码会被 `TCSAFLUSH` 一把冲掉，导致 `su` 干等到 10 秒超时
 /// （2026-11-25 麒麟真机 `su 2.34` 实测：`dt=0.016s echo=False prompt='输入密码'`）。
+#[cfg(not(windows))]
 fn run_pty_prompt_auth(
     cmd: portable_pty::CommandBuilder,
     password: &str,
@@ -212,5 +300,13 @@ mod tests {
         let res = run_pty_prompt_auth(cmd, "any", Duration::from_millis(250));
         assert!(res.is_err(), "卡死的子进程必须按超时拒绝：{res:?}");
         assert!(t0.elapsed() < Duration::from_secs(2), "超时强杀耗时过长");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_logon_rejects_empty_and_bogus_user() {
+        assert_eq!(windows_logon_check("", "anything"), Ok(false));
+        let res = windows_logon_check("nonexistent_lanlink_test_user_999", "wrong_pw");
+        assert!(res != Ok(true), "不存在的账户绝不允许通过：{res:?}");
     }
 }
